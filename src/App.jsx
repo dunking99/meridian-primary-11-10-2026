@@ -1,0 +1,12690 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect, useId } from "react";
+import { AreaChart, Area, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from "recharts";
+import { fetchLivePrices, fetchFearAndGreed } from "./prices.js";
+// Portfolio sub-pages (Overview / Holdings / Performance / Analysis) live in
+// their own files and are rendered from layout data; App.jsx only wires them.
+import * as SubPages from "./pages.jsx";
+const Gallery = React.lazy(() => import("./gallery/Gallery.jsx"));
+import { GEMINI_API_KEY, GEMINI_MODEL, API_BASE } from "./config.js";
+
+// ============================================================
+// SHARED AI HELPER  (Google Gemini, free tier)
+// All AI features route through this single function.
+// Reads the key saved in Settings (localStorage) first, then .env.
+// To change model, edit GEMINI_MODEL in config.js.
+// ============================================================
+function getGeminiKey() {
+  try { return localStorage.getItem("meridian_gemini_key") || GEMINI_API_KEY || ""; }
+  catch { return GEMINI_API_KEY || ""; }
+}
+
+// News relevance scoring happens server-side on the refresh loop, so the
+// backend needs its own copy of the key. Best-effort and silent: if the
+// server isn't up, the frontend's own AI features still work fine.
+async function pushKeyToServer(key) {
+  try {
+    await fetch(`${API}/settings/ai`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: key ?? "" }),
+    });
+  } catch { /* server not running — nothing to do */ }
+}
+
+/** Sync an existing browser key to the backend if the backend has none. */
+async function syncKeyToServerIfNeeded() {
+  const key = getGeminiKey();
+  if (!key) return;
+  try {
+    const res = await fetch(`${API}/settings/ai`);
+    const data = await res.json();
+    if (!data.enabled) await pushKeyToServer(key);
+  } catch { /* server not running */ }
+}
+
+async function callAI(prompt, maxTokens = 600) {
+  const key = getGeminiKey();
+  if (!key) {
+    return { ok: false, text: "No Gemini API key set. Add your free key in Settings (or .env) to enable AI features. Get one at aistudio.google.com." };
+  }
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
+        }),
+      }
+    );
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      return { ok: false, text: `AI request failed (${res.status}). ${detail.slice(0, 140)}` };
+    }
+    const data = await res.json();
+    const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+    return text ? { ok: true, text } : { ok: false, text: "AI returned an empty response — try again." };
+  } catch {
+    return { ok: false, text: "AI service unreachable. Check your connection and key in Settings." };
+  }
+}
+
+// ============================================================
+// LIVE MARKET REGIME  (derived from VIX + S&P momentum)
+// Degrades gracefully: partial data lowers confidence,
+// no data returns a neutral "awaiting data" state.
+// ============================================================
+
+
+// ============================================================
+// SHARED DATA ENGINE & CONSTANTS
+// ============================================================
+
+const POLL_INTERVAL = 60000;
+
+const TICKERS = {
+  usIndices:  ["^GSPC", "^IXIC", "VUSA.L"],
+  intIndices: ["^FTSE", "^STOXX50E", "VDPG.L", "EEM"],
+  volatility: ["^VIX"],
+  gold:       ["GC=F", "SGLN.L"],
+  energy:     ["CL=F", "BZ=F", "NG=F"],
+  forex:      ["GBPUSD=X", "EURUSD=X"],
+};
+
+const ALL_SYMBOLS = [
+  ...TICKERS.usIndices,
+  ...TICKERS.intIndices,
+  ...TICKERS.volatility,
+  ...TICKERS.gold,
+  ...TICKERS.energy,
+  ...TICKERS.forex,
+];
+
+const DISPLAY_NAMES = {
+  "^GSPC": "S&P 500", "^IXIC": "NASDAQ Comp.", "VUSA.L": "VUSA (Vanguard S&P)",
+  "^FTSE": "FTSE 100", "^STOXX50E": "EuroStoxx 50", "VDPG.L": "Asia Pac ex-JP", "EEM": "Emerging Mkts",
+  "^VIX": "VIX",
+  "GC=F": "Gold", "SGLN.L": "iShares Gold (SGLN)",
+  "CL=F": "WTI Crude", "BZ=F": "Brent", "NG=F": "Nat Gas",
+  "GBPUSD=X": "GBP/USD", "EURUSD=X": "EUR/USD",
+};
+
+// Sub-items are the internal tabs of a page that's worth surfacing directly
+// in the sidebar rather than making the user land on the front tab and click
+// again. The page's own front/overview tab is never listed here — that's
+// what clicking the parent item already does.
+const NAV_ITEMS = [
+  { id: "briefing", label: "Briefing", icon: "◆" },
+  { id: "changed", label: "What Changed", icon: "⬡" },
+  { id: "alerts", label: "Alerts", icon: "◭" },
+  { id: "risk", label: "Risk", icon: "◉" },
+  { id: "research", label: "Research", icon: "◎", subItems: [
+    { tab: "compare", label: "Compare" },
+    { tab: "precedents", label: "Precedents" },
+    { tab: "news", label: "News" },
+    { tab: "bullbear", label: "Bull / Bear" },
+    { tab: "filings", label: "Filings" },
+    { tab: "ai", label: "AI Note" },
+  ] },
+  { id: "portfolio", label: "Portfolio", icon: "◰", subItems: [
+    { tab: "holdings", label: "Holdings" },
+    { tab: "xray", label: "X-Ray" },
+    { tab: "performance", label: "Performance" },
+    { tab: "analysis", label: "Analysis" },
+    { tab: "allocate", label: "Allocate" },
+    { tab: "rebuild", label: "Rebuild" },
+  ] },
+  { id: "portfolio2", label: "Portfolio 2", icon: "◰" },
+  { id: "watchlist", label: "Watchlist", icon: "◫" },
+  { id: "screener", label: "Screener", icon: "▦" },
+  { id: "markets", label: "Markets", icon: "◬", subItems: [
+    { tab: "indices", label: "Indices" },
+    { tab: "fx", label: "FX" },
+    { tab: "commod", label: "Commodities" },
+    { tab: "sectors", label: "Sectors" },
+    { tab: "rates", label: "Rates" },
+    { tab: "crypto", label: "Crypto" },
+    { tab: "banks", label: "Central Banks" },
+  ] },
+  { id: "news", label: "News", icon: "◉" },
+  { id: "reports", label: "Reports", icon: "▤" },
+  { id: "settings", label: "Settings", icon: "⚙" },
+];
+
+// ============================================================
+// THEME
+//
+// Meridian shipped with a single dark palette and colours written as literal
+// hex values inline throughout this file. This is the first step of pulling
+// them into named semantic tokens: a converted component reads useTheme() and
+// styles from t.<token> rather than a literal, so the same tree renders
+// correctly in either theme.
+//
+// The dark values below are a deliberate retune of the originals, not a copy.
+// The old muted greys (#4a6080 for labels, #3a4558 for footnotes and axis
+// ticks) sat far below a legible contrast ratio on the near-black ground —
+// that was the specific complaint this work addresses — so they are lifted
+// here, and the panel ground and borders are raised enough to actually read
+// as panels.
+//
+// Rollout is page by page. A converted component works in both themes; an
+// unconverted one keeps its old hardcoded dark look and will look wrong in
+// light mode until it is migrated too. Portfolio is the pilot.
+// ============================================================
+
+const THEMES = {
+  dark: {
+    name: "dark",
+
+    // Grounds, back to front
+    appBg:        "#0a0d13",
+    chromeBg:     "#0f131b",   // top bar, sidebar, ticker tape
+    surface:      "#141922",   // Panel
+    surfaceAlt:   "#10151e",   // expanded-row detail area
+    surfaceInset: "#1b2230",   // stat tiles, inputs, menus, hover
+
+    // Borders
+    border:       "#2a3342",   // default panel edge / divider
+    borderSubtle: "#20272f",   // in-table row rules
+    borderStrong: "#3a465c",   // buttons, emphasised edges
+
+    // Text  (old value in comments — all were too dim on black)
+    text:          "#e6edf6",  // headings, primary values   (was #c8d6e8/#e8f0fe)
+    textSecondary: "#a9b8cc",  // body, secondary values     (was #7a8ba0)
+    textMuted:     "#8595ab",  // labels, captions           (was #4a6080)
+    textFaint:     "#6f7f96",  // footnotes, axis ticks      (was #3a4558)
+
+    // Semantic
+    accent:      "#00d4aa",    // mint — brand, active state
+    accentSoft:  "#00d4aa22",
+    info:        "#4d97ff",
+    infoSoft:    "#4d97ff22",
+    positive:    "#26d0a5",
+    negative:    "#ff5a67",
+    warning:     "#f5a623",
+    warningSoft: "#f5a62322",
+
+    // Charts
+    chartGrid:   "#232b38",
+    chartAxis:   "#8595ab",
+    tooltipBg:   "#1b2230",
+    // Categorical series for the Portfolio pages' charts. Chosen to stay apart
+    // from positive/negative (gain and loss never share a hue with a category)
+    // and to remain distinguishable under deuteranopia; order matters — the
+    // first four carry most charts.
+    cat1: "#5b8def", cat2: "#e0a03a", cat3: "#a07fe0", cat4: "#3fb7c9",
+    cat5: "#d774b4", cat6: "#9aab52", cat7: "#c98b5e", cat8: "#7f8aa3",
+    benchmark:   "#b8c4d6",    // benchmark line, drawn dashed
+    focusRing:   "#7fb2ff",
+
+    scrollThumb: "#2a3342",
+  },
+
+  light: {
+    name: "light",
+
+    appBg:        "#eef1f6",
+    chromeBg:     "#e6eaf1",
+    surface:      "#ffffff",
+    surfaceAlt:   "#f5f8fb",
+    surfaceInset: "#edf1f6",
+
+    border:       "#d4dbe4",
+    borderSubtle: "#e3e8ef",
+    borderStrong: "#bac5d4",
+
+    text:          "#151c28",
+    textSecondary: "#3e4a5c",
+    textMuted:     "#5b6880",
+    textFaint:     "#78849a",
+
+    accent:      "#00937a",    // darkened so it reads on white
+    accentSoft:  "#00937a1c",
+    info:        "#2f6fd0",
+    infoSoft:    "#2f6fd014",
+    positive:    "#0a8a68",
+    negative:    "#d1394a",
+    warning:     "#a96c0c",
+    warningSoft: "#a96c0c14",
+
+    chartGrid:   "#e3e8ef",
+    chartAxis:   "#78849a",
+    tooltipBg:   "#ffffff",
+    cat1: "#2f64c8", cat2: "#b0700f", cat3: "#6f4cc0", cat4: "#1b7f8f",
+    cat5: "#a8468a", cat6: "#5f7322", cat7: "#95582a", cat8: "#56607a",
+    benchmark:   "#4a5568",
+    focusRing:   "#2f6fd0",
+
+    scrollThumb: "#c3ccd8",
+  },
+};
+
+const ThemeContext = React.createContext(THEMES.dark);
+const useTheme = () => React.useContext(ThemeContext);
+
+function ThemeProvider({ children }) {
+  const [name, setName] = useState(() => {
+    try { return localStorage.getItem("meridian_theme") || "dark"; } catch { return "dark"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("meridian_theme", name); } catch { /* private mode — fine */ }
+  }, [name]);
+  const theme = useMemo(
+    () => ({ ...(THEMES[name] || THEMES.dark), setTheme: setName }),
+    [name],
+  );
+  return <ThemeContext.Provider value={theme}>{children}</ThemeContext.Provider>;
+}
+
+
+
+
+
+
+
+// ============================================================
+// UTILITY HOOKS & HELPERS
+// ============================================================
+
+/**
+ * The live price feed.
+ *
+ * Prices only ever come from the API. There is no seeded starting state and no
+ * synthesised movement: a symbol the API has not returned is simply absent
+ * from `prices`, and every consumer treats absent as "no data" rather than
+ * drawing a number.
+ *
+ * `feed` carries the provenance the numbers need to be trustworthy — whether
+ * the last poll succeeded, when the browser last heard from the API, and when
+ * the API itself last reached its upstream. Those last two differ whenever the
+ * API is up but its own fetches are failing, which is precisely the situation
+ * a single "last updated" timestamp hides.
+ */
+function useMarketData() {
+  const [prices, setPrices] = useState({});
+  const [feed, setFeed] = useState({
+    status: "loading",     // loading | live | stale | unavailable
+    polledAt: null,        // when the browser last got a good response
+    upstreamAt: null,      // when the API last reached Yahoo
+    reason: null,
+    count: 0,
+  });
+  const [pulseCount, setPulseCount] = useState(0);
+
+  const poll = useCallback(async () => {
+    const r = await fetchLivePrices();
+    if (r.ok && r.count > 0) {
+      // The API's own changePct is measured against the previous close, which
+      // is what a day change means. The previous implementation recomputed it
+      // against the last poll, so every "day change" on screen was really the
+      // change over the preceding sixty seconds.
+      setPrices(r.prices);
+      setFeed({ status: "live", polledAt: Date.now(), upstreamAt: r.lastFetch, reason: null, count: r.count });
+    } else {
+      // Whatever is already on screen stays — it was real when it arrived —
+      // but it stops being described as live, and keeps its original
+      // timestamp so its age is visible.
+      setFeed(f => ({
+        ...f,
+        status: f.count > 0 ? "stale" : "unavailable",
+        reason: r.reason,
+      }));
+    }
+    setPulseCount(c => c + 1);
+  }, []);
+
+  useEffect(() => {
+    poll();
+    const interval = setInterval(poll, POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [poll]);
+
+  return { prices, feed, pulseCount, poll };
+}
+
+function formatPrice(price, symbol) {
+  if (!price) return "—";
+  if (symbol?.includes("=X")) return price.toFixed(4);
+  // ^FVX (US 5Y) belongs with the other yields — it was missing here, so the
+  // 5-year rendered as a bare "4.12" next to "5.301%" and "4.372%".
+  if (symbol === "^IRX" || symbol === "^TNX" || symbol === "^FVX") return price.toFixed(3) + "%";
+  return price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function formatChange(pct) {
+  if (pct === undefined || pct === null) return "—";
+  const sign = pct >= 0 ? "+" : "";
+  return `${sign}${pct.toFixed(2)}%`;
+}
+
+// ============================================================
+// AI BRIEF ENGINE
+//
+// Every prompt here shares one constraint: the model must be allowed to
+// conclude that nothing is happening. That is not politeness — most sessions
+// genuinely are unremarkable, and a prompt that demands an opinion, forbids
+// hedging and asks "where is today's opportunity" will manufacture one. The
+// output then looks identical on a quiet day and a real one, which makes it
+// useless on both.
+//
+// The prompts also take derived context — sigma-scored moves, percentile
+// ranks, breadth — rather than a list of price levels. Handing a model raw
+// levels and asking what it means invites it to invent the significance it was
+// not given.
+// ============================================================
+
+/** Prepended to every prompt in this file. */
+const AI_RULES = `Rules you must follow:
+- If the data shows nothing unusual, say so plainly and stop. A short answer
+  that says "this was an ordinary session" is correct and useful. Do not
+  manufacture a narrative to fill space.
+- Only cite numbers present in the data given to you. Never estimate, recall
+  or invent a figure, a level, or an event.
+- Where the data says a value is unavailable, say it is unavailable rather
+  than guessing or working around it.
+- Do not describe a move as significant unless the data says it is unusual by
+  its own historical standard.
+- British English. Plain text, no markdown. No disclaimers about not being
+  financial advice.`;
+
+/**
+ * The session read on the What Changed page.
+ *
+ * Fed the memory layer's own output — which instruments moved beyond their
+ * normal range and by how many sigma, plus breadth, dispersion and correlation
+ * with their percentiles — rather than a list of prices. The verdict is passed
+ * through explicitly, so on a quiet day the model is told it was quiet instead
+ * of being left to decide whether to say so.
+ */
+async function fetchSessionRead(changes, setText, setLoading) {
+  setLoading(true);
+  const r = changes?.regime;
+  const notable = (changes?.notable ?? [])
+    .map(n => `${n.symbol} ${(n.ret1d * 100).toFixed(2)}% (${Math.abs(n.retZ).toFixed(1)} sigma vs its own year, `
+             + `${n.pctRank != null ? `${ordinal(Math.round(n.pctRank * 100))} percentile of its 1y range` : "range unknown"})`)
+    .join("; ") || "none — nothing moved beyond 1.5 sigma of its own normal range";
+
+  const pctText = (v, dp = 0) => v == null ? "unavailable" : `${(v * 100).toFixed(dp)}%`;
+
+  const prompt = `${AI_RULES}
+
+You are reading one session for a UK private investor, using a dataset that
+measures every move against that instrument's own trailing year.
+
+Session: ${changes?.date ?? "unknown"} (previous: ${changes?.previousDate ?? "unknown"}), ${changes?.observed ?? 0} instruments.
+Automated verdict: ${changes?.verdict?.tone ?? "unknown"} — ${changes?.verdict?.text ?? ""}
+
+Moved unusually: ${notable}.
+
+Universe state:
+- Above their 50-day average: ${pctText(r?.breadth50)}${r?.breadth50Pct != null ? ` (${ordinal(Math.round(r.breadth50Pct * 100))} percentile of the past year)` : ""}
+- Above their 200-day average: ${pctText(r?.breadth200)}${r?.breadth200Pct != null ? ` (${ordinal(Math.round(r.breadth200Pct * 100))} percentile)` : ""}
+- Cross-sectional dispersion: ${r?.dispersion != null ? (r.dispersion * 100).toFixed(2) + "%" : "unavailable"}${r?.dispersionPct != null ? ` (${ordinal(Math.round(r.dispersionPct * 100))} percentile)` : ""}
+- Mean pairwise 60-day correlation: ${r?.avgCorr != null ? r.avgCorr.toFixed(2) : "unavailable"}${r?.avgCorrPct != null ? ` (${ordinal(Math.round(r.avgCorrPct * 100))} percentile)` : ""}
+- Advancing: ${pctText(r?.pctUp)}. Instruments with a 2-sigma day: ${pctText(r?.pctExtreme)}.
+${r?.breadth50Streak > 1 ? `- Breadth has been ${r.breadth50 >= 0.5 ? "above" : "below"} half for ${r.breadth50Streak} consecutive sessions.` : ""}
+
+If the verdict is quiet or mild, reply with one or two sentences saying so and
+naming the one thing, if any, worth keeping an eye on. Do not pad it.
+
+Otherwise write at most three short paragraphs: what was actually unusual and
+in what terms, whether the move was broad or isolated and what breadth,
+dispersion and correlation say about that, and one observation with a number
+attached. Not a trade instruction.`;
+
+  const { text } = await callAI(prompt, 700);
+  setText(text);
+  setLoading(false);
+}
+
+// ============================================================
+// COMPONENTS
+// ============================================================
+
+/**
+ * Renders an absent value.
+ *
+ * Missing data must not be able to look like a real reading. A dash in the
+ * muted "no data" colour reads as absence at a glance, and the title carries
+ * the reason so it is answerable rather than merely blank.
+ */
+function NoData({ reason = "No data", compact = false }) {
+  const t = useTheme();
+  return (
+    <span
+      title={reason}
+      style={{
+        color: t.textFaint, fontFamily: "monospace",
+        fontSize: compact ? 11 : 12, letterSpacing: 1, cursor: "help",
+      }}
+    >
+      ——
+    </span>
+  );
+}
+
+/** Relative age of a timestamp, for provenance labels. */
+function ageLabel(ts) {
+  if (!ts) return "never";
+  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
+  return `${Math.round(secs / 86400)}d ago`;
+}
+
+/**
+ * Feed status and provenance.
+ *
+ * Shows both timestamps, because they answer different questions: `polled` is
+ * whether the browser can reach the API, `upstream` is whether the API can
+ * reach Yahoo. A green light on the first while the second is hours old was
+ * previously indistinguishable from everything working.
+ */
+function PulseIndicator({ pulseCount, feed }) {
+  const th = useTheme();
+  const [pulse, setPulse] = useState(false);
+  useEffect(() => {
+    setPulse(true);
+    const timer = setTimeout(() => setPulse(false), 600);
+    return () => clearTimeout(timer);
+  }, [pulseCount]);
+
+  const { status, polledAt, upstreamAt, reason, count } = feed;
+  const color = status === "live" ? th.accent
+              : status === "loading" ? th.warning
+              : status === "stale" ? th.warning : th.negative;
+  const label = status === "live" ? `LIVE · ${count}`
+              : status === "loading" ? "CONNECTING"
+              : status === "stale" ? "STALE" : "NO FEED";
+
+  const detail = status === "unavailable"
+    ? (reason ?? "API unreachable")
+    : `polled ${ageLabel(polledAt)} · upstream ${ageLabel(upstreamAt)}${reason ? ` · ${reason}` : ""}`;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }} title={detail}>
+      <div style={{
+        width: 7, height: 7, borderRadius: "50%",
+        background: pulse ? color : `${color}66`,
+        boxShadow: pulse ? `0 0 8px ${color}` : "none",
+        transition: "all 0.3s ease",
+      }} />
+      <span style={{ fontSize: 10, color: status === "unavailable" ? th.negative : th.textMuted, fontFamily: "monospace" }}>
+        {label}
+      </span>
+      <span style={{ fontSize: 9, color: th.textFaint, fontFamily: "monospace" }}>
+        {status === "unavailable" ? (reason ?? "") : ageLabel(upstreamAt)}
+      </span>
+    </div>
+  );
+}
+
+function TickerTape({ prices, feed }) {
+  const t = useTheme();
+  const items = ALL_SYMBOLS.filter(s => DISPLAY_NAMES[s] && prices[s]);
+
+  // An empty tape scrolling silently reads as "the market is closed". Say what
+  // is actually wrong instead.
+  if (!items.length) {
+    return (
+      <div style={{
+        background: t.chromeBg, borderBottom: `1px solid ${t.border}`,
+        padding: "7px 20px", fontSize: 11, fontFamily: "monospace",
+        color: feed?.status === "loading" ? t.textMuted : t.negative,
+      }}>
+        {feed?.status === "loading"
+          ? "Connecting to the Meridian API…"
+          : `No live prices — ${feed?.reason ?? "the API returned nothing"}. Start it with: npm run server`}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      background: t.chromeBg,
+      borderBottom: `1px solid ${t.border}`,
+      padding: "6px 0",
+      overflow: "hidden",
+      position: "relative",
+    }}>
+      <div style={{
+        display: "flex",
+        gap: 32,
+        animation: "tape 60s linear infinite",
+        width: "max-content",
+      }}>
+        {[...items, ...items].map((sym, i) => {
+          const d = prices[sym];
+          if (!d) return null;
+          const up = d.changePct >= 0;
+          return (
+            <span key={i} style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11, whiteSpace: "nowrap" }}>
+              <span style={{ color: t.textMuted, fontFamily: "monospace" }}>{DISPLAY_NAMES[sym]}</span>
+              <span style={{ color: t.text, fontFamily: "monospace", fontWeight: 600 }}>{formatPrice(d.price, sym)}</span>
+              <span style={{ color: up ? t.positive : t.negative, fontFamily: "monospace" }}>{formatChange(d.changePct)}</span>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+
+function FearGreedGauge({ data, tried = false }) {
+  // Once a fetch has been attempted and come back empty, this is unavailable —
+  // not still loading. Sitting on a spinner forever is its own small lie.
+  if (!data || !data.score) return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center", justifyContent: "center", height: 120, color: "#3a4558", fontSize: 11, fontFamily: "monospace" }}>
+      {tried ? <><NoData reason="CNN Fear & Greed could not be reached" /><span>SOURCE UNREACHABLE</span></> : "LOADING FEAR & GREED..."}
+    </div>
+  );
+
+  const score = data.score;
+  const rating = data.rating?.replace(/_/g, ' ').toUpperCase() || '';
+
+  const getColor = (s) => {
+    if (s <= 25) return "#ff4757";
+    if (s <= 45) return "#ff7043";
+    if (s <= 55) return "#ffa502";
+    if (s <= 75) return "#a8e063";
+    return "#00d4aa";
+  };
+
+  const color = getColor(score);
+
+  // SVG arc gauge
+  const cx = 90, cy = 85, r = 65;
+  const startAngle = -210;
+  const endAngle = 30;
+  const totalArc = endAngle - startAngle;
+  const scoreAngle = startAngle + (score / 100) * totalArc;
+
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const arcPath = (start, end, radius) => {
+    const s = { x: cx + radius * Math.cos(toRad(start)), y: cy + radius * Math.sin(toRad(start)) };
+    const e = { x: cx + radius * Math.cos(toRad(end)), y: cy + radius * Math.sin(toRad(end)) };
+    const large = end - start > 180 ? 1 : 0;
+    return `M ${s.x} ${s.y} A ${radius} ${radius} 0 ${large} 1 ${e.x} ${e.y}`;
+  };
+
+  const needleX = cx + (r - 10) * Math.cos(toRad(scoreAngle));
+  const needleY = cy + (r - 10) * Math.sin(toRad(scoreAngle));
+
+  const zones = [
+    { label: "EXT FEAR", start: -210, end: -156, color: "#ff4757" },
+    { label: "FEAR", start: -156, end: -102, color: "#ff7043" },
+    { label: "NEUTRAL", start: -102, end: -70, color: "#ffa502" },
+    { label: "GREED", start: -70, end: -16, color: "#a8e063" },
+    { label: "EXT GREED", start: -16, end: 30, color: "#00d4aa" },
+  ];
+
+  const comparisons = [
+    { label: "PREV CLOSE", value: data.prevClose },
+    { label: "1 WEEK AGO", value: data.weekAgo },
+    { label: "1 MONTH AGO", value: data.monthAgo },
+  ].filter(c => c.value != null);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "8px 0" }}>
+      <svg width={180} height={110} style={{ overflow: "visible" }}>
+        {/* Background track */}
+        <path d={arcPath(startAngle, endAngle, r)} fill="none" stroke="#1a2535" strokeWidth={12} strokeLinecap="round" />
+        {/* Coloured zone arcs */}
+        {zones.map((z, i) => (
+          <path key={i} d={arcPath(z.start, z.end, r)} fill="none" stroke={z.color + "40"} strokeWidth={12} />
+        ))}
+        {/* Active fill up to score */}
+        <path d={arcPath(startAngle, scoreAngle, r)} fill="none" stroke={color} strokeWidth={12} strokeLinecap="round"
+          style={{ filter: `drop-shadow(0 0 4px ${color}80)` }} />
+        {/* Needle dot */}
+        <circle cx={needleX} cy={needleY} r={5} fill={color} style={{ filter: `drop-shadow(0 0 6px ${color})` }} />
+        {/* Center score */}
+        <text x={cx} y={cy + 8} textAnchor="middle" fill={color} fontSize={28} fontWeight={700} fontFamily="monospace">{score}</text>
+        {/* Rating label */}
+        <text x={cx} y={cy + 24} textAnchor="middle" fill={color + "cc"} fontSize={8} fontFamily="monospace" letterSpacing={1}>{rating}</text>
+      </svg>
+
+      {/* Comparison row */}
+      {comparisons.length > 0 && (
+        <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+          {comparisons.map(c => {
+            const diff = score - c.value;
+            const diffColor = diff > 0 ? "#00d4aa" : diff < 0 ? "#ff4757" : "#4a6080";
+            return (
+              <div key={c.label} style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 8, color: "#3a4558", fontFamily: "monospace", letterSpacing: 0.5 }}>{c.label}</div>
+                <div style={{ fontSize: 11, color: "#7a8ba0", fontFamily: "monospace" }}>{c.value}</div>
+                <div style={{ fontSize: 9, color: diffColor, fontFamily: "monospace" }}>{diff > 0 ? "+" : ""}{diff}</div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+
+
+function SectionHeader({ title, subtitle, action, onAction, extra }) {
+  const t = useTheme();
+  return (
+    <div style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      padding: "13px 20px 11px",
+      borderBottom: `1px solid ${t.border}`,
+    }}>
+      <div>
+        <span style={{ fontSize: 13, fontWeight: 700, color: t.text, letterSpacing: 1.5, fontFamily: "monospace" }}>
+          {title}
+        </span>
+        {subtitle && <span style={{ fontSize: 12, color: t.textMuted, marginLeft: 10 }}>{subtitle}</span>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {extra}
+        {action && (
+          <button onClick={onAction} style={{
+            background: "transparent",
+            border: `1px solid ${t.borderStrong}`,
+            color: t.textSecondary,
+            fontSize: 12,
+            padding: "5px 12px",
+            borderRadius: 3,
+            cursor: "pointer",
+            fontFamily: "monospace",
+          }}>{action}</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Panel({ children, style = {} }) {
+  const t = useTheme();
+  return (
+    <div style={{
+      background: t.surface,
+      border: `1px solid ${t.border}`,
+      borderRadius: 8,
+      overflow: "hidden",
+      ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
+
+// ============================================================
+// DASHBOARD PAGE
+// ============================================================
+
+// ============================================================
+// WHAT CHANGED — the front page
+//
+// This replaced a dashboard whose movers, alerts, sector performance, market
+// internals and catalysts were all hardcoded constants. Rather than sourcing
+// the same panels for real — an index level and a sector table being things
+// any free site shows better — the page now answers the one question those
+// sites cannot: what is different, measured against this universe's own
+// history.
+//
+// Everything here comes from GET /changes, GET /leadership and
+// GET /relationships, all computed locally from stored daily bars. The page is
+// designed to be able to say "nothing happened", because most days nothing
+// does, and a front page that finds a headline daily is one you stop reading.
+// ============================================================
+
+const TONE_STYLE = {
+  quiet:    { color: "#4a6080", label: "QUIET" },
+  mild:     { color: "#7a8ba0", label: "MILD" },
+  isolated: { color: "#ffa502", label: "ISOLATED MOVES" },
+  broad:    { color: "#3d8bff", label: "BROAD MOVE" },
+};
+
+const pct = (v, dp = 1) => v == null ? null : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(dp)}%`;
+
+/** 1st, 2nd, 3rd, 4th — including the 11-13 exception. */
+function ordinal(n) {
+  const r100 = n % 100, r10 = n % 10;
+  const suffix = (r100 >= 11 && r100 <= 13) ? "th"
+    : r10 === 1 ? "st" : r10 === 2 ? "nd" : r10 === 3 ? "rd" : "th";
+  return `${n}${suffix}`;
+}
+const pctPlain = (v, dp = 0) => v == null ? null : `${(v * 100).toFixed(dp)}%`;
+
+/** Colour a signed value, with an explicit neutral for exactly-zero. */
+function signColor(v, { invert = false } = {}) {
+  if (v == null) return "#3a4558";
+  if (v === 0) return "#7a8ba0";
+  const up = v > 0;
+  return (up !== invert) ? "#00d4aa" : "#ff4757";
+}
+
+/**
+ * One instrument that moved unusually.
+ *
+ * The sigma figure leads because it is the comparable number: a 1.9% day in a
+ * world equity fund and a 0.4% day in a short bond fund can be the same event
+ * in their own terms, and only the sigma says so.
+ */
+function ChangeRow({ n }) {
+  const c = signColor(n.ret1d);
+  const sigma = Math.abs(n.retZ);
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: "minmax(90px,1.4fr) 74px 62px 1fr",
+      gap: 10, alignItems: "center",
+      padding: "8px 12px", borderBottom: "1px solid #10151f",
+    }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontFamily: "monospace", fontSize: 12, color: "#c8d6e8", fontWeight: 700,
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {n.symbol}
+        </div>
+        <div style={{ fontSize: 9, color: "#3a4558" }}>
+          {n.pctRank != null ? `${pctPlain(n.pctRank)} of 1y range` : "range unknown"}
+        </div>
+      </div>
+
+      <div style={{ textAlign: "right", fontFamily: "monospace", fontSize: 13, color: c, fontWeight: 700 }}>
+        {pct(n.ret1d, 2)}
+      </div>
+
+      {/* Sigma is the headline measure, so it gets its own emphasised column. */}
+      <div style={{ textAlign: "right", fontFamily: "monospace", fontSize: 12,
+                    color: sigma >= 2.5 ? "#ffa502" : sigma >= 2 ? "#c8d6e8" : "#7a8ba0" }}>
+        {sigma.toFixed(1)}σ
+      </div>
+
+      <div style={{ fontSize: 10, color: "#4a6080", display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        {n.dist200dma != null && (
+          <span title="Distance from its own 200-day average">
+            200d {pct(n.dist200dma, 0)}
+          </span>
+        )}
+        {n.volRatio != null && n.volRatio > 1.25 && (
+          <span style={{ color: "#ffa502" }} title="21-day volatility versus its own 252-day volatility">
+            vol ×{n.volRatio.toFixed(1)}
+          </span>
+        )}
+        {n.drawdown != null && n.drawdown < -0.1 && (
+          <span style={{ color: "#ff4757" }} title="Below its own trailing 1-year high">
+            dd {pct(n.drawdown, 0)}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** A universe-level statistic shown with its own historical percentile. */
+function RegimeStat({ label, value, percentile, hint, invert }) {
+  const p = percentile;
+  // The percentile is the interpretation. 0.94 means "higher than 94% of the
+  // last year" — that is what makes a bare correlation figure legible.
+  const extreme = p != null && (p >= 0.9 || p <= 0.1);
+  return (
+    <div style={{ flex: 1, minWidth: 120, padding: "10px 12px", background: "#0b0f18",
+                  border: `1px solid ${extreme ? "#ffa50240" : "#141b28"}`, borderRadius: 5 }}>
+      <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", letterSpacing: 1 }}>{label}</div>
+      <div style={{ fontFamily: "monospace", fontSize: 17, fontWeight: 700, color: value == null ? "#3a4558" : "#c8d6e8", marginTop: 3 }}>
+        {value ?? <NoData reason={hint ?? "Not enough stored history"} />}
+      </div>
+      {p != null ? (
+        <div style={{ fontSize: 9, color: extreme ? "#ffa502" : "#3a4558", marginTop: 2 }}>
+          {ordinal(Math.round(p * 100))} pct of past year
+        </div>
+      ) : (
+        <div style={{ fontSize: 9, color: "#2a3548", marginTop: 2 }}>no percentile yet</div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Alerts ────────────────────────────────────────────────────
+ *
+ * The alert engine has existed since v2 and has never had a page. Ten price
+ * and technical kinds, a full evaluation loop and four routes, reachable only
+ * by curl — so in practice nothing was ever armed.
+ *
+ * This is that page, covering both families: the price kinds the poll loop
+ * evaluates on every tick, and the cross-engine kinds that fire on what the
+ * news, bull/bear, scorecard and memory engines know.
+ */
+
+function relTime(ts) {
+  if (!ts) return "never";
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function AlertRow({ row, progress, onAction, portfolioSymbol }) {
+  const t = useTheme();
+  const [busy, setBusy] = useState(false);
+  const isSignal = !!row.signal;
+  const snoozed = row.snooze_until && row.snooze_until > Date.now();
+  const armed = row.status === "active" && !snoozed;
+
+  const statusColour = row.status === "triggered" ? "#ffa502"
+    : row.status === "muted" ? t.textFaint
+    : snoozed ? t.textFaint : t.positive;
+  const statusText = row.status === "triggered" ? "FIRED"
+    : row.status === "muted" ? "MUTED"
+    : snoozed ? `SNOOZED ${relTime(row.snooze_until).replace(" ago", "")}` : "ARMED";
+
+  async function act(fn) { setBusy(true); try { await fn(); } finally { setBusy(false); } }
+
+  return (
+    <div style={{ padding: "12px 20px", borderBottom: `1px solid ${t.border}` }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+        <span style={{
+          fontSize: 9, fontFamily: "monospace", letterSpacing: 1, color: statusColour,
+          border: `1px solid ${statusColour}`, borderRadius: 3, padding: "1px 5px",
+        }}>{statusText}</span>
+        <span style={{ fontSize: 13, color: t.text, fontFamily: "monospace" }}>
+          {row.symbol === portfolioSymbol ? "Portfolio" : row.symbol}
+        </span>
+        <span style={{ fontSize: 12.5, color: t.textSecondary }}>
+          {isSignal ? row.signal.text : `${row.kind}${row.threshold != null ? ` ${row.direction} ${row.threshold}` : ""}`}
+        </span>
+        {isSignal && (
+          <span style={{ fontSize: 9, fontFamily: "monospace", color: t.accent, letterSpacing: 1 }}>
+            CROSS-ENGINE
+          </span>
+        )}
+      </div>
+
+      <div style={{ fontSize: 11, color: t.textFaint, marginTop: 4 }}>
+        repeats: {row.repeat_mode ?? "once"}
+        {row.fire_count > 0 && ` · fired ${row.fire_count}×, last ${relTime(row.last_fired_at)}`}
+        {row.note && ` · your note: ${row.note}`}
+      </div>
+
+      {/* Progress only means something for a price level — showing a bar for a
+          kind with no distance-to-threshold would invent a reading. */}
+      {progress?.progress != null && armed && (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ height: 4, background: t.border, borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${progress.progress}%`, background: t.accent }} />
+          </div>
+          <div style={{ fontSize: 10, color: t.textFaint, marginTop: 3 }}>
+            now {progress.current} · {progress.distancePct > 0 ? "+" : ""}{progress.distancePct}% to go
+          </div>
+        </div>
+      )}
+
+      {row.history?.length > 0 && (
+        <div style={{ marginTop: 6, fontSize: 11, color: t.textMuted }}>
+          {row.history.slice(0, 2).map(h => (
+            <div key={h.id} style={{ marginTop: 2 }}>
+              <span style={{ color: t.textFaint, fontFamily: "monospace", fontSize: 10 }}>
+                {new Date(h.fired_at).toLocaleString("en-GB")}
+              </span>{" "}{h.message}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        {row.status === "triggered" && (
+          <AlertButton disabled={busy} onClick={() => act(() => onAction("rearm", row))}>RE-ARM</AlertButton>
+        )}
+        {snoozed
+          ? <AlertButton disabled={busy} onClick={() => act(() => onAction("unsnooze", row))}>WAKE</AlertButton>
+          : <AlertButton disabled={busy} onClick={() => act(() => onAction("snooze", row))}>SNOOZE 7d</AlertButton>}
+        {row.status === "muted"
+          ? <AlertButton disabled={busy} onClick={() => act(() => onAction("unmute", row))}>UNMUTE</AlertButton>
+          : <AlertButton disabled={busy} onClick={() => act(() => onAction("mute", row))}>MUTE</AlertButton>}
+        <AlertButton disabled={busy} danger onClick={() => act(() => onAction("delete", row))}>DELETE</AlertButton>
+      </div>
+    </div>
+  );
+}
+
+function AlertButton({ children, onClick, disabled, danger }) {
+  const t = useTheme();
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      background: "transparent",
+      border: `1px solid ${danger ? t.negative : t.borderStrong}`,
+      color: disabled ? t.textFaint : danger ? t.negative : t.textSecondary,
+      fontSize: 10, padding: "4px 9px", borderRadius: 3,
+      cursor: disabled ? "default" : "pointer", fontFamily: "monospace", letterSpacing: 0.5,
+    }}>{children}</button>
+  );
+}
+
+function AlertsPage() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [kind, setKind] = useState("concentration");
+  const [symbol, setSymbol] = useState("");
+  const [threshold, setThreshold] = useState("");
+  const [repeat, setRepeat] = useState("once");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [formErr, setFormErr] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/signals`);
+      setData(await r.json());
+      setErr(null);
+    } catch { setErr("Could not reach the Meridian API. Start it with: npm run server"); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const signalKinds = data?.signalKinds ?? {};
+  const priceKinds = data?.priceKinds ?? {};
+  const spec = signalKinds[kind] ?? null;
+  const isSignal = !!spec;
+  const needsSymbol = isSignal ? spec.scope === "symbol" : true;
+  const needsThreshold = isSignal ? spec.needsThreshold : (priceKinds[kind]?.needsThreshold ?? false);
+
+  async function create() {
+    setSaving(true); setFormErr(null);
+    try {
+      const body = isSignal
+        ? { kind, symbol: needsSymbol ? symbol.toUpperCase().trim() : null,
+            threshold: threshold === "" ? null : Number(threshold), repeat, note: note || null }
+        : { symbol: symbol.toUpperCase().trim(), kind, direction: "above",
+            threshold: threshold === "" ? null : Number(threshold), note: note || null };
+      const res = await fetch(`${API}/${isSignal ? "signals" : "alerts"}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      const out = await res.json();
+      if (out?.error) { setFormErr(out.error); return; }
+      setSymbol(""); setThreshold(""); setNote("");
+      // A freshly armed cross-engine alert has no baseline until a pass has
+      // run, so it would sit there looking inert for fifteen minutes.
+      if (isSignal) await fetch(`${API}/signals/evaluate`, { method: "POST" }).catch(() => {});
+      await load();
+    } catch (e) { setFormErr(String(e.message ?? e)); }
+    finally { setSaving(false); }
+  }
+
+  async function onAction(action, row) {
+    const post = (path, body) => fetch(`${API}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    if (action === "snooze") await post("/signals/snooze", { id: row.id, days: 7 });
+    if (action === "unsnooze") await post("/signals/unsnooze", { id: row.id });
+    if (action === "rearm") await post("/signals/rearm", { id: row.id });
+    if (action === "mute" || action === "unmute") {
+      await fetch(`${API}/alerts`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: row.id, status: action === "mute" ? "muted" : "active" }),
+      });
+    }
+    if (action === "delete") await fetch(`${API}/alerts?id=${row.id}`, { method: "DELETE" });
+    await load();
+  }
+
+  if (err) {
+    return (
+      <Panel>
+        <SectionHeader title="ALERTS" action="RETRY" onAction={load} />
+        <div style={{ padding: 20, color: t.negative, fontSize: 12, fontFamily: "monospace" }}>{err}</div>
+      </Panel>
+    );
+  }
+  if (loading && !data) {
+    return (
+      <Panel><SectionHeader title="ALERTS" />
+        <div style={{ padding: 20, color: t.textMuted, fontSize: 12, fontFamily: "monospace" }}>Loading alerts…</div>
+      </Panel>
+    );
+  }
+
+  const rows = data.alerts ?? [];
+  // Snoozed alerts keep status 'active' in the table — the snooze is a
+  // separate timestamp — but grouping one under "armed" while its own badge
+  // reads SNOOZED contradicts itself, so the page treats it as not armed.
+  const isArmed = r => r.status === "active" && !(r.snooze_until && r.snooze_until > Date.now());
+  const armed = rows.filter(isArmed);
+  const rest = rows.filter(r => !isArmed(r));
+  const progressById = Object.fromEntries((data.progress ?? []).map(p => [p.id, p]));
+
+  const inputStyle = {
+    background: t.surfaceAlt ?? t.surface, border: `1px solid ${t.border}`,
+    color: t.text, fontSize: 12, padding: "6px 8px", borderRadius: 3,
+    fontFamily: "monospace", minWidth: 0,
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader title="ARM AN ALERT" subtitle={`${armed.length} armed`} action="REFRESH" onAction={load} />
+        <div style={{ padding: "14px 20px", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>CONDITION</label>
+            <select id="alert-kind" value={kind} onChange={e => setKind(e.target.value)} style={{ ...inputStyle, minWidth: 220 }}>
+              <optgroup label="Cross-engine">
+                {Object.entries(signalKinds).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </optgroup>
+              <optgroup label="Price and technicals">
+                {Object.entries(priceKinds).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </optgroup>
+            </select>
+          </div>
+          {needsSymbol && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>SYMBOL</label>
+              <input id="alert-symbol" value={symbol} onChange={e => setSymbol(e.target.value)}
+                     placeholder="e.g. VUSA.L" style={{ ...inputStyle, width: 120 }} />
+            </div>
+          )}
+          {needsThreshold && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>THRESHOLD</label>
+              <input id="alert-threshold" value={threshold} onChange={e => setThreshold(e.target.value)}
+                     placeholder={spec?.defaultThreshold != null ? String(spec.defaultThreshold) : "value"}
+                     style={{ ...inputStyle, width: 100 }} />
+            </div>
+          )}
+          {isSignal && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>REPEATS</label>
+              <select id="alert-repeat" value={repeat} onChange={e => setRepeat(e.target.value)} style={{ ...inputStyle, width: 110 }}>
+                <option value="once">Once</option>
+                <option value="daily">Daily</option>
+                <option value="always">Every time</option>
+              </select>
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, minWidth: 140 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>NOTE (OPTIONAL)</label>
+            <input id="alert-note" value={note} onChange={e => setNote(e.target.value)}
+                   placeholder="why you care" style={inputStyle} />
+          </div>
+          <button id="alert-create" onClick={create} disabled={saving} style={{
+            background: t.accent, border: "none", color: "#04121a", fontSize: 12, fontWeight: 700,
+            padding: "8px 16px", borderRadius: 3, cursor: saving ? "default" : "pointer", fontFamily: "monospace",
+          }}>{saving ? "ARMING…" : "ARM"}</button>
+        </div>
+        {spec && (
+          <div style={{ padding: "0 20px 12px", fontSize: 11.5, color: t.textMuted }}>
+            {spec.describe ? null : null}
+            {spec.scope === "portfolio"
+              ? "Watches the portfolio as a whole — no symbol needed."
+              : "Watches one instrument, using what the news and research engines know about it."}
+          </div>
+        )}
+        {formErr && (
+          <div style={{ padding: "0 20px 12px", fontSize: 12, color: t.negative }}>{formErr}</div>
+        )}
+        <div style={{ padding: "0 20px 14px", fontSize: 10.5, color: t.textFaint, lineHeight: 1.6 }}>
+          {data.delivery}
+        </div>
+      </Panel>
+
+      <Panel>
+        <SectionHeader title="ARMED" subtitle={`${armed.length}`} />
+        {armed.length === 0 ? (
+          <div style={{ padding: 20, fontSize: 12, color: t.textFaint }}>
+            Nothing armed. Alerts you arm here are evaluated automatically while the app is running.
+          </div>
+        ) : armed.map(row => (
+          <AlertRow key={row.id} row={row} progress={progressById[row.id]}
+                    onAction={onAction} portfolioSymbol={data.portfolioSymbol} />
+        ))}
+      </Panel>
+
+      {rest.length > 0 && (
+        <Panel>
+          <SectionHeader title="FIRED AND MUTED" subtitle={`${rest.length}`} />
+          {rest.map(row => (
+            <AlertRow key={row.id} row={row} progress={progressById[row.id]}
+                      onAction={onAction} portfolioSymbol={data.portfolioSymbol} />
+          ))}
+        </Panel>
+      )}
+
+      <Panel>
+        <SectionHeader title="FIRING HISTORY" subtitle={`${(data.events ?? []).length} recorded`} />
+        {(data.events ?? []).length === 0 ? (
+          <div style={{ padding: 20, fontSize: 12, color: t.textFaint }}>
+            No alert has fired yet. History is kept even when a repeating alert re-arms.
+          </div>
+        ) : (
+          <div style={{ padding: "8px 20px 16px" }}>
+            {data.events.map(e => (
+              <div key={e.id} style={{ padding: "8px 0", borderBottom: `1px solid ${t.border}` }}>
+                <div style={{ fontSize: 12.5, color: t.text }}>{e.message}</div>
+                <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 2, fontFamily: "monospace" }}>
+                  {new Date(e.fired_at).toLocaleString("en-GB")} · {e.kind} · {e.symbol}
+                </div>
+                {e.detail && <div style={{ fontSize: 11, color: t.textMuted, marginTop: 2 }}>{e.detail}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/* ─── Daily Briefing ────────────────────────────────────────────
+ *
+ * The cross-engine page. Every other page answers its own question well and
+ * in isolation; this one asks the backend to rank findings from all of them
+ * against each other and shows the result newest-and-most-material first.
+ *
+ * The design leans on two things the engine guarantees: every finding carries
+ * a materiality on one comparable scale, and every section states its own
+ * coverage. So an empty section is rendered with its reason rather than
+ * hidden, which is what stops a quiet day looking like a broken page.
+ */
+
+const BRIEF_KIND_LABEL = {
+  alert: "ALERT", position_move: "MOVE", news: "NEWS", risk: "RISK",
+  event: "EVENT", signal: "SIGNAL", regime: "REGIME", correlation: "CORR",
+};
+
+function MaterialityDot({ value }) {
+  const t = useTheme();
+  // Three bands rather than a continuous ramp: the number is a ranking device,
+  // and implying it is precise to the point would overstate what it is.
+  const band = value >= 45 ? 2 : value >= 20 ? 1 : 0;
+  const colour = [t.textFaint, "#ffa502", t.negative][band];
+  return (
+    <span
+      title={`Materiality ${value.toFixed(1)} of 100 — how much this is worth your attention, combining how extreme it is, how much of the portfolio it touches, and how actionable its kind is.`}
+      style={{
+        width: 6, height: 6, borderRadius: "50%", background: colour,
+        flex: "none", marginTop: 6, cursor: "help",
+      }}
+    />
+  );
+}
+
+function BriefingItem({ item, onOpenSymbol }) {
+  const t = useTheme();
+  const dirColour = item.direction === "up" ? t.positive
+    : item.direction === "down" ? t.negative : t.textMuted;
+  return (
+    <div style={{
+      display: "flex", gap: 10, padding: "10px 0",
+      borderBottom: `1px solid ${t.border}`,
+    }}>
+      <MaterialityDot value={item.materiality} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+          <span style={{
+            fontSize: 9, fontFamily: "monospace", letterSpacing: 1,
+            color: t.textFaint, border: `1px solid ${t.border}`,
+            borderRadius: 3, padding: "1px 5px",
+          }}>{BRIEF_KIND_LABEL[item.kind] ?? item.kind.toUpperCase()}</span>
+          {item.isNew && (
+            <span style={{
+              fontSize: 9, fontFamily: "monospace", letterSpacing: 1,
+              color: t.accent, border: `1px solid ${t.accent}`,
+              borderRadius: 3, padding: "1px 5px",
+            }}>NEW</span>
+          )}
+          <span style={{ fontSize: 13, color: t.text, fontWeight: 500 }}>{item.title}</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 3 }}>
+          {item.detail}
+          {item.weight != null && (
+            <span style={{ color: t.textFaint }}> · {item.weight.toFixed(1)}% of portfolio</span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 10, marginTop: 4, alignItems: "center", flexWrap: "wrap" }}>
+          {item.symbol && (
+            <button
+              onClick={() => onOpenSymbol?.(item.symbol)}
+              style={{
+                background: "transparent", border: "none", padding: 0,
+                color: dirColour, fontSize: 11, fontFamily: "monospace",
+                cursor: "pointer", textDecoration: "underline",
+              }}
+            >{item.symbol}</button>
+          )}
+          {item.meta?.url && (
+            <a href={item.meta.url} target="_blank" rel="noreferrer"
+               style={{ color: t.textMuted, fontSize: 11 }}>read ↗</a>
+          )}
+          <span title={item.source} style={{ fontSize: 10, color: t.textFaint, cursor: "help" }}>
+            source ⓘ
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BriefingSection({ section, onOpenSymbol }) {
+  const t = useTheme();
+  const [open, setOpen] = useState(section.count > 0);
+  return (
+    <div style={{ borderBottom: `1px solid ${t.border}` }}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        style={{
+          width: "100%", display: "flex", alignItems: "center", gap: 10,
+          background: "transparent", border: "none", cursor: "pointer",
+          padding: "12px 20px", textAlign: "left",
+        }}
+      >
+        <span style={{ color: t.textFaint, fontSize: 10, fontFamily: "monospace" }}>{open ? "▾" : "▸"}</span>
+        <span style={{
+          fontSize: 12, fontWeight: 700, letterSpacing: 1.2,
+          fontFamily: "monospace", color: t.text, whiteSpace: "nowrap", flex: "none",
+        }}>{section.title.toUpperCase()}</span>
+        <span style={{ fontSize: 11, color: t.textMuted }}>{section.count}</span>
+        {section.newCount > 0 && (
+          <span style={{ fontSize: 10, color: t.accent, fontFamily: "monospace" }}>{section.newCount} new</span>
+        )}
+        {/* An empty section says why it is empty without needing to be opened.
+            Hiding the reason behind a click is what makes a quiet day look
+            like a broken page. Once open, the body carries it instead, so it
+            is not repeated. */}
+        {section.count === 0 && !open && (
+          <span style={{
+            fontSize: 10.5, color: t.textFaint, marginLeft: 4,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0,
+          }}>
+            {section.reason || section.coverage || "Nothing to report."}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div style={{ padding: "0 20px 14px" }}>
+          {section.items.length === 0 ? (
+            section.reason ? (
+              <div style={{ fontSize: 11.5, color: t.textFaint, padding: "4px 0 10px" }}>
+                {section.reason}
+              </div>
+            ) : null
+          ) : (
+            section.items.map(item => (
+              <BriefingItem key={item.fp} item={item} onOpenSymbol={onOpenSymbol} />
+            ))
+          )}
+          {section.coverage && (
+            <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 8, lineHeight: 1.5 }}>
+              {section.coverage}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BriefingPage({ onOpenSymbol }) {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [marking, setMarking] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const r = await fetch(`${API}/briefing?limit=8`);
+      setData(await r.json());
+    } catch {
+      setErr("Could not reach the Meridian API. Start it with: npm run server");
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Sends back the fingerprints this render actually showed, so a finding that
+  // arrives between render and click is not silently marked as already seen.
+  async function markRead() {
+    if (!data) return;
+    setMarking(true);
+    try {
+      await fetch(`${API}/briefing/read`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fingerprints: data.fingerprints, generatedAt: data.generatedAt }),
+      });
+      await load();
+    } catch { /* the badge staying is a better failure than a false "read" */ }
+    finally { setMarking(false); }
+  }
+
+  if (err) {
+    return (
+      <Panel>
+        <SectionHeader title="BRIEFING" action="RETRY" onAction={load} />
+        <div style={{ padding: 20, color: t.negative, fontSize: 12, fontFamily: "monospace" }}>{err}</div>
+      </Panel>
+    );
+  }
+  if (loading && !data) {
+    return (
+      <Panel>
+        <SectionHeader title="BRIEFING" />
+        <div style={{ padding: 20, color: t.textMuted, fontSize: 12, fontFamily: "monospace" }}>
+          Reading across the engines…
+        </div>
+      </Panel>
+    );
+  }
+  if (!data) return null;
+
+  const toneColour = {
+    action: t.negative, broad: "#ffa502", isolated: "#ffa502",
+    mild: t.textMuted, quiet: t.textMuted,
+  }[data.verdict.tone] ?? t.textMuted;
+
+  const p = data.portfolio;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader
+          title="BRIEFING"
+          subtitle={new Date(data.generatedAt).toLocaleString("en-GB")}
+          action={marking ? "SAVING…" : "MARK AS READ"}
+          onAction={markRead}
+          extra={
+            <span style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace" }}>
+              {data.counts.new} new / {data.counts.total}
+            </span>
+          }
+        />
+
+        {/* The verdict. Allowed — and on most days expected — to say nothing
+            happened, which is why it is computed from the findings rather than
+            written by a model that would rather find something. */}
+        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${t.border}` }}>
+          <div style={{ fontSize: 15, color: toneColour, fontWeight: 500, lineHeight: 1.45 }}>
+            {data.verdict.text}
+          </div>
+          {data.lastRead && (
+            <div style={{ fontSize: 11, color: t.textFaint, marginTop: 6 }}>
+              Last read {new Date(data.lastRead.readAt).toLocaleString("en-GB")}
+            </div>
+          )}
+        </div>
+
+        {/* Portfolio line. Kept to what the briefing needs for context — the
+            Portfolio page is where this is the subject rather than the frame. */}
+        <div style={{
+          padding: "12px 20px", display: "flex", gap: 24, flexWrap: "wrap",
+          borderBottom: `1px solid ${t.border}`,
+        }}>
+          {p.available ? (
+            <>
+              <div>
+                <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>VALUE</div>
+                <div style={{ fontSize: 16, color: t.text, fontFamily: "monospace" }}>{gbp0(p.total)}</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>TODAY</div>
+                <div style={{
+                  fontSize: 16, fontFamily: "monospace",
+                  color: p.dayChange == null ? t.textFaint : p.dayChange >= 0 ? t.positive : t.negative,
+                }}>
+                  {p.dayChange == null ? <NoData reason="No live quotes yet" />
+                    : `${p.dayChange >= 0 ? "+" : ""}${gbp0(p.dayChange)}${p.dayChangePct != null ? ` (${p.dayChangePct >= 0 ? "+" : ""}${p.dayChangePct}%)` : ""}`}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>PRICED</div>
+                <div style={{ fontSize: 16, color: t.text, fontFamily: "monospace" }}>
+                  {p.priced}/{p.positions}
+                </div>
+                {p.unpriced?.length > 0 && (
+                  <div style={{ fontSize: 10, color: t.textFaint }} title={p.unpriced.join(", ")}>
+                    {p.unpriced.length} without a live price
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: t.textFaint }}>{p.reason}</div>
+          )}
+        </div>
+
+        {/* Headline: the ranked cross-engine list, which is the whole point. */}
+        <div style={{ padding: "6px 20px 14px" }}>
+          <div style={{
+            fontSize: 10, color: t.textFaint, letterSpacing: 1.2,
+            fontFamily: "monospace", padding: "10px 0 2px",
+          }}>WHAT MATTERS MOST</div>
+          {data.headline.length === 0 ? (
+            <div style={{ fontSize: 12, color: t.textFaint, padding: "8px 0" }}>
+              Nothing crossed the threshold today. The sections below show what was checked.
+            </div>
+          ) : (
+            data.headline.map(item => (
+              <BriefingItem key={item.fp} item={item} onOpenSymbol={onOpenSymbol} />
+            ))
+          )}
+        </div>
+      </Panel>
+
+      <Panel>
+        <SectionHeader title="EVERYTHING CHECKED" subtitle={`${data.sections.length} sources`} />
+        {data.sections.map(s => (
+          <BriefingSection key={s.key} section={s} onOpenSymbol={onOpenSymbol} />
+        ))}
+        <div style={{ padding: "12px 20px", fontSize: 10.5, color: t.textFaint, lineHeight: 1.6 }}>
+          {data.coverage}
+        </div>
+        {data.failures.length > 0 && (
+          <div style={{ padding: "0 20px 14px", fontSize: 11, color: t.negative }}>
+            {data.failures.length} section{data.failures.length === 1 ? "" : "s"} failed to build:{" "}
+            {data.failures.map(f => `${f.section} (${f.error})`).join("; ")}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function WhatChangedPage({ prices, pulseCount, poll, feed }) {
+  const [data, setData] = useState(null);
+  const [lead, setLead] = useState(null);
+  const [rel, setRel] = useState(null);
+  const [cal, setCal] = useState(null);
+  const [calBusy, setCalBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [fearGreed, setFearGreed] = useState(null);
+  const [fgTried, setFgTried] = useState(false);
+  const [aiRead, setAiRead] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const [c, l, r, cal] = await Promise.all([
+        fetch(`${API}/changes?limit=14`).then(x => x.json()),
+        fetch(`${API}/leadership?window=21`).then(x => x.json()),
+        fetch(`${API}/relationships`).then(x => x.json()),
+        // "What is coming up" belongs beside "what changed", and for a book of
+        // index funds there are only ever a handful of dated events — not
+        // enough to justify a page of its own.
+        fetch(`${API}/calendar?days=90`).then(x => x.json()).catch(() => null),
+      ]);
+      setData(c); setLead(l); setRel(r); setCal(cal);
+    } catch {
+      setErr("Could not reach the Meridian API. Start it with: npm run server");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const get = () => fetchFearAndGreed().then(d => { setFearGreed(d); setFgTried(true); });
+    get();
+    const t = setInterval(get, 300000);
+    return () => clearInterval(t);
+  }, []);
+
+  if (err) {
+    return (
+      <Panel>
+        <SectionHeader title="WHAT CHANGED" action="RETRY" onAction={load} />
+        <div style={{ padding: 20, color: "#ff4757", fontSize: 12, fontFamily: "monospace" }}>{err}</div>
+      </Panel>
+    );
+  }
+
+  if (loading && !data) {
+    return (
+      <Panel>
+        <SectionHeader title="WHAT CHANGED" />
+        <div style={{ padding: 20, color: "#4a6080", fontSize: 12, fontFamily: "monospace" }}>Reading the memory…</div>
+      </Panel>
+    );
+  }
+
+  // The memory is empty until history has been synced at least once. Say what
+  // to run rather than rendering an empty page that looks broken.
+  if (data && !data.available) {
+    return (
+      <Panel>
+        <SectionHeader title="WHAT CHANGED" subtitle="No memory yet" action="RETRY" onAction={load} />
+        <div style={{ padding: 20, fontSize: 12, color: "#7a8ba0", lineHeight: 1.8, fontFamily: "monospace" }}>
+          {data.reason}
+          <div style={{ marginTop: 12, color: "#4a6080" }}>
+            curl -X POST http://localhost:4001/sync
+          </div>
+        </div>
+      </Panel>
+    );
+  }
+
+  const tone = TONE_STYLE[data.verdict?.tone] ?? TONE_STYLE.mild;
+  const r = data.regime;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      {/* The verdict. Allowed to say nothing happened. */}
+      <div style={{
+        background: "#0d1117", border: `1px solid ${tone.color}35`, borderRadius: 6,
+        padding: "14px 18px", display: "flex", alignItems: "center", gap: 18, flexWrap: "wrap",
+      }}>
+        <div>
+          <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1.5 }}>SESSION VERDICT</div>
+          <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color: tone.color, letterSpacing: 1, marginTop: 3 }}>
+            {tone.label}
+          </div>
+        </div>
+        <div style={{ flex: 1, minWidth: 260, fontSize: 13, color: "#a0b4c8", lineHeight: 1.6 }}>
+          {data.verdict?.text}
+        </div>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace" }}>SESSION</div>
+          <div style={{ fontFamily: "monospace", fontSize: 12, color: "#7a8ba0" }}>{data.date}</div>
+          <div style={{ fontSize: 9, color: "#2a3548", fontFamily: "monospace" }}>
+            {data.observed} instruments · vs {data.previousDate ?? "—"}
+          </div>
+        </div>
+        <PulseIndicator pulseCount={pulseCount} feed={feed} />
+      </div>
+
+      {/* On demand. Auto-generating a paragraph every load is how a quiet day
+          ends up with a narrative attached to it. */}
+      <Panel>
+        <SectionHeader
+          title="SESSION READ"
+          subtitle="AI, given the sigma-scored moves and breadth above — not raw prices"
+          action={aiLoading ? "READING\u2026" : aiRead ? "REGENERATE" : "GENERATE"}
+          onAction={() => fetchSessionRead(data, setAiRead, setAiLoading)}
+        />
+        <div style={{ padding: 14 }}>
+          {aiLoading ? (
+            <span style={{ color: "#4a6080", fontSize: 12, fontFamily: "monospace" }}>Reading the session\u2026</span>
+          ) : aiRead ? (
+            <div style={{ fontSize: 13, lineHeight: 1.75, color: "#a0b4c8", borderLeft: "2px solid #00d4aa30", paddingLeft: 12 }}>
+              {aiRead.split("\n\n").filter(Boolean).map((para, i) => (
+                <p key={i} style={{ margin: "0 0 10px 0" }}>{para}</p>
+              ))}
+            </div>
+          ) : (
+            <span style={{ color: "#3a4558", fontSize: 12, fontFamily: "monospace" }}>
+              Not generated. The verdict above already says whether anything happened.
+            </span>
+          )}
+        </div>
+      </Panel>
+
+      {/* Universe-level state, each figure with its own historical percentile. */}
+      <Panel>
+        <SectionHeader
+          title="UNIVERSE STATE"
+          subtitle={r ? `${r.nSymbols} instruments · derived from stored daily bars` : "not enough coverage"}
+          action="REFRESH" onAction={load}
+        />
+        <div style={{ padding: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <RegimeStat label="ABOVE 50DMA" value={pctPlain(r?.breadth50)} percentile={r?.breadth50Pct}
+                      hint="Needs 50 bars per symbol" />
+          <RegimeStat label="ABOVE 200DMA" value={pctPlain(r?.breadth200)} percentile={r?.breadth200Pct}
+                      hint="Needs 200 bars per symbol" />
+          <RegimeStat label="DISPERSION" value={r?.dispersion != null ? (r.dispersion * 100).toFixed(2) + "%" : null}
+                      percentile={r?.dispersionPct}
+                      hint="Cross-sectional spread of same-day returns" />
+          <RegimeStat label="AVG CORRELATION" value={r?.avgCorr != null ? r.avgCorr.toFixed(2) : null}
+                      percentile={r?.avgCorrPct}
+                      hint="Mean pairwise 60-day correlation" />
+          <RegimeStat label="ADVANCING" value={pctPlain(r?.pctUp)} percentile={null} />
+          <RegimeStat label="2σ DAYS" value={pctPlain(r?.pctExtreme)} percentile={null}
+                      hint="Share of the universe with an unusual move" />
+        </div>
+        {r?.breadth50Streak > 1 && (
+          <div style={{ padding: "0 14px 12px", fontSize: 11, color: "#7a8ba0" }}>
+            Breadth has been {r.breadth50 >= 0.5 ? "above" : "below"} half for{" "}
+            <span style={{ color: "#c8d6e8", fontWeight: 700 }}>{r.breadth50Streak}</span> consecutive sessions.
+          </div>
+        )}
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr", gap: 14, alignItems: "start" }}>
+
+        {/* Instruments that moved beyond their own normal range. */}
+        <Panel>
+          <SectionHeader
+            title="MOVED UNUSUALLY"
+            subtitle="Ranked by standard deviations against each instrument's own trailing year"
+          />
+          {data.notable.length === 0 ? (
+            <div style={{ padding: 20, fontSize: 12, color: "#4a6080", fontFamily: "monospace", lineHeight: 1.7 }}>
+              Nothing moved beyond 1.5σ of its own normal range.
+              <div style={{ color: "#2a3548", marginTop: 6 }}>
+                That is the expected result on most days.
+              </div>
+            </div>
+          ) : (
+            <>
+              <div style={{
+                display: "grid", gridTemplateColumns: "minmax(90px,1.4fr) 74px 62px 1fr",
+                gap: 10, padding: "6px 12px", borderBottom: "1px solid #1a1f2e",
+                fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1,
+              }}>
+                <span>INSTRUMENT</span>
+                <span style={{ textAlign: "right" }}>DAY</span>
+                <span style={{ textAlign: "right" }}>SIGMA</span>
+                <span style={{ textAlign: "right" }}>CONTEXT</span>
+              </div>
+              {data.notable.map(n => <ChangeRow key={n.symbol} n={n} />)}
+            </>
+          )}
+        </Panel>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+          {/* Leadership rotation — needs two windows, so no quote page has it. */}
+          <Panel>
+            <SectionHeader title="LEADERSHIP" subtitle="21 sessions, and how the ranking has rotated" />
+            {!lead?.available ? (
+              <div style={{ padding: 16 }}><NoData reason="Not enough stored history" /></div>
+            ) : (
+              <div style={{ padding: "6px 0" }}>
+                {lead.groups.map(g => (
+                  <div key={g.group} style={{
+                    display: "flex", alignItems: "center", gap: 10,
+                    padding: "6px 14px", fontSize: 11,
+                  }}>
+                    <span style={{ flex: 1, color: "#7a8ba0", fontFamily: "monospace" }}>{g.group}</span>
+                    <span style={{ fontFamily: "monospace", color: signColor(g.ret), minWidth: 58, textAlign: "right" }}>
+                      {pct(g.ret, 2)}
+                    </span>
+                    {/* Rank movement is the rotation signal; flat means no change. */}
+                    <span style={{
+                      minWidth: 34, textAlign: "right", fontFamily: "monospace", fontSize: 10,
+                      color: g.rankChange == null ? "#2a3548" : g.rankChange > 0 ? "#00d4aa" : g.rankChange < 0 ? "#ff4757" : "#3a4558",
+                    }} title={g.priorRank != null ? `Ranked ${g.priorRank + 1} a month ago, ${g.rank + 1} now` : "No prior window"}>
+                      {g.rankChange == null ? "·" : g.rankChange === 0 ? "—" : `${g.rankChange > 0 ? "▲" : "▼"}${Math.abs(g.rankChange)}`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+
+          {/* Relationships that changed — the reason to keep history at all. */}
+          <Panel>
+            <SectionHeader title="RELATIONSHIPS" subtitle="60-day correlation vs the preceding 60" />
+            {!rel?.available ? (
+              <div style={{ padding: 16 }}><NoData reason="Needs 120 sessions of overlapping history" /></div>
+            ) : (
+              <div style={{ padding: "6px 0" }}>
+                {rel.pairs.slice(0, 6).map(p => (
+                  <div key={p.pair} style={{ padding: "6px 14px", fontSize: 11 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ flex: 1, color: "#7a8ba0", fontFamily: "monospace", fontSize: 10 }}>{p.pair}</span>
+                      <span style={{ fontFamily: "monospace", color: "#3a4558" }}>{p.previous.toFixed(2)}</span>
+                      <span style={{ color: "#2a3548" }}>→</span>
+                      <span style={{ fontFamily: "monospace", color: p.flipped ? "#ffa502" : "#c8d6e8", fontWeight: 700 }}>
+                        {p.now.toFixed(2)}
+                      </span>
+                    </div>
+                    {p.percentile != null && (p.percentile >= 0.9 || p.percentile <= 0.1) && (
+                      <div style={{ fontSize: 9, color: "#ffa502", marginTop: 1 }}>
+                        {ordinal(Math.round(p.percentile * 100))} percentile of the past year
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Panel>
+
+          <Panel>
+            <SectionHeader
+              title="COMING UP"
+              subtitle="Next 90 days, for what you hold or watch"
+              action={calBusy ? "FETCHING\u2026" : "\u21bb FETCH"}
+              onAction={async () => {
+                setCalBusy(true);
+                try {
+                  const res = await fetch(`${API}/calendar/refresh`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ days: 90 }),
+                  });
+                  setCal(await res.json());
+                } catch { /* leave the previous view in place */ }
+                finally { setCalBusy(false); }
+              }}
+            />
+            {!cal?.events?.length ? (
+              <div style={{ padding: 14, fontSize: 11, color: "#4a6080", lineHeight: 1.7 }}>
+                No dated events in the next 90 days.
+                {cal?.unresolved?.length > 0 && (
+                  <div style={{ color: "#2a3548", marginTop: 5 }}>
+                    {cal.unresolved.length} instrument{cal.unresolved.length === 1 ? "" : "s"} not looked up yet.
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ padding: "4px 0" }}>
+                {cal.events.slice(0, 6).map(ev => (
+                  <div key={ev.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 14px", fontSize: 11 }}>
+                    <span style={{
+                      fontFamily: "monospace", fontSize: 10, minWidth: 52,
+                      color: ev.daysAway <= 7 ? "#ffa502" : "#4a6080",
+                    }}>{ev.daysAway <= 0 ? "today" : `${ev.daysAway}d`}</span>
+                    <span style={{ flex: 1, color: "#a0b4c8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {ev.title}
+                    </span>
+                    <span style={{ fontSize: 9, fontFamily: "monospace", color: ev.relevance === "held" ? "#00d4aa" : "#3d8bff" }}>
+                      {ev.relevance}
+                    </span>
+                  </div>
+                ))}
+                {cal.events.length > 6 && (
+                  <div style={{ padding: "4px 14px 8px", fontSize: 9, color: "#2a3548", fontFamily: "monospace" }}>
+                    +{cal.events.length - 6} more
+                  </div>
+                )}
+              </div>
+            )}
+            <div style={{ padding: "0 14px 10px", fontSize: 9, color: "#2a3548", lineHeight: 1.5 }}>
+              Earnings and dividend dates plus the ISA deadline. Macro releases are not covered.
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader title="FEAR & GREED" subtitle="CNN — external source" />
+            <FearGreedGauge data={fearGreed} tried={fgTried} />
+          </Panel>
+        </div>
+      </div>
+
+      {/* Provenance, stated rather than implied. */}
+      <div style={{ fontSize: 10, color: "#2a3548", fontFamily: "monospace", padding: "0 4px" }}>
+        {data.source} · Fear &amp; Greed from CNN. Live quotes polled {ageLabel(feed?.upstreamAt)}.
+      </div>
+    </div>
+  );
+}
+
+
+// MACRO & REGIME DASHBOARD PAGE
+// ============================================================
+
+function GaugeBar({ label, value, max = 100, color = "#00d4aa", format = v => `${v}%` }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+        <span style={{ fontSize: 11, color: "#7a8ba0" }}>{label}</span>
+        <span style={{ fontSize: 11, fontFamily: "monospace", color }}>{format(value)}</span>
+      </div>
+      <div style={{ height: 5, background: "#1a2535", borderRadius: 3 }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3, transition: "width 0.6s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+
+
+// ============================================================
+// WATCHLIST
+//
+// A list of symbols with prices next to them is the single easiest thing to
+// get for free, and any broker does it better. So this is not that.
+//
+// The watchlist table has existed in the database since v2 and the page never
+// touched it — it kept INITIAL_WATCHLIST, six invented positions with fixed
+// prices, fixed triggers and fixed catalysts, in React state that reset on
+// reload.
+//
+// It now reads the real table, and shows each name the way the memory layer
+// sees it: how unusual today's move was in that instrument's own terms, where
+// it sits in its own yearly range, how far it is from the target you set, and
+// what the factor screener makes of it. That is a watchlist answering "is
+// anything I care about doing something", which is a different question from
+// "what are these worth".
+// ============================================================
+
+const TIERS = [
+  { id: 1, label: "Conviction", color: "#00d4aa" },
+  { id: 2, label: "Active",     color: "#ffa502" },
+  { id: 3, label: "Monitoring", color: "#3d8bff" },
+];
+
+const tierMeta = t => TIERS.find(x => x.id === Number(t)) ?? TIERS[2];
+
+function WatchlistPage() {
+  const [items, setItems] = useState([]);
+  const [obs, setObs] = useState({});
+  const [scores, setScores] = useState({});
+  const [prices, setPrices] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [draft, setDraft] = useState({ symbol: "", tier: 3, target: "", note: "" });
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const wl = await fetch(`${API}/watchlist`).then(r => r.json());
+      const list = wl.watchlist ?? [];
+      setItems(list);
+
+      if (list.length) {
+        const syms = list.map(i => i.symbol).join(",");
+        // Memory, screener scores and live quotes are independent — a failure
+        // in any one of them must not blank the other two.
+        const [m, p] = await Promise.all([
+          fetch(`${API}/memory/latest?symbols=${encodeURIComponent(syms)}`).then(r => r.json()).catch(() => ({})),
+          fetch(`${API}/prices`).then(r => r.json()).catch(() => ({})),
+        ]);
+        setObs(m.observations ?? {});
+        setPrices(p.prices ?? {});
+
+        const scored = await Promise.all(list.map(i =>
+          fetch(`${API}/score?symbol=${encodeURIComponent(i.symbol)}`)
+            .then(r => r.json()).then(d => [i.symbol, d?.composite ?? null]).catch(() => [i.symbol, null])));
+        setScores(Object.fromEntries(scored));
+      } else {
+        setObs({}); setScores({}); setPrices({});
+      }
+    } catch {
+      setErr("Could not reach the Meridian API. Start it with: npm run server");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function add() {
+    const symbol = draft.symbol.trim().toUpperCase();
+    if (!symbol) return;
+    setBusy(true);
+    try {
+      await fetch(`${API}/watchlist`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol, tier: Number(draft.tier),
+          target: draft.target === "" ? null : Number(draft.target),
+          note: draft.note.trim() || null,
+        }),
+      });
+      setDraft({ symbol: "", tier: 3, target: "", note: "" });
+      setAdding(false);
+      await load();
+    } finally { setBusy(false); }
+  }
+
+  async function remove(id) {
+    setBusy(true);
+    try {
+      await fetch(`${API}/watchlist?id=${id}`, { method: "DELETE" });
+      await load();
+    } finally { setBusy(false); }
+  }
+
+  const GRID = "minmax(110px,1.3fr) 84px 76px 62px 96px 92px 80px 34px";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader
+          title="WATCHLIST"
+          subtitle={`${items.length} name${items.length === 1 ? "" : "s"} · scored against each instrument's own history`}
+          action={adding ? "CANCEL" : "+ ADD"}
+          onAction={() => setAdding(a => !a)}
+          extra={
+            <button onClick={load} disabled={loading} style={{
+              background: "transparent", border: "1px solid #1a2535", color: "#4a6080",
+              fontSize: 10, padding: "3px 9px", borderRadius: 3, cursor: "pointer", fontFamily: "monospace",
+            }}>{loading ? "…" : "↻ REFRESH"}</button>
+          }
+        />
+
+        {adding && (
+          <div style={{ padding: "12px 14px", background: "#080b12", borderBottom: "1px solid #1a1f2e",
+                        display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <input
+              autoFocus placeholder="Symbol (e.g. VUSA.L)" value={draft.symbol}
+              onChange={e => setDraft(d => ({ ...d, symbol: e.target.value }))}
+              onKeyDown={e => e.key === "Enter" && add()}
+              style={fieldStyle(150)}
+            />
+            <select value={draft.tier} onChange={e => setDraft(d => ({ ...d, tier: e.target.value }))} style={fieldStyle(130)}>
+              {TIERS.map(t => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </select>
+            <input
+              placeholder="Target price" value={draft.target} type="number" step="any"
+              onChange={e => setDraft(d => ({ ...d, target: e.target.value }))}
+              style={fieldStyle(110)}
+            />
+            <input
+              placeholder="Note — why are you watching it?" value={draft.note}
+              onChange={e => setDraft(d => ({ ...d, note: e.target.value }))}
+              onKeyDown={e => e.key === "Enter" && add()}
+              style={fieldStyle(280)}
+            />
+            <button onClick={add} disabled={busy || !draft.symbol.trim()} style={btn("#00d4aa")}>
+              {busy ? "SAVING…" : "ADD"}
+            </button>
+          </div>
+        )}
+
+        {err ? (
+          <div style={{ padding: 20, color: "#ff4757", fontSize: 12, fontFamily: "monospace" }}>{err}</div>
+        ) : loading && !items.length ? (
+          <div style={{ padding: 20, color: "#4a6080", fontSize: 12, fontFamily: "monospace" }}>Loading…</div>
+        ) : !items.length ? (
+          <div style={{ padding: 22, color: "#4a6080", fontSize: 12, fontFamily: "monospace", lineHeight: 1.8 }}>
+            Nothing on the watchlist yet.
+            <div style={{ color: "#2a3548", marginTop: 6 }}>
+              Add a symbol and it will be tracked, priced and scored alongside your holdings.
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{
+              display: "grid", gridTemplateColumns: GRID, gap: 10,
+              padding: "7px 14px", borderBottom: "1px solid #1a1f2e",
+              fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1,
+            }}>
+              <span>SYMBOL</span>
+              <span style={{ textAlign: "right" }}>LAST</span>
+              <span style={{ textAlign: "right" }}>DAY</span>
+              <span style={{ textAlign: "right" }}>SIGMA</span>
+              <span style={{ textAlign: "right" }}>1Y RANGE</span>
+              <span style={{ textAlign: "right" }}>TO TARGET</span>
+              <span style={{ textAlign: "right" }}>SCORE</span>
+              <span />
+            </div>
+
+            {items.map(it => {
+              const o = obs[it.symbol];
+              const live = prices[it.symbol];
+              const t = tierMeta(it.tier);
+              const last = live?.price ?? o?.close ?? null;
+              const sigma = o?.ret_z;
+              const toTarget = (it.target && last) ? (it.target / last - 1) : null;
+              const score = scores[it.symbol];
+
+              return (
+                <div key={it.id} style={{
+                  display: "grid", gridTemplateColumns: GRID, gap: 10,
+                  padding: "9px 14px", borderBottom: "1px solid #10151f", alignItems: "center",
+                }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ width: 3, height: 12, background: t.color, borderRadius: 2 }} />
+                      <span style={{ fontFamily: "monospace", fontSize: 12, color: "#c8d6e8", fontWeight: 700 }}>
+                        {it.symbol}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 9, color: "#3a4558", marginTop: 2, overflow: "hidden",
+                                  textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {t.label}{it.note ? ` · ${it.note}` : ""}
+                    </div>
+                  </div>
+
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 12, color: "#c8d6e8" }}>
+                    {last != null ? last.toFixed(2) : <NoData compact reason="No price and no stored bars" />}
+                  </span>
+
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 12,
+                                 color: signColor(o?.ret_1d) }}>
+                    {o?.ret_1d != null ? pct(o.ret_1d, 2) : <NoData compact reason="No stored history" />}
+                  </span>
+
+                  {/* The comparable number: how big that move was for this instrument. */}
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 11,
+                                 color: sigma == null ? "#3a4558"
+                                      : Math.abs(sigma) >= 2 ? "#ffa502"
+                                      : Math.abs(sigma) >= 1.5 ? "#c8d6e8" : "#4a6080" }}>
+                    {sigma != null ? `${Math.abs(sigma).toFixed(1)}σ` : <NoData compact reason="Needs a year of bars" />}
+                  </span>
+
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 11, color: "#7a8ba0" }}>
+                    {o?.pct_rank != null ? `${Math.round(o.pct_rank * 100)}%` : <NoData compact reason="Needs a year of bars" />}
+                  </span>
+
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 11,
+                                 color: toTarget == null ? "#3a4558" : Math.abs(toTarget) < 0.02 ? "#00d4aa" : "#7a8ba0" }}>
+                    {toTarget != null ? pct(toTarget, 1) : <NoData compact reason="No target set" />}
+                  </span>
+
+                  <span style={{ textAlign: "right", fontFamily: "monospace", fontSize: 12,
+                                 color: compositeColor(score), fontWeight: 700 }}>
+                    {score != null ? score.toFixed(0) : <NoData compact reason="Under 120 stored bars" />}
+                  </span>
+
+                  <button onClick={() => remove(it.id)} disabled={busy} title="Remove" style={{
+                    background: "transparent", border: "none", color: "#3a4558",
+                    cursor: "pointer", fontSize: 13, padding: 0,
+                  }}>×</button>
+                </div>
+              );
+            })}
+
+            <div style={{ padding: "8px 14px", fontSize: 10, color: "#2a3548", fontFamily: "monospace" }}>
+              Sigma and 1-year range from stored daily bars · score from the factor screener · last price from the live feed where available
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// ============================================================
+// SCREENER
+//
+// The backend has scored every tracked symbol against six weighted factor
+// strategies since v2, entirely from stored bar history — /screen and /score
+// in server/engines/screener.js. This page never called either. It rendered
+// SCREENER_RESULTS: twenty-one lines of fixed rows with invented composite
+// scores, invented setups and invented invalidation levels that never changed
+// no matter what the market did.
+//
+// This is now a front end for the engine that was already there.
+// ============================================================
+
+function ScoreBar({ score, color = "#00d4aa", showValue = true }) {
+  if (score == null) return <NoData compact reason="Not scored" />;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ flex: 1, height: 4, background: "#141b28", borderRadius: 2, overflow: "hidden", minWidth: 40 }}>
+        <div style={{ width: `${Math.max(0, Math.min(100, score))}%`, height: "100%", background: color, borderRadius: 2 }} />
+      </div>
+      {showValue && (
+        <span style={{ fontFamily: "monospace", fontSize: 10, color: "#7a8ba0", minWidth: 26, textAlign: "right" }}>
+          {score.toFixed(0)}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Colour by strength so a table of sixty rows can be read at a glance.
+function compositeColor(v) {
+  if (v == null) return "#3a4558";
+  if (v >= 70) return "#00d4aa";
+  if (v >= 55) return "#a8e063";
+  if (v >= 45) return "#ffa502";
+  return "#ff7043";
+}
+
+const FACTOR_COLORS = {
+  trend: "#00d4aa", momentum: "#3d8bff", meanRev: "#a855f7",
+  volume: "#ffa502", lowVol: "#4ade80", breakout: "#ff7043",
+};
+
+/** Expanded detail for one result — the components behind its composite. */
+function ScreenDetail({ r }) {
+  const m = r.metrics;
+  const cell = (label, value, suffix = "") => (
+    <div key={label}>
+      <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontFamily: "monospace", fontSize: 12, color: value == null ? "#3a4558" : "#c8d6e8", marginTop: 2 }}>
+        {value == null ? <NoData compact /> : `${value}${suffix}`}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ padding: "12px 16px", background: "#080b12", borderBottom: "1px solid #10151f" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+
+        <div>
+          <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, marginBottom: 8 }}>
+            FACTOR COMPONENTS
+          </div>
+          {Object.entries(r.scores).map(([k, v]) => (
+            <div key={k} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 5 }}>
+              <span style={{ fontSize: 10, color: "#7a8ba0", minWidth: 74, fontFamily: "monospace" }}>{k}</span>
+              <div style={{ flex: 1 }}><ScoreBar score={v} color={FACTOR_COLORS[k] ?? "#4a6080"} /></div>
+            </div>
+          ))}
+          <div style={{ fontSize: 9, color: "#2a3548", marginTop: 8, lineHeight: 1.5 }}>
+            Weighted by the selected strategy. Computed from {r.observations} stored daily bars.
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, marginBottom: 8 }}>
+            MEASURES
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px 14px" }}>
+            {cell("1M", m.return1m, "%")}
+            {cell("3M", m.return3m, "%")}
+            {cell("6M", m.return6m, "%")}
+            {cell("12-1M", m.return12m1, "%")}
+            {cell("RSI(14)", m.rsi)}
+            {cell("Z-SCORE", m.zScore)}
+            {cell("ANN VOL", m.annualVol, "%")}
+            {cell("VOL RATIO", m.volumeRatio, "×")}
+            {cell("52W RANGE", m.rangePosition, "%")}
+            {cell("50DMA", m.ma50)}
+            {cell("200DMA", m.ma200)}
+            {cell("MACD HIST", m.macdHistogram)}
+          </div>
+
+          {r.signals.length > 0 && (
+            <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {r.signals.map(s => (
+                <span key={s} style={{
+                  fontSize: 10, fontFamily: "monospace", padding: "2px 7px", borderRadius: 3,
+                  background: "#0d1421", border: "1px solid #1a2535", color: "#7a8ba0",
+                }}>{s}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScreenerPage() {
+  const [strategy, setStrategy] = useState("balanced");
+  const [strategies, setStrategies] = useState(null);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [expanded, setExpanded] = useState(null);
+  const [minScore, setMinScore] = useState(0);
+
+  useEffect(() => {
+    fetch(`${API}/screener/strategies`)
+      .then(r => r.json())
+      .then(d => setStrategies(d.screener ?? null))
+      .catch(() => {});
+  }, []);
+
+  const run = useCallback(async (strat, floor) => {
+    setLoading(true); setErr(null);
+    try {
+      const res = await fetch(`${API}/screen`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ strategy: strat, minScore: floor, limit: 60 }),
+      });
+      setData(await res.json());
+    } catch {
+      setErr("Could not reach the Meridian API. Start it with: npm run server");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { run(strategy, minScore); }, [strategy, minScore, run]);
+
+  const stratList = strategies
+    ? Object.entries(strategies).map(([id, s]) => ({ id, label: s.label }))
+    : [{ id: "balanced", label: "Balanced" }];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      <Panel>
+        <SectionHeader
+          title="SCREENER"
+          subtitle="Factor scores computed from stored daily bars"
+          action={loading ? "SCANNING…" : "RESCAN"}
+          onAction={() => run(strategy, minScore)}
+        />
+
+        <div style={{ padding: "10px 14px", display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", borderBottom: "1px solid #1a1f2e" }}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {stratList.map(s => (
+              <button key={s.id} onClick={() => setStrategy(s.id)} style={{
+                background: strategy === s.id ? "#0d2820" : "transparent",
+                border: `1px solid ${strategy === s.id ? "#00d4aa50" : "#1a2535"}`,
+                color: strategy === s.id ? "#00d4aa" : "#4a6080",
+                fontFamily: "monospace", fontSize: 11, padding: "4px 10px",
+                borderRadius: 3, cursor: "pointer",
+              }}>{s.label}</button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+            <span style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace" }}>MIN SCORE</span>
+            <input
+              type="range" min="0" max="80" step="5" value={minScore}
+              onChange={e => setMinScore(Number(e.target.value))}
+              style={{ width: 110, accentColor: "#00d4aa" }}
+            />
+            <span style={{ fontFamily: "monospace", fontSize: 11, color: "#c8d6e8", minWidth: 20 }}>{minScore}</span>
+          </div>
+        </div>
+
+        {err ? (
+          <div style={{ padding: 20, color: "#ff4757", fontSize: 12, fontFamily: "monospace" }}>{err}</div>
+        ) : loading && !data ? (
+          <div style={{ padding: 20, color: "#4a6080", fontSize: 12, fontFamily: "monospace" }}>Scoring stored history…</div>
+        ) : !data?.results?.length ? (
+          <div style={{ padding: 20, color: "#4a6080", fontSize: 12, fontFamily: "monospace", lineHeight: 1.7 }}>
+            Nothing scored{minScore > 0 ? ` above ${minScore}` : ""}.
+            {data?.skipped?.length > 0 && (
+              <div style={{ color: "#2a3548", marginTop: 6 }}>
+                {data.skipped.length} symbol{data.skipped.length === 1 ? "" : "s"} skipped for having under 120 stored bars.
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            <div style={{
+              display: "grid", gridTemplateColumns: "22px minmax(90px,1.2fr) 80px 90px 1.1fr 1.4fr",
+              gap: 10, padding: "7px 14px", borderBottom: "1px solid #1a1f2e",
+              fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1,
+            }}>
+              <span />
+              <span>SYMBOL</span>
+              <span style={{ textAlign: "right" }}>PRICE</span>
+              <span style={{ textAlign: "right" }}>COMPOSITE</span>
+              <span>STRENGTH</span>
+              <span>SIGNALS</span>
+            </div>
+
+            {data.results.map(r => {
+              const open = expanded === r.symbol;
+              return (
+                <div key={r.symbol}>
+                  <div
+                    onClick={() => setExpanded(open ? null : r.symbol)}
+                    style={{
+                      display: "grid", gridTemplateColumns: "22px minmax(90px,1.2fr) 80px 90px 1.1fr 1.4fr",
+                      gap: 10, padding: "8px 14px", borderBottom: "1px solid #10151f",
+                      cursor: "pointer", alignItems: "center",
+                      background: open ? "#0b0f18" : "transparent",
+                    }}
+                  >
+                    <span style={{ color: "#3a4558", fontSize: 10 }}>{open ? "▾" : "▸"}</span>
+                    <span style={{ fontFamily: "monospace", fontSize: 12, color: "#c8d6e8", fontWeight: 700 }}>
+                      {r.symbol}
+                    </span>
+                    <span style={{ fontFamily: "monospace", fontSize: 12, color: "#7a8ba0", textAlign: "right" }}>
+                      {r.price}
+                    </span>
+                    <span style={{
+                      fontFamily: "monospace", fontSize: 14, fontWeight: 700,
+                      color: compositeColor(r.composite), textAlign: "right",
+                    }}>
+                      {r.composite}
+                    </span>
+                    <ScoreBar score={r.composite} color={compositeColor(r.composite)} showValue={false} />
+                    <span style={{ fontSize: 10, color: "#4a6080", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {r.signals.length ? r.signals.join(" · ") : "—"}
+                    </span>
+                  </div>
+                  {open && <ScreenDetail r={r} />}
+                </div>
+              );
+            })}
+
+            <div style={{ padding: "8px 14px", fontSize: 10, color: "#2a3548", fontFamily: "monospace" }}>
+              {data.strategyLabel} · scanned {data.scanned}, showing {data.results.length}
+              {data.skipped?.length > 0 && ` · ${data.skipped.length} skipped for insufficient history`}
+            </div>
+          </>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+const CB_MATRIX = [
+  { bank: "Federal Reserve", country: "US", rate: "5.25-5.50%", bias: "Hold / Hawkish", nextMeeting: "Mar 19", expectation: "Hold", color: "#3d8bff" },
+  { bank: "ECB", country: "Eurozone", rate: "4.00%", bias: "Cutting", nextMeeting: "Apr 11", expectation: "Cut -25bp", color: "#ffa502" },
+  { bank: "Bank of England", country: "UK", rate: "5.25%", bias: "Hold / Hawkish", nextMeeting: "May 9", expectation: "Hold", color: "#00d4aa" },
+  { bank: "Bank of Japan", country: "Japan", rate: "0.10%", bias: "Hiking slowly", nextMeeting: "Apr 26", expectation: "Hold", color: "#ff4757" },
+  { bank: "Bank of Canada", country: "Canada", rate: "5.00%", bias: "Cutting", nextMeeting: "Apr 10", expectation: "Cut -25bp", color: "#a855f7" },
+  { bank: "SNB", country: "Switzerland", rate: "1.50%", bias: "Cutting", nextMeeting: "Jun 20", expectation: "Hold", color: "#c8d6e8" },
+];
+
+// ============================================================
+// MARKETS PAGE
+// Replaces the old FX & Commod. page. One hub for every quoted
+// market: indices, FX, commodities, sectors, rates, crypto,
+// central banks.
+//
+// Two rules hold across every sub-page here:
+//   1. Prices are live or absent — never a hardcoded stand-in.
+//      The page this replaced showed fabricated support/resistance
+//      levels next to real quotes, which is worse than showing
+//      nothing: it reads as data.
+//   2. One visual language. Every board is built from the same
+//      MarketTile / Sparkline / RangeBar / heat-cell parts, so the
+//      sub-pages read as one page rather than seven.
+// ============================================================
+
+const MK = {
+  panel: "#0d1117", panelAlt: "#080b12", hair: "#12161f",
+  border: "#1a1f2e", border2: "#1a2535",
+  up: "#00d4aa", down: "#ff4757", flat: "#4a6080",
+  blue: "#3d8bff", amber: "#ffa502", purple: "#a855f7",
+  ink: "#e8f0fe", ink2: "#c8d6e8", ink3: "#7a8ba0", ink4: "#4a6080", ink5: "#3a4558",
+  mono: "monospace",
+};
+
+// VIX and similar inverted gauges: a rising print is risk-off, so the
+// usual green-is-good mapping would tell the opposite story.
+const INVERTED = new Set(["^VIX"]);
+const moveColor = (pct, symbol) => {
+  if (pct == null || Number.isNaN(pct)) return MK.flat;
+  const good = INVERTED.has(symbol) ? pct < 0 : pct >= 0;
+  return Math.abs(pct) < 0.005 ? MK.flat : (good ? MK.up : MK.down);
+};
+
+// Diverging scale: two hues with a NEUTRAL midpoint. A hue at zero would
+// imply direction where there is none, so near-flat values go grey.
+function heatStyle(pct, scale = 2) {
+  if (pct == null || Number.isNaN(pct)) return { background: MK.hair, color: MK.ink5 };
+  const t = Math.max(-1, Math.min(1, pct / scale));
+  if (Math.abs(t) < 0.05) return { background: "#141a24", color: MK.ink4 };
+  const rgb = t > 0 ? "0,212,170" : "255,71,87";
+  return {
+    background: `rgba(${rgb},${(0.10 + Math.abs(t) * 0.42).toFixed(3)})`,
+    color: t > 0 ? MK.up : MK.down,
+  };
+}
+
+const pctText = v => (v == null || Number.isNaN(v) ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`);
+
+// ─── Primitives ──────────────────────────────────────────────
+
+/** Bare shape-of-the-trend line. Renders nothing when history is missing. */
+function Sparkline({ data, color = MK.up, width = 120, height = 30, fill = true, id }) {
+  if (!Array.isArray(data) || data.length < 2) return null;
+  const lo = Math.min(...data), hi = Math.max(...data);
+  const span = hi - lo || 1;
+  const dx = width / (data.length - 1);
+  // Guard the top and bottom by 2px so peaks aren't clipped by the viewBox.
+  const y = v => height - 2 - ((v - lo) / span) * (height - 4);
+  const pts = data.map((v, i) => `${(i * dx).toFixed(2)},${y(v).toFixed(2)}`);
+  const gid = `sg-${id}`;
+  const lastX = (data.length - 1) * dx, lastY = y(data[data.length - 1]);
+  return (
+    <svg width={width} height={height} style={{ display: "block", overflow: "visible" }} aria-hidden="true">
+      {fill && (
+        <>
+          <defs>
+            <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity="0.28" />
+              <stop offset="100%" stopColor={color} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <polygon points={`0,${height} ${pts.join(" ")} ${width},${height}`} fill={`url(#${gid})`} />
+        </>
+      )}
+      <polyline points={pts.join(" ")} fill="none" stroke={color} strokeWidth="1.5"
+                strokeLinejoin="round" strokeLinecap="round" />
+      {/* Emphasised endpoint — the eye should land on "now". */}
+      <circle cx={lastX} cy={lastY} r="2.4" fill={color} />
+    </svg>
+  );
+}
+
+/** Where the current print sits inside a low–high band. */
+function RangeBar({ low, high, value, label, compact = false, symbol }) {
+  if ([low, high, value].some(v => typeof v !== "number" || Number.isNaN(v)) || high <= low) return null;
+  const pos = Math.max(0, Math.min(1, (value - low) / (high - low)));
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      {label && <div style={{ fontSize: 8, color: MK.ink5, fontFamily: MK.mono, letterSpacing: 1 }}>{label}</div>}
+      <div style={{ position: "relative", height: compact ? 3 : 4, background: MK.border2, borderRadius: 2 }}>
+        <div style={{
+          position: "absolute", left: `${pos * 100}%`, top: -2, bottom: -2,
+          width: 2, background: MK.ink2, borderRadius: 1, transform: "translateX(-1px)",
+        }} />
+      </div>
+      {!compact && (
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: MK.ink5, fontFamily: MK.mono }}>
+          {/* Match the instrument's own precision — a 4dp index bound
+              ("5,568.7945") reads as noise next to a 2dp price. */}
+          <span>{symbol ? formatPrice(low, symbol) : low.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
+          <span>{symbol ? formatPrice(high, symbol) : high.toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Signed bar growing left or right from a shared centre line. */
+function DivergingBar({ value, max, label, sub, unit = "%" }) {
+  const t = max ? Math.max(-1, Math.min(1, value / max)) : 0;
+  const pos = t >= 0;
+  const col = Math.abs(t) < 0.02 ? MK.flat : pos ? MK.up : MK.down;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "84px 1fr 64px", alignItems: "center", gap: 10, padding: "5px 0" }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: MK.ink2, fontFamily: MK.mono }}>{label}</div>
+        {sub && <div style={{ fontSize: 9, color: MK.ink5 }}>{sub}</div>}
+      </div>
+      <div style={{ position: "relative", height: 14 }}>
+        <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "#2a3548" }} />
+        <div style={{
+          position: "absolute", top: 3, height: 8, borderRadius: 2, background: col,
+          left: pos ? "50%" : `${50 + t * 50}%`,
+          width: `${Math.abs(t) * 50}%`,
+        }} />
+      </div>
+      <div style={{ fontSize: 12, fontFamily: MK.mono, color: col, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+        {value >= 0 ? "+" : ""}{value.toFixed(2)}{unit}
+      </div>
+    </div>
+  );
+}
+
+/** The workhorse card. Every board on this page is a grid of these. */
+function MarketTile({ symbol, name, sub, prices, spark, onClick, active, unit }) {
+  const d = prices?.[symbol];
+  const pct = d?.changePct;
+  const col = moveColor(pct, symbol);
+  const live = !!d;
+
+  return (
+    <div
+      onClick={onClick}
+      role={onClick ? "button" : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      onKeyDown={onClick ? e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onClick(); } } : undefined}
+      style={{
+        background: MK.panel,
+        border: `1px solid ${active ? `${col}66` : MK.border}`,
+        borderTop: `2px solid ${live ? col : MK.border2}`,
+        borderRadius: 7,
+        padding: "12px 14px 10px",
+        cursor: onClick ? "pointer" : "default",
+        display: "flex", flexDirection: "column", gap: 8,
+        position: "relative", overflow: "hidden",
+        transition: "border-color .15s",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: MK.ink, fontFamily: MK.mono, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {name}
+          </div>
+          {sub && <div style={{ fontSize: 9.5, color: MK.ink5, marginTop: 1 }}>{sub}</div>}
+        </div>
+        {spark && spark.length > 1 && (
+          <Sparkline data={spark} color={col} width={62} height={24} id={symbol} />
+        )}
+      </div>
+
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
+        <div style={{ fontSize: 19, fontWeight: 700, color: live ? MK.ink : MK.ink5, fontFamily: MK.mono, fontVariantNumeric: "tabular-nums" }}>
+          {live ? formatPrice(d.price, symbol) : "—"}
+        </div>
+        <div style={{ fontSize: 12.5, fontFamily: MK.mono, color: col, fontVariantNumeric: "tabular-nums" }}>
+          {pctText(pct)}
+        </div>
+      </div>
+
+      {unit && <div style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono, marginTop: -4 }}>{unit}</div>}
+
+      {live && d.dayLow != null && d.dayHigh != null && d.dayHigh > d.dayLow
+        ? <RangeBar low={d.dayLow} high={d.dayHigh} value={d.price} label="DAY RANGE" symbol={symbol} />
+        : !live && <div style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono }}>awaiting price feed</div>}
+    </div>
+  );
+}
+
+/** Sub-page switcher. */
+function TabRail({ tabs, active, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 2, borderBottom: `1px solid ${MK.border}`, overflowX: "auto" }}>
+      {tabs.map(t => (
+        <button key={t.id} onClick={() => onChange(t.id)} style={{
+          background: "transparent", border: "none",
+          borderBottom: active === t.id ? `2px solid ${MK.up}` : "2px solid transparent",
+          color: active === t.id ? MK.up : MK.ink4,
+          padding: "9px 15px", cursor: "pointer", fontFamily: MK.mono, fontSize: 11,
+          letterSpacing: 1, whiteSpace: "nowrap", flexShrink: 0,
+        }}>{t.label.toUpperCase()}</button>
+      ))}
+    </div>
+  );
+}
+
+function BoardHeading({ title, note }) {
+  return (
+    <div style={{ display: "flex", alignItems: "baseline", gap: 10, margin: "2px 0 -2px" }}>
+      <span style={{ fontSize: 10, color: MK.ink4, fontFamily: MK.mono, letterSpacing: 1.6 }}>{title}</span>
+      {note && <span style={{ fontSize: 10.5, color: MK.ink5 }}>{note}</span>}
+    </div>
+  );
+}
+
+// Auto-fitting grid — the old page stacked one row per instrument and left
+// most of a wide monitor empty. auto-FIT (not auto-fill) collapses the unused
+// tracks, so a three-item row like Energy stretches across the width instead
+// of huddling at the left with three empty columns beside it.
+const grid = (min = 210, max = 420) => ({
+  display: "grid",
+  gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`,
+  maxWidth: `calc(${max}px * 6)`,
+  gap: 10,
+  alignItems: "start",
+});
+
+// ─── Static reference data ───────────────────────────────────
+// Structural context only: which central banks set a pair, what a contract is
+// quoted in, what durably drives it. Deliberately no price calls, no support
+// and resistance levels — those were invented in the page this replaces.
+
+const FX_BOARD = [
+  { symbol: "EURUSD=X", name: "EUR/USD", banks: "ECB vs Fed",  note: "The most-traded pair; policy-rate spread is the dominant driver." },
+  { symbol: "GBPUSD=X", name: "GBP/USD", banks: "BoE vs Fed",  note: "Sensitive to UK inflation prints and gilt moves." },
+  { symbol: "USDJPY=X", name: "USD/JPY", banks: "Fed vs BoJ",  note: "Rate-differential and carry proxy; moves on BoJ policy shifts." },
+  { symbol: "GBPEUR=X", name: "GBP/EUR", banks: "BoE vs ECB",  note: "UK-vs-eurozone growth and rate spread, no dollar leg." },
+  { symbol: "AUDUSD=X", name: "AUD/USD", banks: "RBA vs Fed",  note: "Traded as a China growth and industrial-commodity proxy." },
+  { symbol: "USDCAD=X", name: "USD/CAD", banks: "Fed vs BoC",  note: "Crude oil is a persistent second driver alongside rates." },
+  { symbol: "USDCHF=X", name: "USD/CHF", banks: "Fed vs SNB",  note: "Franc carries a safe-haven bid in risk-off episodes." },
+];
+
+// Which side of each pair each currency sits on, for the strength read.
+const FX_LEGS = {
+  "EURUSD=X": ["EUR", "USD"], "GBPUSD=X": ["GBP", "USD"], "USDJPY=X": ["USD", "JPY"],
+  "GBPEUR=X": ["GBP", "EUR"], "AUDUSD=X": ["AUD", "USD"], "USDCAD=X": ["USD", "CAD"],
+  "USDCHF=X": ["USD", "CHF"],
+};
+
+const COMMODITY_BOARD = [
+  { symbol: "GC=F", name: "Gold",        unit: "$ / troy oz", group: "Metals", note: "Real yields and the dollar set the tone; central-bank buying is the structural bid." },
+  { symbol: "SI=F", name: "Silver",      unit: "$ / troy oz", group: "Metals", note: "Half precious metal, half industrial input — solar demand is the secular leg." },
+  { symbol: "HG=F", name: "Copper",      unit: "$ / lb",      group: "Metals", note: "Read as a global growth proxy; China construction and grid spend dominate." },
+  { symbol: "CL=F", name: "WTI Crude",   unit: "$ / barrel",  group: "Energy", note: "US benchmark. OPEC+ supply policy and inventory draws drive it." },
+  { symbol: "BZ=F", name: "Brent Crude", unit: "$ / barrel",  group: "Energy", note: "Seaborne global benchmark; carries more geopolitical risk premium than WTI." },
+  { symbol: "NG=F", name: "Natural Gas", unit: "$ / MMBtu",   group: "Energy", note: "Weather and storage driven; the most volatile of the majors." },
+];
+
+const INDEX_BOARD = [
+  { symbol: "^GSPC",     name: "S&P 500",       sub: "US large cap",        group: "United States" },
+  { symbol: "^IXIC",     name: "NASDAQ Comp.",  sub: "US tech-weighted",    group: "United States" },
+  { symbol: "^DJI",      name: "Dow Jones",     sub: "US blue chip",        group: "United States" },
+  { symbol: "^RUT",      name: "Russell 2000",  sub: "US small cap",        group: "United States" },
+  { symbol: "^FTSE",     name: "FTSE 100",      sub: "UK large cap",        group: "International" },
+  { symbol: "^STOXX50E", name: "EuroStoxx 50",  sub: "Eurozone blue chip",  group: "International" },
+  { symbol: "^GDAXI",    name: "DAX",           sub: "Germany",             group: "International" },
+  { symbol: "^N225",     name: "Nikkei 225",    sub: "Japan",               group: "International" },
+  { symbol: "EEM",       name: "MSCI EM",       sub: "Emerging markets",    group: "International" },
+];
+
+const SECTOR_BOARD = [
+  { symbol: "XLK",  name: "Technology" },      { symbol: "XLF",  name: "Financials" },
+  { symbol: "XLV",  name: "Health Care" },     { symbol: "XLE",  name: "Energy" },
+  { symbol: "XLI",  name: "Industrials" },     { symbol: "XLY",  name: "Cons. Disc." },
+  { symbol: "XLP",  name: "Cons. Staples" },   { symbol: "XLU",  name: "Utilities" },
+  { symbol: "XLRE", name: "Real Estate" },     { symbol: "XLB",  name: "Materials" },
+  { symbol: "XLC",  name: "Communications" },
+];
+
+const RATE_BOARD = [
+  { symbol: "^IRX", name: "US 3-Month", years: 0.25, sub: "T-bill — tracks the Fed's policy rate" },
+  { symbol: "^FVX", name: "US 5-Year",  years: 5,    sub: "Belly of the curve" },
+  { symbol: "^TNX", name: "US 10-Year", years: 10,   sub: "The global discount-rate benchmark" },
+];
+
+// Placeholder until a price source is wired — labelled as such everywhere it
+// shows, rather than quietly rendering as though it were live.
+const CRYPTO_BOARD = [
+  { symbol: "BTC", name: "Bitcoin",  sub: "BTC" },
+  { symbol: "ETH", name: "Ethereum", sub: "ETH" },
+  { symbol: "SOL", name: "Solana",   sub: "SOL" },
+  { symbol: "XRP", name: "XRP",      sub: "XRP" },
+];
+
+// Rate gaps below are hand-maintained alongside CB_MATRIX; the banner on that
+// board says so, because a stale policy spread reads exactly like a live one.
+const CB_DIVERGENCE = [
+  { pair: "USD vs EUR", gap: "+1.25-1.50%", note: "ECB cutting while the Fed holds — EUR/USD carries a downside bias.", tag: "Long USD / Short EUR", color: "#3d8bff" },
+  { pair: "USD vs JPY", gap: "+5.15-5.40%", note: "The widest gap of the majors; the carry trade dominates positioning.", tag: "Long USD/JPY carry", color: "#ffa502" },
+  { pair: "USD vs GBP", gap: "-0.25-0.00%", note: "Near parity. A hawkish BoE hold keeps sterling supported and the cross range-bound.", tag: "Neutral - watch data", color: "#00d4aa" },
+  { pair: "USD vs CAD", gap: "+0.25-0.50%", note: "The BoC is ahead of the Fed in cutting, leaving CAD under moderate pressure.", tag: "Mild USD/CAD upside", color: "#a855f7" },
+];
+
+// Labels are derived from the board definitions above rather than kept in a
+// parallel hand-maintained map — one source of truth, no drift.
+const MARKET_META = Object.fromEntries([
+  ...INDEX_BOARD.map(x => [x.symbol, { name: x.name, sub: x.sub }]),
+  ...FX_BOARD.map(x => [x.symbol, { name: x.name, sub: x.banks }]),
+  ...COMMODITY_BOARD.map(x => [x.symbol, { name: x.name, sub: x.unit }]),
+  ...SECTOR_BOARD.map(x => [x.symbol, { name: x.name, sub: x.symbol }]),
+  ...RATE_BOARD.map(x => [x.symbol, { name: x.name, sub: x.sub }]),
+  ["^VIX",      { name: "VIX",          sub: "Implied volatility, S&P 500" }],
+  ["DX-Y.NYB",  { name: "Dollar Index", sub: "Trade-weighted USD" }],
+]);
+const mkName = s => MARKET_META[s]?.name || DISPLAY_NAMES[s] || s;
+const mkSub  = s => MARKET_META[s]?.sub;
+
+const ALL_MARKET_SYMBOLS = [
+  ...INDEX_BOARD.map(x => x.symbol), ...FX_BOARD.map(x => x.symbol),
+  ...COMMODITY_BOARD.map(x => x.symbol), ...SECTOR_BOARD.map(x => x.symbol),
+  ...RATE_BOARD.map(x => x.symbol), "^VIX", "DX-Y.NYB",
+];
+
+// ─── Derived measures ────────────────────────────────────────
+
+/**
+ * Per-currency strength from the tracked pairs.
+ * Each pair contributes its move to the base currency and the negation of it
+ * to the quote currency; a currency's score is the mean across the pairs it
+ * appears in. Averaging (not summing) keeps USD — which appears in six pairs —
+ * on the same scale as CHF, which appears in one.
+ */
+function currencyStrength(prices) {
+  const acc = {};
+  for (const [sym, [base, quote]] of Object.entries(FX_LEGS)) {
+    const pct = prices?.[sym]?.changePct;
+    if (pct == null || Number.isNaN(pct)) continue;
+    (acc[base] ??= []).push(pct);
+    (acc[quote] ??= []).push(-pct);
+  }
+  return Object.entries(acc)
+    .map(([ccy, vals]) => ({ ccy, value: vals.reduce((a, b) => a + b, 0) / vals.length, n: vals.length }))
+    .sort((a, b) => b.value - a.value);
+}
+
+/** Pearson correlation of daily returns. Real history in, real number out. */
+function returnsCorrelation(a, b) {
+  if (!a || !b) return null;
+  const n = Math.min(a.length, b.length);
+  if (n < 20) return null;                      // too short to mean anything
+  const ra = [], rb = [];
+  const sa = a.slice(-n), sb = b.slice(-n);
+  for (let i = 1; i < n; i++) {
+    if (!sa[i - 1] || !sb[i - 1]) continue;
+    ra.push(sa[i] / sa[i - 1] - 1);
+    rb.push(sb[i] / sb[i - 1] - 1);
+  }
+  if (ra.length < 15) return null;
+  const m = xs => xs.reduce((s, v) => s + v, 0) / xs.length;
+  const ma = m(ra), mb = m(rb);
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < ra.length; i++) {
+    const x = ra[i] - ma, y = rb[i] - mb;
+    num += x * y; da += x * x; db += y * y;
+  }
+  const den = Math.sqrt(da * db);
+  return den ? num / den : null;
+}
+
+/** Percent change across a close series — the sparkline's own period. */
+const periodChange = s => (Array.isArray(s) && s.length > 1 && s[0] ? (s[s.length - 1] / s[0] - 1) * 100 : null);
+
+// ─── Page ────────────────────────────────────────────────────
+
+function MarketsPage({ prices, tabJump, onTabChange }) {
+  const [tab, setTab] = useState("overview");
+
+  // Arriving via a sidebar sub-item (e.g. Markets > FX).
+  useEffect(() => {
+    if (!tabJump?.tab) return;
+    setTab(tabJump.tab);
+  }, [tabJump?.ts]);
+
+  useEffect(() => { onTabChange?.(tab); }, [tab]);
+  const [hist, setHist] = useState({});
+  const [histLoaded, setHistLoaded] = useState(false);
+  const [detail, setDetail] = useState(null);
+  const [aiText, setAiText] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+
+  // One batched call for every sparkline on the page.
+  useEffect(() => {
+    let alive = true;
+    fetch(`${API}/history/batch?symbols=${encodeURIComponent(ALL_MARKET_SYMBOLS.join(","))}&days=90`)
+      .then(r => r.json())
+      .then(d => { if (alive) { setHist(d.series ?? {}); setHistLoaded(true); } })
+      .catch(() => { if (alive) setHistLoaded(true); });   // no history: tiles still render, just without sparklines
+    return () => { alive = false; };
+  }, []);
+
+  const sp = sym => hist[sym];
+  const px = sym => prices?.[sym];
+
+  const TABS = [
+    { id: "overview",  label: "Overview" },
+    { id: "indices",   label: "Indices" },
+    { id: "fx",        label: "FX" },
+    { id: "commod",    label: "Commodities" },
+    { id: "sectors",   label: "Sectors" },
+    { id: "rates",     label: "Rates" },
+    { id: "crypto",    label: "Crypto" },
+    { id: "banks",     label: "Central Banks" },
+  ];
+
+  // Ranked movers across everything quoted, for the overview.
+  // Yields are excluded: a 1.3% move in a 5.3% yield is a 7bp shift, which is
+  // not the same kind of quantity as a stock rising 1.3%, and ranking them
+  // together puts rates at the top of the board on a quiet day.
+  const RANKABLE = ALL_MARKET_SYMBOLS.filter(s => !RATE_BOARD.some(r => r.symbol === s));
+  const movers = RANKABLE
+    .map(s => ({ symbol: s, name: mkName(s), pct: px(s)?.changePct }))
+    .filter(m => m.pct != null && !Number.isNaN(m.pct))
+    .sort((a, b) => b.pct - a.pct);
+
+  const liveCount = ALL_MARKET_SYMBOLS.filter(s => px(s)).length;
+
+  function runAI() {
+    setAiLoading(true);
+    const line = (label, sym) => {
+      const d = px(sym);
+      return d ? `${label} ${formatPrice(d.price, sym)} (${pctText(d.changePct)})` : null;
+    };
+    const ctx = [
+      line("S&P 500", "^GSPC"), line("NASDAQ", "^IXIC"), line("FTSE 100", "^FTSE"),
+      line("VIX", "^VIX"), line("DXY", "DX-Y.NYB"), line("Gold", "GC=F"),
+      line("WTI", "CL=F"), line("US 10Y", "^TNX"), line("EUR/USD", "EURUSD=X"),
+    ].filter(Boolean).join("; ");
+    const strength = currencyStrength(prices).slice(0, 3).map(s => `${s.ccy} ${s.value >= 0 ? "+" : ""}${s.value.toFixed(2)}%`).join(", ");
+    const prompt = `${AI_RULES}
+
+You are writing a cross-asset read for a UK private investor.
+
+Live session data: ${ctx || "no live prices available"}.
+Strongest currencies today: ${strength || "n/a"}.
+
+If the moves here are small and unremarkable, say that in one or two sentences
+and stop. A flat session across assets is a legitimate and common finding.
+
+Otherwise write three labelled sections, at most two sentences each:
+THE SESSION: What is actually moving, in the numbers given.
+WHAT LINKS IT: The mechanism connecting those moves — or say plainly that the
+moves do not appear connected, if they do not.
+WHAT WOULD CHANGE IT: The specific thing that would alter this picture.`;
+    callAI(prompt, 900).then(({ text }) => { setAiText(text); setAiLoading(false); });
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: MK.ink, fontFamily: MK.mono, letterSpacing: 1 }}>MARKETS</div>
+          <div style={{ fontSize: 12.5, color: MK.ink4, marginTop: 3 }}>
+            {liveCount} of {ALL_MARKET_SYMBOLS.length} Instruments Live
+            {histLoaded && ` · ${Object.keys(hist).length} With Stored History`}
+          </div>
+        </div>
+      </div>
+
+      <TabRail tabs={TABS} active={tab} onChange={t => { setTab(t); setDetail(null); }} />
+
+      {/* ─── OVERVIEW ─────────────────────────────────────── */}
+      {tab === "overview" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={grid(200)}>
+            {["^GSPC", "^FTSE", "DX-Y.NYB", "^VIX", "GC=F", "^TNX"].map(s => (
+              <MarketTile key={s} symbol={s} name={mkName(s)}
+                          sub={mkSub(s)} prices={prices} spark={sp(s)} />
+            ))}
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12, alignItems: "start" }}>
+            <Panel>
+              <SectionHeader title="LEADERS" subtitle="strongest today, all tracked markets" />
+              <div style={{ padding: "10px 16px 14px" }}>
+                {movers.slice(0, 6).map(m => (
+                  <MarketMoverRow key={m.symbol} {...m} spark={sp(m.symbol)} />
+                ))}
+                {!movers.length && <Empty text="No live prices yet." />}
+              </div>
+            </Panel>
+            <Panel>
+              <SectionHeader title="LAGGARDS" subtitle="weakest today, all tracked markets" />
+              <div style={{ padding: "10px 16px 14px" }}>
+                {movers.slice(-6).reverse().map(m => (
+                  <MarketMoverRow key={m.symbol} {...m} spark={sp(m.symbol)} />
+                ))}
+                {!movers.length && <Empty text="No live prices yet." />}
+              </div>
+            </Panel>
+          </div>
+
+          <Panel>
+            <SectionHeader title="CROSS-ASSET MAP" subtitle="today's move by asset class — colour and number both encode the same value" />
+            <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 12 }}>
+              {[
+                { label: "EQUITY INDICES", syms: INDEX_BOARD.map(i => i.symbol) },
+                { label: "SECTORS",        syms: SECTOR_BOARD.map(i => i.symbol) },
+                { label: "COMMODITIES",    syms: COMMODITY_BOARD.map(i => i.symbol) },
+                { label: "FX",             syms: FX_BOARD.map(i => i.symbol) },
+                { label: "RATES & VOL",    syms: [...RATE_BOARD.map(i => i.symbol), "^VIX", "DX-Y.NYB"] },
+              ].map(row => (
+                <div key={row.label}>
+                  <BoardHeading title={row.label} />
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(104px, 1fr))", gap: 4, marginTop: 6 }}>
+                    {row.syms.map(s => {
+                      const d = px(s);
+                      const st = heatStyle(d?.changePct);
+                      return (
+                        <div key={s} title={`${mkName(s)}: ${pctText(d?.changePct)}`} style={{
+                          ...st, borderRadius: 4, padding: "7px 8px",
+                          border: `1px solid ${MK.border}`, minWidth: 0,
+                        }}>
+                          <div style={{ fontSize: 9.5, color: MK.ink4, fontFamily: MK.mono, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                            {mkName(s)}
+                          </div>
+                          <div style={{ fontSize: 12, fontFamily: MK.mono, fontWeight: 700, color: st.color, fontVariantNumeric: "tabular-nums" }}>
+                            {pctText(d?.changePct)}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader title="AI CROSS-ASSET READ" subtitle="generated from the live prices above"
+                           action={aiLoading ? "THINKING..." : "GENERATE"} onAction={runAI} />
+            <div style={{ padding: 16 }}>
+              {aiText
+                ? <div style={{ fontSize: 12.5, lineHeight: 1.8, color: "#b8c6da", whiteSpace: "pre-wrap", fontFamily: "'Courier New', monospace" }}>{aiText}</div>
+                : <div style={{ fontSize: 12, color: MK.ink4 }}>Click GENERATE for a session read across equities, rates, FX and commodities. Requires a Gemini API key (Settings).</div>}
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── INDICES ──────────────────────────────────────── */}
+      {tab === "indices" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {["United States", "International"].map(g => (
+            <div key={g} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <BoardHeading title={g.toUpperCase()} />
+              <div style={grid(215)}>
+                {INDEX_BOARD.filter(i => i.group === g).map(i => (
+                  <MarketTile key={i.symbol} symbol={i.symbol} name={i.name} sub={i.sub}
+                              prices={prices} spark={sp(i.symbol)}
+                              active={detail === i.symbol}
+                              onClick={() => setDetail(detail === i.symbol ? null : i.symbol)} />
+                ))}
+              </div>
+            </div>
+          ))}
+          <PerformancePanel
+            title="INDEX PERFORMANCE"
+            note="which markets are actually leading, today and over the quarter"
+            rows={INDEX_BOARD} prices={prices} hist={hist} />
+          <DetailStrip symbol={detail} prices={prices} spark={sp(detail)} />
+        </div>
+      )}
+
+      {/* ─── FX ───────────────────────────────────────────── */}
+      {tab === "fx" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12, alignItems: "start" }}>
+            <Panel>
+              <SectionHeader title="CURRENCY STRENGTH"
+                             subtitle="today's mean move across the pairs each currency trades in" />
+              <div style={{ padding: "12px 16px 14px" }}>
+                {(() => {
+                  const rows = currencyStrength(prices);
+                  if (!rows.length) return <Empty text="No live FX prices yet." />;
+                  const max = Math.max(...rows.map(r => Math.abs(r.value)), 0.25);
+                  return rows.map(r => (
+                    <DivergingBar key={r.ccy} label={r.ccy} value={r.value} max={max}
+                                  sub={`${r.n} pair${r.n > 1 ? "s" : ""}`} />
+                  ));
+                })()}
+                <div style={{ fontSize: 10, color: MK.ink5, marginTop: 10, lineHeight: 1.5 }}>
+                  Derived from the seven pairs tracked here, not a full G10 basket — a
+                  currency quoted in only one pair moves on thinner evidence than one quoted in six.
+                </div>
+              </div>
+            </Panel>
+
+            <Panel>
+              <SectionHeader title="DOLLAR INDEX" subtitle="DXY — the dollar's trade-weighted level" />
+              <div style={{ padding: "16px 18px" }}>
+                {px("DX-Y.NYB") ? (
+                  <>
+                    <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+                      <div>
+                        <div style={{ fontSize: 34, fontWeight: 700, color: MK.ink, fontFamily: MK.mono, lineHeight: 1, fontVariantNumeric: "tabular-nums" }}>
+                          {px("DX-Y.NYB").price.toFixed(2)}
+                        </div>
+                        <div style={{ fontSize: 13, fontFamily: MK.mono, color: moveColor(px("DX-Y.NYB").changePct), marginTop: 5 }}>
+                          {pctText(px("DX-Y.NYB").changePct)} today
+                        </div>
+                      </div>
+                      <Sparkline data={sp("DX-Y.NYB")} color={moveColor(px("DX-Y.NYB").changePct)} width={130} height={46} id="dxy-hero" />
+                    </div>
+                    <RangeBar low={px("DX-Y.NYB").low52} high={px("DX-Y.NYB").high52} value={px("DX-Y.NYB").price} label="52-WEEK RANGE" symbol="DX-Y.NYB" />
+                  </>
+                ) : <Empty text="No live DXY price." />}
+              </div>
+            </Panel>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <BoardHeading title="MAJOR PAIRS" note="click a pair for its 52-week position and dollar correlation" />
+            <div style={grid(215)}>
+              {FX_BOARD.map(p => (
+                <MarketTile key={p.symbol} symbol={p.symbol} name={p.name} sub={p.banks}
+                            prices={prices} spark={sp(p.symbol)}
+                            active={detail === p.symbol}
+                            onClick={() => setDetail(detail === p.symbol ? null : p.symbol)} />
+              ))}
+            </div>
+          </div>
+          <DetailStrip symbol={detail} prices={prices} spark={sp(detail)} hist={hist}
+                       note={FX_BOARD.find(p => p.symbol === detail)?.note} />
+        </div>
+      )}
+
+      {/* ─── COMMODITIES ──────────────────────────────────── */}
+      {tab === "commod" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {["Energy", "Metals"].map(g => (
+            <div key={g} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <BoardHeading title={g.toUpperCase()} />
+              <div style={grid(215)}>
+                {COMMODITY_BOARD.filter(c => c.group === g).map(c => (
+                  <MarketTile key={c.symbol} symbol={c.symbol} name={c.name} unit={c.unit}
+                              prices={prices} spark={sp(c.symbol)}
+                              active={detail === c.symbol}
+                              onClick={() => setDetail(detail === c.symbol ? null : c.symbol)} />
+                ))}
+              </div>
+            </div>
+          ))}
+          <PerformancePanel
+            title="COMMODITY PERFORMANCE"
+            note="today against the quarter — a one-day move can run opposite the trend"
+            rows={COMMODITY_BOARD} prices={prices} hist={hist} />
+          <DollarCorrelationPanel rows={COMMODITY_BOARD} hist={hist} />
+          <DetailStrip symbol={detail} prices={prices} spark={sp(detail)} hist={hist}
+                       note={COMMODITY_BOARD.find(c => c.symbol === detail)?.note} />
+        </div>
+      )}
+
+      {/* ─── SECTORS ──────────────────────────────────────── */}
+      {tab === "sectors" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <Panel>
+            <SectionHeader title="US SECTOR MAP" subtitle="SPDR sector ETFs — today's move" />
+            <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(132px, 1fr))", gap: 5 }}>
+              {SECTOR_BOARD.map(s => {
+                const d = px(s.symbol);
+                const st = heatStyle(d?.changePct, 1.5);
+                return (
+                  <div key={s.symbol} style={{ ...st, border: `1px solid ${MK.border}`, borderRadius: 5, padding: "10px 11px" }}>
+                    <div style={{ fontSize: 10, color: MK.ink4, fontFamily: MK.mono, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.name}</div>
+                    <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 6, marginTop: 4 }}>
+                      <span style={{ fontSize: 15, fontWeight: 700, fontFamily: MK.mono, color: st.color, fontVariantNumeric: "tabular-nums" }}>
+                        {pctText(d?.changePct)}
+                      </span>
+                      <span style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono }}>{s.symbol}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader title="SECTOR ROTATION" subtitle="ranked by today's move — leadership at the top" />
+            <div style={{ padding: "12px 18px 16px" }}>
+              {(() => {
+                const rows = SECTOR_BOARD
+                  .map(s => ({ ...s, pct: px(s.symbol)?.changePct }))
+                  .filter(s => s.pct != null)
+                  .sort((a, b) => b.pct - a.pct);
+                if (!rows.length) return <Empty text="No live sector prices yet. Sector ETFs sync with the rest of the price feed." />;
+                const max = Math.max(...rows.map(r => Math.abs(r.pct)), 0.4);
+                return rows.map(r => <DivergingBar key={r.symbol} label={r.symbol} sub={r.name} value={r.pct} max={max} />);
+              })()}
+            </div>
+          </Panel>
+
+          <div style={grid(215)}>
+            {SECTOR_BOARD.map(s => (
+              <MarketTile key={s.symbol} symbol={s.symbol} name={s.name} sub={s.symbol}
+                          prices={prices} spark={sp(s.symbol)} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ─── RATES ────────────────────────────────────────── */}
+      {tab === "rates" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div style={grid(230)}>
+            {RATE_BOARD.map(r => (
+              <MarketTile key={r.symbol} symbol={r.symbol} name={r.name} sub={r.sub}
+                          prices={prices} spark={sp(r.symbol)} />
+            ))}
+          </div>
+
+          <Panel>
+            <SectionHeader title="YIELD CURVE" subtitle="US Treasury yields by maturity" />
+            <div style={{ padding: "18px 20px 14px" }}>
+              <YieldCurve prices={prices} />
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader title="CURVE SPREADS" subtitle="an inverted curve has preceded most post-war US recessions" />
+            <div style={{ padding: "12px 18px 16px" }}>
+              {(() => {
+                const y = s => px(s)?.price;
+                const spreads = [
+                  { label: "10Y − 3M", a: "^TNX", b: "^IRX", note: "The Fed's own preferred recession signal" },
+                  { label: "10Y − 5Y", a: "^TNX", b: "^FVX", note: "Belly-to-long-end slope" },
+                ].map(s => ({ ...s, v: y(s.a) != null && y(s.b) != null ? y(s.a) - y(s.b) : null }))
+                 .filter(s => s.v != null);
+                if (!spreads.length) return <Empty text="No live yield data yet." />;
+                return spreads.map(s => (
+                  <div key={s.label} style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+                                              gap: 12, padding: "11px 0", borderBottom: `1px solid ${MK.hair}` }}>
+                    <div>
+                      <div style={{ fontSize: 12.5, color: MK.ink2, fontFamily: MK.mono, fontWeight: 700 }}>{s.label}</div>
+                      <div style={{ fontSize: 10.5, color: MK.ink5, marginTop: 2 }}>{s.note}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 17, fontWeight: 700, fontFamily: MK.mono,
+                                    color: s.v < 0 ? MK.down : MK.up, fontVariantNumeric: "tabular-nums" }}>
+                        {s.v >= 0 ? "+" : ""}{s.v.toFixed(3)}%
+                      </div>
+                      <div style={{ fontSize: 10, color: s.v < 0 ? MK.down : MK.ink4, fontFamily: MK.mono, marginTop: 2 }}>
+                        {s.v < 0 ? "INVERTED" : "NORMAL"}
+                      </div>
+                    </div>
+                  </div>
+                ));
+              })()}
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── CRYPTO ───────────────────────────────────────── */}
+      {tab === "crypto" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <Panel style={{ borderLeft: `3px solid ${MK.amber}` }}>
+            <div style={{ padding: "14px 18px" }}>
+              <div style={{ fontSize: 10.5, color: MK.amber, fontFamily: MK.mono, letterSpacing: 1.4, marginBottom: 6 }}>
+                ⚠ NO PRICE SOURCE CONNECTED
+              </div>
+              <div style={{ fontSize: 12.5, color: MK.ink3, lineHeight: 1.6, maxWidth: "70ch" }}>
+                Crypto has no data feed in Meridian yet — the tiles below are structure only, and
+                deliberately show no numbers rather than placeholder ones that would read as real.
+                Wiring a source (CoinGecko's public API needs no key) is tracked as its own piece of work.
+                Crypto <em>news</em> is already live on the News page via CoinDesk and Cointelegraph.
+              </div>
+            </div>
+          </Panel>
+          <div style={grid(215)}>
+            {CRYPTO_BOARD.map(c => (
+              <div key={c.symbol} style={{
+                background: MK.panel, border: `1px dashed ${MK.border2}`, borderRadius: 7,
+                padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8, opacity: 0.75,
+              }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 700, color: MK.ink3, fontFamily: MK.mono }}>{c.name}</div>
+                  <div style={{ fontSize: 9.5, color: MK.ink5, marginTop: 1 }}>{c.sub}</div>
+                </div>
+                <div style={{ fontSize: 19, fontWeight: 700, color: MK.ink5, fontFamily: MK.mono }}>—</div>
+                <div style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono }}>awaiting data source</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ─── CENTRAL BANKS ────────────────────────────────── */}
+      {tab === "banks" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <Panel style={{ borderLeft: `3px solid ${MK.amber}` }}>
+            <div style={{ padding: "12px 18px", fontSize: 11.5, color: MK.ink3, lineHeight: 1.6 }}>
+              Policy rates and meeting dates below are maintained by hand and do not update
+              automatically — check against the bank's own release before trading on them.
+            </div>
+          </Panel>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12, alignItems: "start" }}>
+            {CB_MATRIX.map(cb => (
+              <Panel key={cb.bank} style={{ borderTop: `3px solid ${cb.color}` }}>
+                <div style={{ padding: 15 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 12 }}>
+                    <div>
+                      <div style={{ fontFamily: MK.mono, fontWeight: 700, color: MK.ink, fontSize: 13 }}>{cb.bank}</div>
+                      <div style={{ fontSize: 10, color: MK.ink4, marginTop: 1 }}>{cb.country}</div>
+                    </div>
+                    <span style={{ fontSize: 9.5, fontFamily: MK.mono, background: `${cb.color}1e`, color: cb.color,
+                                   padding: "3px 8px", borderRadius: 3, whiteSpace: "nowrap" }}>{cb.bias}</span>
+                  </div>
+                  {[["CURRENT RATE", cb.rate, cb.color], ["NEXT MEETING", cb.nextMeeting, MK.ink2], ["EXPECTATION", cb.expectation, MK.ink2]].map(([l, v, c]) => (
+                    <div key={l} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline",
+                                          padding: "7px 0", borderTop: `1px solid ${MK.hair}` }}>
+                      <span style={{ fontSize: 9.5, color: MK.ink5, fontFamily: MK.mono, letterSpacing: 1 }}>{l}</span>
+                      <span style={{ fontSize: l === "CURRENT RATE" ? 15 : 12, fontWeight: 700, color: c, fontFamily: MK.mono }}>{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </Panel>
+            ))}
+          </div>
+
+          <Panel>
+            <SectionHeader title="POLICY DIVERGENCE" subtitle="where the rate gaps sit, and what they imply for the crosses" />
+            <div style={{ padding: "6px 18px 14px" }}>
+              {CB_DIVERGENCE.map(d => (
+                <div key={d.pair} style={{ display: "grid", gridTemplateColumns: "110px 92px 1fr auto", gap: 12,
+                                           alignItems: "center", padding: "11px 0", borderBottom: `1px solid ${MK.hair}` }}>
+                  <span style={{ fontSize: 12, fontWeight: 700, color: MK.ink2, fontFamily: MK.mono }}>{d.pair}</span>
+                  <span style={{ fontSize: 12, color: MK.blue, fontFamily: MK.mono }}>{d.gap}</span>
+                  <span style={{ fontSize: 11.5, color: MK.ink3 }}>{d.note}</span>
+                  <span style={{ fontSize: 9.5, fontFamily: MK.mono, background: `${d.color}1e`, color: d.color,
+                                 padding: "3px 9px", borderRadius: 3, whiteSpace: "nowrap" }}>{d.tag}</span>
+                </div>
+              ))}
+            </div>
+          </Panel>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Page-local sub-components ───────────────────────────────
+
+function Empty({ text }) {
+  return <div style={{ fontSize: 12, color: MK.ink4, padding: "14px 0", textAlign: "center" }}>{text}</div>;
+}
+
+function MarketMoverRow({ symbol, name, pct, spark }) {
+  const col = moveColor(pct, symbol);
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", alignItems: "center", gap: 10,
+                  padding: "7px 0", borderBottom: `1px solid ${MK.hair}` }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 12, color: MK.ink2, fontFamily: MK.mono, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
+        <div style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono }}>{symbol}</div>
+      </div>
+      <Sparkline data={spark} color={col} width={54} height={20} fill={false} id={`mv-${symbol}`} />
+      <div style={{ fontSize: 13, fontWeight: 700, fontFamily: MK.mono, color: col, minWidth: 62,
+                    textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+        {pctText(pct)}
+      </div>
+    </div>
+  );
+}
+
+/** Expanded row shown under a board when a tile is selected. */
+function DetailStrip({ symbol, prices, spark, hist, note }) {
+  if (!symbol) return null;
+  const d = prices?.[symbol];
+  if (!d) return null;
+  const col = moveColor(d.changePct, symbol);
+  const dxyCorr = hist ? returnsCorrelation(hist[symbol], hist["DX-Y.NYB"]) : null;
+  const per = periodChange(spark);
+
+  return (
+    <Panel style={{ borderLeft: `3px solid ${col}` }}>
+      <SectionHeader title={mkName(symbol).toUpperCase()} subtitle={symbol} />
+      <div style={{ padding: 16, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 14, alignItems: "flex-start" }}>
+        <Stat label="LAST" value={formatPrice(d.price, symbol)} color={MK.ink} />
+        <Stat label="TODAY" value={pctText(d.changePct)} color={col} />
+        {per != null && <Stat label="90-DAY" value={pctText(per)} color={moveColor(per, symbol)} />}
+        {d.dayLow != null && d.dayHigh != null && (
+          <div><RangeBar low={d.dayLow} high={d.dayHigh} value={d.price} label="DAY RANGE" symbol={symbol} /></div>
+        )}
+        {d.low52 != null && d.high52 != null && (
+          <div><RangeBar low={d.low52} high={d.high52} value={d.price} label="52-WEEK RANGE" symbol={symbol} /></div>
+        )}
+        {dxyCorr != null && symbol !== "DX-Y.NYB" && (
+          <Stat label="90D DXY CORR" value={dxyCorr.toFixed(2)}
+                color={dxyCorr < -0.3 ? MK.down : dxyCorr > 0.3 ? MK.up : MK.ink3} />
+        )}
+      </div>
+      {spark && spark.length > 1 && (
+        <div style={{ padding: "0 16px 14px" }}>
+          <Sparkline data={spark} color={col} width={760} height={70} id={`detail-${symbol}`} />
+          <div style={{ fontSize: 9.5, color: MK.ink5, fontFamily: MK.mono, marginTop: 4 }}>
+            90 days of stored closes
+          </div>
+        </div>
+      )}
+      {note && (
+        <div style={{ padding: "0 16px 16px", fontSize: 12, color: MK.ink3, lineHeight: 1.6, maxWidth: "78ch" }}>
+          {note}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * Today's move beside the 90-day move, both ranked.
+ * The pairing is the point: a name up strongly today can still be the worst
+ * thing on the board over the quarter, and one column alone hides that.
+ */
+function PerformancePanel({ title, note, rows, prices, hist }) {
+  const build = key => rows
+    .map(r => ({
+      symbol: r.symbol,
+      name: r.name,
+      v: key === "day" ? prices?.[r.symbol]?.changePct : periodChange(hist?.[r.symbol]),
+    }))
+    .filter(r => r.v != null && !Number.isNaN(r.v))
+    .sort((a, b) => b.v - a.v);
+
+  const cols = [
+    { key: "day", label: "TODAY", sub: "since previous close" },
+    { key: "period", label: "90 DAYS", sub: "from stored history" },
+  ].map(c => ({ ...c, data: build(c.key) }));
+
+  if (cols.every(c => !c.data.length)) return null;
+
+  return (
+    <Panel>
+      <SectionHeader title={title} subtitle={note} />
+      <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 18, alignItems: "start" }}>
+        {cols.map(c => (
+          <div key={c.key}>
+            <BoardHeading title={c.label} note={c.sub} />
+            <div style={{ marginTop: 8 }}>
+              {c.data.length
+                ? (() => {
+                    const max = Math.max(...c.data.map(r => Math.abs(r.v)), 0.4);
+                    return c.data.map(r => (
+                      <DivergingBar key={r.symbol} label={r.symbol} sub={r.name} value={r.v} max={max} />
+                    ));
+                  })()
+                : <Empty text="No stored history yet — run a sync to populate." />}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+/**
+ * Real 90-day correlation of daily returns against the dollar index.
+ * The page this replaced carried hand-written correlation figures that never
+ * moved; these are computed from the same stored closes the sparklines use.
+ */
+function DollarCorrelationPanel({ rows, hist }) {
+  const data = rows
+    .map(r => ({ ...r, c: returnsCorrelation(hist?.[r.symbol], hist?.["DX-Y.NYB"]) }))
+    .filter(r => r.c != null)
+    .sort((a, b) => a.c - b.c);
+  if (!data.length) return null;
+
+  return (
+    <Panel>
+      <SectionHeader title="DOLLAR CORRELATION"
+                     subtitle="90-day correlation of daily returns against DXY — computed, not assumed" />
+      <div style={{ padding: "12px 18px 16px" }}>
+        {data.map(r => (
+          <DivergingBar key={r.symbol} label={r.symbol} sub={r.name} value={r.c} max={1} unit="" />
+        ))}
+        <div style={{ fontSize: 10, color: MK.ink5, marginTop: 10, lineHeight: 1.5 }}>
+          −1 moves exactly opposite the dollar, +1 exactly with it, 0 no linear relationship.
+          Correlation is not causation and it drifts — a commodity with its own supply story
+          can decouple from the dollar for months.
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: MK.ink5, fontFamily: MK.mono, letterSpacing: 1, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 17, fontWeight: 700, color, fontFamily: MK.mono, fontVariantNumeric: "tabular-nums" }}>{value}</div>
+    </div>
+  );
+}
+
+/** Yields plotted against maturity — the curve's actual shape, not a table of it. */
+function YieldCurve({ prices }) {
+  const pts = RATE_BOARD
+    .map(r => ({ ...r, y: prices?.[r.symbol]?.price }))
+    .filter(p => p.y != null && !Number.isNaN(p.y));
+  if (pts.length < 2) return <Empty text="Not enough live yield data to plot the curve." />;
+
+  const W = 620, H = 160, PAD = { l: 46, r: 20, t: 26, b: 28 };
+  const ys = pts.map(p => p.y);
+  const lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi - lo) * 0.45 || 0.2;
+  const yMin = lo - pad, yMax = hi + pad;
+  // Maturity is log-spaced: 3M to 10Y is two orders of magnitude, and a linear
+  // axis would crush the short end into the y-axis.
+  const xs = pts.map(p => Math.log(p.years));
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const px = i => PAD.l + ((xs[i] - xMin) / (xMax - xMin || 1)) * (W - PAD.l - PAD.r);
+  const py = v => PAD.t + (1 - (v - yMin) / (yMax - yMin || 1)) * (H - PAD.t - PAD.b);
+  const line = pts.map((p, i) => `${px(i).toFixed(1)},${py(p.y).toFixed(1)}`).join(" ");
+  const inverted = pts[pts.length - 1].y < pts[0].y;
+  const col = inverted ? MK.down : MK.up;
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 420, height: "auto", display: "block" }}>
+        {/* Recessive gridlines — present for reading values, never competing with the data. */}
+        {[0, 0.5, 1].map(t => {
+          const v = yMin + t * (yMax - yMin);
+          return (
+            <g key={t}>
+              <line x1={PAD.l} x2={W - PAD.r} y1={py(v)} y2={py(v)} stroke={MK.border} strokeWidth="1" />
+              <text x={PAD.l - 8} y={py(v) + 3.5} textAnchor="end" fill={MK.ink5} fontSize="9.5" fontFamily="monospace">
+                {v.toFixed(2)}
+              </text>
+            </g>
+          );
+        })}
+        <polyline points={line} fill="none" stroke={col} strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+        {pts.map((p, i) => (
+          <g key={p.symbol}>
+            {/* 2px surface ring keeps the marker legible where it sits on the line. */}
+            <circle cx={px(i)} cy={py(p.y)} r="4.5" fill={col} stroke={MK.panel} strokeWidth="2" />
+            {/* End labels are anchored inward: centred on the first point a
+                label overlaps the y-axis tick text, and on the last it runs off
+                the right edge. Near the top it also drops below the marker. */}
+            <text x={px(i) + (i === 0 ? 8 : i === pts.length - 1 ? -8 : 0)}
+                  y={py(p.y) < PAD.t + 18 ? py(p.y) + 20 : py(p.y) - 12}
+                  textAnchor={i === 0 ? "start" : i === pts.length - 1 ? "end" : "middle"}
+                  fill={MK.ink2} fontSize="11" fontFamily="monospace" fontWeight="700">
+              {p.y.toFixed(2)}%
+            </text>
+            <text x={px(i)} y={H - 8} textAnchor="middle" fill={MK.ink4} fontSize="9.5" fontFamily="monospace">
+              {p.years < 1 ? `${p.years * 12}M` : `${p.years}Y`}
+            </text>
+          </g>
+        ))}
+      </svg>
+      <div style={{ fontSize: 11, color: inverted ? MK.down : MK.ink4, fontFamily: MK.mono, marginTop: 8 }}>
+        {inverted
+          ? "INVERTED — the long end yields less than the short end"
+          : "Upward sloping — the conventional shape"}
+      </div>
+    </div>
+  );
+}
+
+
+// ============================================================
+// NEWS / CATALYST INTELLIGENCE PAGE
+// ============================================================
+
+async function fetchAINewsSummary(story, setResult, setLoading) {
+  setLoading(true);
+  const symbolsStr = story.symbols?.length ? story.symbols.join(", ") : "none tagged";
+  const prompt = `${AI_RULES}
+
+Headline: "${story.title}" (${story.source}). Summary: ${story.summary || "none provided"}. Tagged symbols: ${symbolsStr}.
+
+Write exactly three labelled sentences:
+WHAT HAPPENED: A one-sentence plain summary.
+WHY MARKETS MIGHT CARE: The mechanism by which this could move prices — or
+state that there is no plausible mechanism, if there is not.
+ACTIONABLE OR NOISE: Say which, and why. Most news is noise; saying so is the
+right answer far more often than not, and you should not strain to find
+significance in a story that has none.`;
+  const { text } = await callAI(prompt, 400);
+  setResult(text);
+  setLoading(false);
+}
+
+function newsSentimentMeta(score) {
+  if (score == null) return { label: "NEUTRAL", color: "#4a6080" };
+  if (score > 0.15) return { label: "POSITIVE", color: "#00d4aa" };
+  if (score < -0.15) return { label: "NEGATIVE", color: "#ff4757" };
+  return { label: "NEUTRAL", color: "#4a6080" };
+}
+
+function newsRelativeTime(ms) {
+  const diff = Date.now() - ms;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+/**
+ * Where news tone and price disagree, across held and watched instruments.
+ *
+ * Renders only when there is something to say: symbols whose 90-day news
+ * tone points one way while the trailing month's price went the other. Most
+ * days it renders nothing — the divergence list is empty, and an empty
+ * warning strip is noise. Symbols with too little coverage to read a tone
+ * are counted in the footer rather than pretending to have been checked.
+ */
+function NewsDivergencePanel() {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    fetch(`${API}/news/divergence`).then(r => r.json()).then(setData).catch(() => setData(null));
+  }, []);
+  if (!data) return null;
+  const diverging = (data.symbols ?? []).filter(s => s.diverging);
+  if (!diverging.length) return null;
+  return (
+    <Panel>
+      <SectionHeader
+        title="TONE / PRICE DIVERGENCE"
+        subtitle="Held and watched instruments where the news reads one way and the last month traded the other"
+      />
+      <div style={{ padding: "6px 0" }}>
+        {diverging.map(s => (
+          <div key={s.symbol} style={{ display: "flex", alignItems: "baseline", gap: 12, padding: "7px 16px", borderBottom: "1px solid #10141d" }}>
+            <span style={{ fontFamily: "monospace", fontSize: 12, color: "#e8f0fc", width: 70, flexShrink: 0 }}>{s.symbol}</span>
+            <span style={{ fontSize: 11.5, color: "#b8c6da", flex: 1, lineHeight: 1.5 }}>
+              News tone is <span style={{ color: s.tone === "positive" ? "#00d4aa" : "#ff4757" }}>{s.tone}</span> across {s.stories} scored stories,
+              but the price is <span style={{ color: s.ret21 >= 0 ? "#00d4aa" : "#ff4757", fontFamily: "monospace" }}>{s.ret21 >= 0 ? "+" : ""}{(s.ret21 * 100).toFixed(1)}%</span> over the last month.
+            </span>
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: "4px 16px 12px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.6 }}>
+        A disagreement worth looking at, not a signal by itself — either side can be the one that's wrong.
+        {(data.unassessable ?? []).length > 0 && ` ${data.unassessable.length} other followed symbol${data.unassessable.length === 1 ? " has" : "s have"} too little scored coverage to read a tone at all.`}
+      </div>
+    </Panel>
+  );
+}
+
+function NewsPage() {
+  const [stories, setStories] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [scoring, setScoring] = useState(false);
+  const [relevance, setRelevance] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [symbolFilter, setSymbolFilter] = useState(null);
+  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState("smart");
+  const [tier, setTier] = useState("relevant");
+  const [expandedId, setExpandedId] = useState(null);
+  const [aiAnalysis, setAiAnalysis] = useState({});
+  const [aiLoadingId, setAiLoadingId] = useState(null);
+  const [heldSymbols, setHeldSymbols] = useState([]);
+  const [watchSymbols, setWatchSymbols] = useState([]);
+  const [failedFeeds, setFailedFeeds] = useState([]);
+  const [aiStatus, setAiStatus] = useState({ enabled: false, scored: 0, pending: 0, total: 0 });
+
+  // Relevance floors. "Everything" still ranks, it just stops hiding the
+  // low-scoring tail — useful when hunting for something specific.
+  const TIERS = {
+    essential: { min: 60, label: "Essential", hint: "Market-moving only" },
+    relevant:  { min: 25, label: "Relevant",  hint: "Filters out noise" },
+    all:       { min: 0,  label: "Everything", hint: "Unfiltered firehose" },
+  };
+  const minRelevance = TIERS[tier].min;
+
+  const load = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({
+        limit: "120",
+        sort,
+        minRelevance: String(minRelevance),
+      });
+      if (categoryFilter !== "all") params.set("category", categoryFilter);
+      const res = await fetch(`${API}/news?${params}`);
+      const data = await res.json();
+      setStories(data.news ?? []);
+      setLastRefresh(data.lastRefresh ?? null);
+      setFailedFeeds(data.failedFeeds ?? []);
+      setAiStatus(data.ai ?? { enabled: false, scored: 0, pending: 0, total: 0 });
+      setError(null);
+    } catch {
+      setError("Could not reach the server at localhost:4001. Is npm start running?");
+    } finally {
+      setLoading(false);
+    }
+  }, [sort, minRelevance, categoryFilter]);
+
+  useEffect(() => {
+    load();
+    fetch(`${API}/portfolio`).then(r => r.json()).then(d => setHeldSymbols((d.positions ?? []).map(p => p.symbol))).catch(() => {});
+    fetch(`${API}/watchlist`).then(r => r.json()).then(d => setWatchSymbols((d.watchlist ?? []).map(w => w.symbol))).catch(() => {});
+  }, [load]);
+
+  // The backend refreshes feeds every 10 min on its own — poll quietly so new
+  // stories appear without a manual reload.
+  useEffect(() => {
+    const poll = setInterval(load, 90_000);
+    return () => clearInterval(poll);
+  }, [load]);
+
+  async function refresh() {
+    setRefreshing(true);
+    await fetch(`${API}/news/refresh`, { method: "POST" }).catch(() => {});
+    await load();
+    setRefreshing(false);
+  }
+
+  // Fills in the scoring backlog on demand rather than waiting for the next
+  // refresh cycle — mainly matters right after a key is first added.
+  async function scoreNow() {
+    setScoring(true);
+    try {
+      await fetch(`${API}/news/score`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ limit: 60 }),
+      });
+      await load();
+    } catch { /* surfaced via aiStatus staying put */ }
+    setScoring(false);
+  }
+
+  function handleAI(story) {
+    if (aiAnalysis[story.guid] || aiLoadingId === story.guid) return;
+    setAiLoadingId(story.guid);
+    fetchAINewsSummary(story, (text) => {
+      setAiAnalysis(prev => ({ ...prev, [story.guid]: text }));
+      setAiLoadingId(null);
+    }, () => setAiLoadingId(null));
+  }
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: "#4a6080", fontSize: 12 }}>Loading news…</div>;
+  if (error) return <Panel style={{ padding: 20 }}><div style={{ color: "#ff4757", fontSize: 12 }}>⚠ {error}</div></Panel>;
+
+  const isRelevant = s => {
+    if (relevance === "held") return s.symbols?.some(sym => heldSymbols.includes(sym));
+    if (relevance === "watchlist") return s.symbols?.some(sym => watchSymbols.includes(sym));
+    return true;
+  };
+  const searchQ = search.trim().toLowerCase();
+  const filtered = stories
+    .filter(isRelevant)
+    .filter(s => sourceFilter === "all" || s.source === sourceFilter)
+    .filter(s => !symbolFilter || s.symbols?.includes(symbolFilter))
+    .filter(s => !searchQ || s.title?.toLowerCase().includes(searchQ) || s.summary?.toLowerCase().includes(searchQ));
+
+  const sources = [...new Set(stories.map(s => s.source))].sort();
+  const cats = [...new Set(stories.map(s => s.category).filter(Boolean))].sort();
+  const portfolioCount = stories.filter(s => s.symbols?.some(sym => heldSymbols.includes(sym))).length;
+  const watchlistCount = stories.filter(s => s.symbols?.some(sym => watchSymbols.includes(sym))).length;
+
+  const mentionCounts = {};
+  for (const s of stories) for (const sym of s.symbols ?? []) mentionCounts[sym] = (mentionCounts[sym] ?? 0) + 1;
+  const topMentions = Object.entries(mentionCounts).sort((a, b) => b[1] - a[1]).slice(0, 6);
+
+  const scoredPct = aiStatus.total ? Math.round((aiStatus.scored / aiStatus.total) * 100) : 0;
+  const selectStyle = { background: "#0d1117", border: "1px solid #1a2535", color: "#7a8ba0", padding: "5px 10px", borderRadius: 3, cursor: "pointer", fontFamily: "monospace", fontSize: 11 };
+  const btn = (active, color) => ({
+    background: active ? `${color}20` : "transparent",
+    border: `1px solid ${active ? `${color}40` : "#1a2535"}`,
+    color: active ? color : "#4a6080",
+    padding: "5px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "monospace", fontSize: 11,
+  });
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <NewsDivergencePanel />
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 20, fontWeight: 700, color: "#e8f0fe", fontFamily: "monospace" }}>NEWS</div>
+          <div style={{ fontSize: 13, color: "#4a6080", marginTop: 3 }}>
+            {filtered.length} shown · {sources.length} feeds
+            {lastRefresh && ` · refreshed ${newsRelativeTime(lastRefresh)}`}
+          </div>
+          {failedFeeds.length > 0 && (
+            <div style={{ fontSize: 11, color: "#ffa502", marginTop: 4 }}>
+              ⚠ {failedFeeds.length} feed{failedFeeds.length > 1 ? "s" : ""} failed last refresh: {failedFeeds.join(", ")}
+            </div>
+          )}
+        </div>
+        <button onClick={refresh} disabled={refreshing} style={{
+          background: refreshing ? "#1a2535" : "#00d4aa20", border: "1px solid #00d4aa40", color: "#00d4aa",
+          padding: "8px 16px", borderRadius: 4, fontSize: 12, fontFamily: "monospace",
+          cursor: refreshing ? "default" : "pointer",
+        }}>{refreshing ? "REFRESHING…" : "↻ REFRESH FEED"}</button>
+      </div>
+
+      {/* AI scoring status — the thing that makes the ranking meaningful, so
+          it gets stated plainly rather than hidden in Settings. */}
+      <Panel style={{ borderLeft: `3px solid ${aiStatus.enabled ? "#00d4aa" : "#ffa502"}` }}>
+        <div style={{ padding: "12px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 10, fontFamily: "monospace", letterSpacing: 1, color: aiStatus.enabled ? "#00d4aa" : "#ffa502" }}>
+              {aiStatus.enabled ? "◉ AI RANKING ACTIVE" : "○ AI RANKING OFF"}
+            </span>
+            {aiStatus.enabled ? (
+              <span style={{ fontSize: 12, color: "#7a8ba0" }}>
+                {aiStatus.scored} of {aiStatus.total} stories scored ({scoredPct}%)
+                {aiStatus.pending > 0 && <span style={{ color: "#4a6080" }}> · {aiStatus.pending} pending</span>}
+                {aiStatus.gaveUp > 0 && <span style={{ color: "#4a6080" }}> · {aiStatus.gaveUp} unscoreable</span>}
+              </span>
+            ) : (
+              <span style={{ fontSize: 12, color: "#7a8ba0" }}>
+                Add a Gemini key in Settings to rank stories by real relevance instead of keywords.
+              </span>
+            )}
+          </div>
+          {aiStatus.enabled && aiStatus.pending > 0 && (
+            <button onClick={scoreNow} disabled={scoring} style={{
+              background: scoring ? "#1a2535" : "#3d8bff20", border: "1px solid #3d8bff40", color: "#3d8bff",
+              padding: "6px 14px", borderRadius: 3, fontSize: 11, fontFamily: "monospace",
+              cursor: scoring ? "default" : "pointer",
+            }}>{scoring ? "SCORING…" : `SCORE ${Math.min(aiStatus.pending, 60)} NOW`}</button>
+          )}
+        </div>
+        {aiStatus.enabled && aiStatus.total > 0 && (
+          <div style={{ height: 3, background: "#1a2535" }}>
+            <div style={{ width: `${scoredPct}%`, height: "100%", background: "#00d4aa", transition: "width .4s" }} />
+          </div>
+        )}
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+        {[
+          { label: "SHOWING", val: filtered.length, color: "#c8d6e8" },
+          { label: "PORTFOLIO MENTIONS", val: portfolioCount, color: "#00d4aa" },
+          { label: "WATCHLIST MENTIONS", val: watchlistCount, color: "#3d8bff" },
+          { label: "LIVE FEEDS", val: sources.length, color: "#ffa502" },
+        ].map(s => (
+          <div key={s.label} style={{ background: "#0d1117", border: `1px solid ${s.color}20`, borderTop: `2px solid ${s.color}`, borderRadius: 6, padding: "12px 16px" }}>
+            <div style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace", letterSpacing: 1, marginBottom: 5 }}>{s.label}</div>
+            <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: s.color }}>{s.val}</div>
+          </div>
+        ))}
+      </div>
+
+      {topMentions.length > 0 && (
+        <Panel>
+          <SectionHeader title="MOST MENTIONED" subtitle="by symbol, across current feed — click to filter" />
+          <div style={{ padding: "14px 16px", display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {topMentions.map(([sym, count]) => {
+              const active = symbolFilter === sym;
+              return (
+                <div key={sym} onClick={() => setSymbolFilter(active ? null : sym)} style={{
+                  display: "flex", alignItems: "center", gap: 6, background: active ? "#00d4aa18" : "#0d1117",
+                  border: active ? "1px solid #00d4aa60" : "1px solid #1a2535", borderRadius: 4, padding: "6px 12px",
+                  cursor: "pointer",
+                }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: active ? "#00d4aa" : "#c8d6e8", fontFamily: "monospace" }}>{sym}</span>
+                  <span style={{ fontSize: 11, color: "#4a6080" }}>{count}</span>
+                  {heldSymbols.includes(sym) && <span style={{ fontSize: 9, color: "#00d4aa" }}>HELD</span>}
+                </div>
+              );
+            })}
+          </div>
+        </Panel>
+      )}
+
+      {/* Primary controls: what gets shown, and in what order. */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace" }}>SHOW:</span>
+        {Object.entries(TIERS).map(([id, t]) => (
+          <button key={id} onClick={() => setTier(id)} title={t.hint} style={btn(tier === id, "#00d4aa")}>{t.label}</button>
+        ))}
+        <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace", marginLeft: 8 }}>ORDER:</span>
+        <button onClick={() => setSort("smart")} title="Rank by relevance, your holdings, source quality and freshness" style={btn(sort === "smart", "#a855f7")}>Smart</button>
+        <button onClick={() => setSort("newest")} title="Strict reverse-chronological" style={btn(sort === "newest", "#a855f7")}>Newest</button>
+        <input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search headlines…"
+          style={{ marginLeft: "auto", background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, color: "#c8d6e8", fontFamily: "monospace", fontSize: 12, padding: "7px 12px", minWidth: 200 }}
+        />
+      </div>
+
+      {/* Secondary controls. */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginTop: -8 }}>
+        <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace" }}>RELEVANCE:</span>
+        {[{ id: "all", label: "All" }, { id: "held", label: `My Holdings (${portfolioCount})` }, { id: "watchlist", label: `Watchlist (${watchlistCount})` }].map(f => (
+          <button key={f.id} onClick={() => setRelevance(f.id)} style={btn(relevance === f.id, "#00d4aa")}>{f.label}</button>
+        ))}
+        <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace", marginLeft: 8 }}>SOURCE:</span>
+        <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} style={selectStyle}>
+          <option value="all">All ({stories.length})</option>
+          {sources.map(src => <option key={src} value={src}>{src}</option>)}
+        </select>
+        {cats.length > 0 && (
+          <>
+            <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace", marginLeft: 8 }}>TYPE:</span>
+            <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)} style={selectStyle}>
+              <option value="all">All</option>
+              {cats.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </>
+        )}
+        {symbolFilter && (
+          <button onClick={() => setSymbolFilter(null)} style={btn(true, "#00d4aa")}>{symbolFilter} ✕</button>
+        )}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {filtered.length === 0 && (
+          <Panel><div style={{ color: "#4a6080", fontSize: 13, padding: 24, textAlign: "center" }}>
+            No stories match current filters.
+            {tier !== "all" && <> Try <span onClick={() => setTier("all")} style={{ color: "#3d8bff", cursor: "pointer" }}>Everything</span>.</>}
+          </div></Panel>
+        )}
+        {filtered.map(story => {
+          const isExp = expandedId === story.guid;
+          const sentiment = newsSentimentMeta(story.sentiment);
+          const held = story.symbols?.some(sym => heldSymbols.includes(sym));
+          const watch = story.symbols?.some(sym => watchSymbols.includes(sym));
+          const rel = story.relevance ?? 0;
+          const relColor = rel >= 70 ? "#00d4aa" : rel >= 40 ? "#ffa502" : "#4a6080";
+          return (
+            <Panel key={story.guid} style={{ borderLeft: `3px solid ${sentiment.color}` }}>
+              <div onClick={() => { setExpandedId(isExp ? null : story.guid); if (!isExp) handleAI(story); }} style={{ padding: "13px 18px", cursor: "pointer" }}>
+                <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+                  <div style={{ minWidth: 90, flexShrink: 0 }}>
+                    <div style={{ fontFamily: "monospace", fontSize: 12, color: "#4a6080" }}>{newsRelativeTime(story.published)}</div>
+                    <div style={{ fontSize: 11, color: "#3a4558", marginTop: 2 }}>{story.source}</div>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5, flexWrap: "wrap" }}>
+                      {/* Relevance is the headline signal now, so it leads. */}
+                      <span title={story.scored ? "AI-assessed relevance" : "Estimated — not yet AI-scored"} style={{
+                        fontSize: 10, fontWeight: 700, fontFamily: "monospace",
+                        background: `${relColor}18`, color: relColor, padding: "2px 7px", borderRadius: 3,
+                        border: story.scored ? "none" : `1px dashed ${relColor}50`,
+                      }}>{rel}{story.scored ? "" : "?"}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, background: `${sentiment.color}18`, color: sentiment.color, padding: "2px 7px", borderRadius: 3, fontFamily: "monospace" }}>{sentiment.label}</span>
+                      {story.category && <span style={{ fontSize: 10, color: "#7a8ba0", fontFamily: "monospace", background: "#1a2535", padding: "2px 7px", borderRadius: 3 }}>{story.category}</span>}
+                      {held && <span style={{ fontSize: 10, fontWeight: 700, background: "#00d4aa18", color: "#00d4aa", padding: "2px 7px", borderRadius: 3 }}>HELD</span>}
+                      {watch && <span style={{ fontSize: 10, fontWeight: 700, background: "#3d8bff18", color: "#3d8bff", padding: "2px 7px", borderRadius: 3 }}>WATCHLIST</span>}
+                      {story.alsoReported > 0 && (
+                        <span title="Same story carried by other feeds" style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace" }}>
+                          +{story.alsoReported} source{story.alsoReported > 1 ? "s" : ""}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 14, color: "#c8d6e8", lineHeight: 1.4 }}>{story.title}</div>
+                    {/* The one line that turns a headline list into something
+                        you can actually triage at a glance. */}
+                    {story.why && (
+                      <div style={{ fontSize: 12, color: "#7a8ba0", marginTop: 5, lineHeight: 1.45, fontStyle: "italic" }}>
+                        {story.why}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 90, alignItems: "flex-end" }}>
+                    {(story.symbols ?? []).slice(0, 3).map(sym => <span key={sym} style={{ fontSize: 10, background: "#1a2535", color: "#7a8ba0", padding: "1px 6px", borderRadius: 2, fontFamily: "monospace" }}>{sym}</span>)}
+                  </div>
+                  <span style={{ color: "#4a6080", fontSize: 13, flexShrink: 0 }}>{isExp ? "▲" : "▼"}</span>
+                </div>
+              </div>
+              {isExp && (
+                <div style={{ borderTop: "1px solid #1a1f2e", padding: "14px 18px", background: "#080b12" }}>
+                  {story.summary && <div style={{ fontSize: 13, color: "#a0b4c8", lineHeight: 1.6, marginBottom: 12 }}>{story.summary}</div>}
+                  {story.url && (
+                    <a href={story.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: "#3d8bff", textDecoration: "none" }}>
+                      Read full story ↗
+                    </a>
+                  )}
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 10, color: "#00d4aa", fontFamily: "monospace", letterSpacing: 1 }}>AI STORY ANALYSIS</span>
+                      {!aiAnalysis[story.guid] && aiLoadingId !== story.guid && (
+                        <button onClick={e => { e.stopPropagation(); handleAI(story); }} style={{ background: "#00d4aa20", border: "1px solid #00d4aa40", color: "#00d4aa", padding: "5px 12px", borderRadius: 3, cursor: "pointer", fontFamily: "monospace", fontSize: 11 }}>ANALYSE</button>
+                      )}
+                    </div>
+                    {aiLoadingId === story.guid ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 12, height: 12, border: "2px solid #1a2535", borderTop: "2px solid #00d4aa", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                        <span style={{ fontSize: 12, color: "#4a6080", fontFamily: "monospace" }}>Analysing…</span>
+                      </div>
+                    ) : aiAnalysis[story.guid] && (
+                      <div style={{ background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, padding: 12, fontSize: 13, color: "#c8d6e8", lineHeight: 1.65, whiteSpace: "pre-wrap" }}>
+                        {aiAnalysis[story.guid]}
+                      </div>
+                    )}
+                  </div>
+                  {(story.symbols ?? []).length > 0 && (
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap", marginTop: 12 }}>
+                      <span style={{ fontSize: 10, color: "#4a6080" }}>TAGGED:</span>
+                      {story.symbols.map(sym => <span key={sym} style={{ fontSize: 10, background: "#1a2535", color: "#7a8ba0", padding: "2px 7px", borderRadius: 2, fontFamily: "monospace" }}>{sym}</span>)}
+                      {story.aiSymbols && <span style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace" }}>(AI-verified)</span>}
+                    </div>
+                  )}
+                </div>
+              )}
+            </Panel>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One key figure.
+ *
+ * Three states, kept visibly distinct. A real value renders normally. A value
+ * the source did not return renders as no-data. A value that does not apply to
+ * this kind of instrument — a P/E on an index, a dividend yield on a currency
+ * pair — renders greyed out with the reason, because it is not missing data
+ * and showing it as missing implies something is broken.
+ */
+function ResearchStat({ label, value, color = "#c8d6e8", inapplicable = null }) {
+  if (inapplicable) {
+    return (
+      <div title={inapplicable} style={{
+        background: "#0a0d14", border: "1px dashed #141b28", borderRadius: 5,
+        padding: "10px 12px", cursor: "help",
+      }}>
+        <div style={{ fontSize: 9, color: "#2a3548", fontFamily: "monospace", letterSpacing: 0.5 }}>{label}</div>
+        <div style={{ fontSize: 10, color: "#2a3548", marginTop: 4, lineHeight: 1.4 }}>n/a for this instrument</div>
+      </div>
+    );
+  }
+  return (
+    <div style={{ background: "#0d1117", border: "1px solid #1a1f2e", borderRadius: 5, padding: "10px 12px" }}>
+      <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 700, color, fontFamily: "monospace", marginTop: 3 }}>
+        {value ?? <NoData reason="The source returned no value for this field" />}
+      </div>
+    </div>
+  );
+}
+
+const RATING_COLORS = { strongBuy: "#00d4aa", buy: "#4ade80", hold: "#ffa502", sell: "#ff8c42", strongSell: "#ff4757" };
+const RATING_LABELS = { strongBuy: "Strong Buy", buy: "Buy", hold: "Hold", sell: "Sell", strongSell: "Strong Sell" };
+
+// ============================================================
+// RESEARCH — OVERVIEW
+//
+// The Analyst tab used to live separately, which split one question ("what is
+// going on with this thing?") across two places: the price picture here, the
+// street's view over there. Researching an instrument meant reading half the
+// story, clicking, and holding the first half in your head. They are one tab
+// now — chart, numbers and narrative down the left, everything the analysts
+// think down the right rail.
+//
+// Every figure on this tab is either fetched or computed from stored bars, and
+// each panel says which. Where a number cannot be computed the panel says why
+// instead of showing a plausible-looking substitute.
+// ============================================================
+
+/** Container width, tracked live, so the SVG can be drawn at real pixel size. */
+function useElementWidth() {
+  const ref = useRef(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setWidth(el.getBoundingClientRect().width);
+    // Charts are drawn at device pixels rather than scaled with a viewBox:
+    // scaling would stretch the axis text and the event dots along with the
+    // line. That means re-rendering on resize rather than letting the browser
+    // handle it.
+    const ro = new ResizeObserver(entries => {
+      const w = entries[0]?.contentRect?.width;
+      if (w) setWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, width];
+}
+
+const CHART_RANGES = [["1M", 21], ["3M", 63], ["6M", 126], ["1Y", 252], ["5Y", 1260], ["MAX", null]];
+
+const EVENT_STYLE = {
+  earnings: { color: "#3d8bff", glyph: "E", title: "Earnings" },
+  rating:   { color: "#a855f7", glyph: "R", title: "Rating change" },
+  target:   { color: "#facc15", glyph: "T", title: "Consensus target revision" },
+  move:     { color: "#ff8c42", glyph: "!", title: "Outsized single-day move" },
+  note:     { color: "#38bdf8", glyph: "N", title: "Your note" },
+};
+
+const shortDate = iso => {
+  const [y, m, d] = String(iso).split("-");
+  return `${d} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][+m - 1]} ${y.slice(2)}`;
+};
+
+function axisPrice(v, symbol) {
+  if (v == null) return "";
+  const a = Math.abs(v);
+  if (a >= 10000) return `${(v / 1000).toFixed(1)}k`;
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 1) return v.toFixed(2);
+  return v.toFixed(4);
+}
+
+/**
+ * The price line, its moving averages, its yearly extremes and the dated
+ * events that landed on it.
+ *
+ * The whole stored series arrives in one payload, so switching range is a
+ * slice rather than a request — instant, and it cannot get into a state where
+ * the header and the line disagree because one of them refetched.
+ */
+function PriceChart({ series, events = [], technicals, symbol, name }) {
+  const [range, setRange] = useState("1Y");
+  const [showMA, setShowMA] = useState(true);
+  const [hover, setHover] = useState(null);
+  const [wrapRef, width] = useElementWidth();
+  const gid = useId().replace(/:/g, "");
+
+  // A range is offered only when there are enough bars to fill a reasonable
+  // part of it. Below that the window is mostly empty and the label lies about
+  // what you are looking at.
+  const enoughFor = span => span == null || (series?.bars ?? 0) > span * 0.35;
+
+  // What is actually drawn. If the selected range can't be filled — which
+  // happens when you move from a symbol with twelve years of history to one
+  // with three weeks — this falls back to the longest range that can, instead
+  // of showing nineteen bars under a "1Y" heading.
+  const activeRange = useMemo(() => {
+    if (enoughFor(CHART_RANGES.find(([id]) => id === range)?.[1])) return range;
+    const usable = CHART_RANGES.filter(([, span]) => enoughFor(span));
+    return usable.length ? usable[usable.length - 1][0] : "MAX";
+  }, [range, series?.bars]);
+
+  const view = useMemo(() => {
+    if (!series?.available) return null;
+    const n = series.close.length;
+    const span = CHART_RANGES.find(([id]) => id === activeRange)?.[1] ?? null;
+    const start = span == null ? 0 : Math.max(0, n - span);
+    return {
+      start,
+      dates: series.dates.slice(start),
+      close: series.close.slice(start),
+      sma50: series.sma50.slice(start),
+      sma200: series.sma200.slice(start),
+    };
+  }, [series, activeRange]);
+
+  // Index by date once, so plotting events is a lookup rather than a scan per
+  // event. Events that fall on a non-trading day (a Saturday press release,
+  // a holiday) have no bar to sit on and are dropped from the chart rather
+  // than being nudged onto a neighbouring day they did not happen on.
+  const eventsOnChart = useMemo(() => {
+    if (!view) return [];
+    const idx = new Map(view.dates.map((d, i) => [d, i]));
+    const grouped = new Map();
+    for (const e of events) {
+      const i = idx.get(e.date);
+      if (i == null) continue;
+      if (!grouped.has(i)) grouped.set(i, []);
+      grouped.get(i).push(e);
+    }
+    return [...grouped.entries()].map(([i, list]) => ({ i, list }));
+  }, [view, events]);
+
+  if (!series?.available) {
+    return (
+      <Panel>
+        <SectionHeader title="PRICE" subtitle="No stored history" />
+        <div style={{ padding: 20, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>{series?.reason ?? "No price history available for this symbol."}</div>
+      </Panel>
+    );
+  }
+
+  const H = 320, padL = 54, padR = 14, padT = 14, padB = 24;
+  const W = Math.max(width || 0, 320);
+  const innerW = Math.max(W - padL - padR, 10);
+  const innerH = H - padT - padB;
+  const n = view.close.length;
+
+  const visible = view.close.filter(v => v != null);
+  // A 50 or 200-day average needs that many bars before it exists at all, so
+  // on a short history — or a short range — there is simply nothing to draw.
+  // The toggle and its legend follow that rather than advertising lines the
+  // chart cannot show.
+  const has50 = view.sma50.some(v => v != null);
+  const has200 = view.sma200.some(v => v != null);
+  const canMA = has50 || has200;
+  const drawMA = showMA && canMA;
+  const maLines = drawMA
+    ? [...view.sma50.filter(v => v != null), ...view.sma200.filter(v => v != null)]
+    : [];
+  // The 52-week extremes are only drawn on ranges long enough to contain
+  // them. On a one-month view a "52-week high" line sitting far above
+  // everything squashes the actual price into a band and tells you nothing
+  // the stat tiles do not already say.
+  const showExtremes = ["1Y", "5Y", "MAX"].includes(activeRange)
+    && technicals?.available && technicals.high52 != null;
+  const extremes = showExtremes ? [technicals.high52, technicals.low52] : [];
+
+  const all = [...visible, ...maLines, ...extremes];
+  let lo = Math.min(...all), hi = Math.max(...all);
+  if (!(hi > lo)) { hi = lo + 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+
+  const x = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+  const y = v => padT + (1 - (v - lo) / (hi - lo)) * innerH;
+
+  const path = (arr) => {
+    let d = "", pen = false;
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (v == null) { pen = false; continue; }
+      d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
+      pen = true;
+    }
+    return d;
+  };
+
+  const first = visible[0], last = view.close[n - 1];
+  const rangeReturn = first > 0 ? last / first - 1 : null;
+  const up = (rangeReturn ?? 0) >= 0;
+  const lineColor = up ? "#00d4aa" : "#ff4757";
+
+  const areaPath = `${path(view.close)}L${x(n - 1).toFixed(1)},${(padT + innerH).toFixed(1)}L${x(0).toFixed(1)},${(padT + innerH).toFixed(1)}Z`;
+
+  const ticks = 5;
+  const yTicks = Array.from({ length: ticks }, (_, i) => lo + (i / (ticks - 1)) * (hi - lo));
+  const xTickIdx = Array.from({ length: Math.min(6, n) }, (_, i) =>
+    Math.round((i / (Math.min(6, n) - 1 || 1)) * (n - 1)));
+
+  const onMove = e => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const i = Math.round(((px - padL) / innerW) * (n - 1));
+    setHover(i >= 0 && i < n ? i : null);
+  };
+
+  const hv = hover != null ? view.close[hover] : null;
+  const hoverEvents = hover != null ? (eventsOnChart.find(g => g.i === hover)?.list ?? []) : [];
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="PRICE"
+        subtitle={`${series.bars.toLocaleString()} stored bars · ${series.first} to ${series.last}`}
+        extra={
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <button
+              onClick={() => setShowMA(v => !v)}
+              disabled={!canMA}
+              title={canMA
+                ? "50 and 200-day simple moving averages, computed from the same stored bars."
+                : `Needs at least 50 bars in view for a 50-day average — this range has ${n}.`}
+              style={{
+                background: drawMA ? "#3d8bff20" : "transparent",
+                border: `1px solid ${drawMA ? "#3d8bff40" : "#1a2535"}`,
+                color: !canMA ? "#232c3d" : drawMA ? "#3d8bff" : "#4a6080", borderRadius: 3,
+                padding: "3px 8px", cursor: canMA ? "pointer" : "not-allowed",
+                fontFamily: "monospace", fontSize: 9, letterSpacing: 0.5,
+              }}>MA</button>
+            <div style={{ display: "flex", gap: 2 }}>
+              {CHART_RANGES.map(([id, span]) => {
+                const enough = enoughFor(span);
+                const on = activeRange === id;
+                return (
+                  <button
+                    key={id}
+                    disabled={!enough}
+                    onClick={() => setRange(id)}
+                    title={enough ? undefined : `Only ${series.bars} stored bars — not enough for a ${id} view.`}
+                    style={{
+                      background: on ? "#00d4aa20" : "transparent",
+                      border: "none", borderBottom: on ? "2px solid #00d4aa" : "2px solid transparent",
+                      color: !enough ? "#232c3d" : on ? "#00d4aa" : "#4a6080",
+                      padding: "3px 7px", cursor: enough ? "pointer" : "not-allowed",
+                      fontFamily: "monospace", fontSize: 10, letterSpacing: 0.5,
+                    }}>{id}</button>
+                );
+              })}
+            </div>
+          </div>
+        }
+      />
+
+      <div ref={wrapRef} style={{ position: "relative", padding: "6px 0 0" }}>
+        <svg
+          width={W} height={H}
+          onMouseMove={onMove}
+          onMouseLeave={() => setHover(null)}
+          style={{ display: "block", cursor: "crosshair" }}
+        >
+          <defs>
+            <linearGradient id={`grad-${gid}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={lineColor} stopOpacity="0.26" />
+              <stop offset="100%" stopColor={lineColor} stopOpacity="0" />
+            </linearGradient>
+          </defs>
+
+          {yTicks.map((t, i) => (
+            <g key={i}>
+              <line x1={padL} x2={W - padR} y1={y(t)} y2={y(t)} stroke="#141b28" strokeWidth="1" />
+              <text x={padL - 8} y={y(t) + 3.5} textAnchor="end" fontSize="9" fill="#3a4558" fontFamily="monospace">
+                {axisPrice(t, symbol)}
+              </text>
+            </g>
+          ))}
+
+          {showExtremes && [
+            ["52W HIGH", technicals.high52, "#ff4757"],
+            ["52W LOW", technicals.low52, "#00d4aa"],
+          ].map(([lbl, val, col]) => val != null && val > lo && val < hi && (
+            <g key={lbl}>
+              <line x1={padL} x2={W - padR} y1={y(val)} y2={y(val)} stroke={col} strokeWidth="1" strokeDasharray="4 4" opacity="0.5" />
+              <text x={W - padR - 2} y={y(val) - 4} textAnchor="end" fontSize="8" fill={col} fontFamily="monospace" opacity="0.85">
+                {lbl} {axisPrice(val, symbol)}
+              </text>
+            </g>
+          ))}
+
+          <path d={areaPath} fill={`url(#grad-${gid})`} />
+
+          {drawMA && (
+            <>
+              {has200 && <path d={path(view.sma200)} fill="none" stroke="#a855f7" strokeWidth="1" opacity="0.55" />}
+              {has50 && <path d={path(view.sma50)} fill="none" stroke="#3d8bff" strokeWidth="1" opacity="0.7" />}
+            </>
+          )}
+
+          <path d={path(view.close)} fill="none" stroke={lineColor} strokeWidth="1.6" strokeLinejoin="round" />
+
+          {eventsOnChart.map(({ i, list }) => {
+            const v = view.close[i];
+            if (v == null) return null;
+            const style = EVENT_STYLE[list[0].type] ?? EVENT_STYLE.move;
+            return (
+              <g key={i}>
+                <line x1={x(i)} x2={x(i)} y1={y(v)} y2={padT + innerH} stroke={style.color} strokeWidth="1" opacity="0.14" />
+                <circle cx={x(i)} cy={y(v)} r="3.4" fill="#0d1117" stroke={style.color} strokeWidth="1.5" />
+                {list.length > 1 && (
+                  <text x={x(i)} y={y(v) - 7} textAnchor="middle" fontSize="7.5" fill={style.color} fontFamily="monospace">{list.length}</text>
+                )}
+              </g>
+            );
+          })}
+
+          {xTickIdx.map(i => (
+            <text key={i} x={x(i)} y={H - 7}
+              textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}
+              fontSize="9" fill="#3a4558" fontFamily="monospace">
+              {shortDate(view.dates[i])}
+            </text>
+          ))}
+
+          {hover != null && hv != null && (
+            <g>
+              <line x1={x(hover)} x2={x(hover)} y1={padT} y2={padT + innerH} stroke="#4a6080" strokeWidth="1" strokeDasharray="3 3" />
+              <circle cx={x(hover)} cy={y(hv)} r="3.5" fill={lineColor} stroke="#0d1117" strokeWidth="1.5" />
+            </g>
+          )}
+        </svg>
+
+        {hover != null && hv != null && (
+          <div style={{
+            position: "absolute", top: 8,
+            left: Math.min(Math.max(x(hover) - 70, 4), Math.max(W - 200, 4)),
+            background: "#070a10", border: "1px solid #1a2535", borderRadius: 4,
+            padding: "7px 10px", pointerEvents: "none", zIndex: 3, maxWidth: 230,
+          }}>
+            <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>{shortDate(view.dates[hover])}</div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace", marginTop: 2 }}>
+              {formatPrice(hv, symbol)}
+            </div>
+            {drawMA && view.sma50[hover] != null && (
+              <div style={{ fontSize: 9, color: "#3d8bff", fontFamily: "monospace", marginTop: 3 }}>
+                50DMA {formatPrice(view.sma50[hover], symbol)}
+                {view.sma200[hover] != null && <span style={{ color: "#a855f7" }}>{"  "}200DMA {formatPrice(view.sma200[hover], symbol)}</span>}
+              </div>
+            )}
+            {hoverEvents.map((e, k) => (
+              <div key={k} style={{ fontSize: 9.5, color: (EVENT_STYLE[e.type] ?? EVENT_STYLE.move).color, marginTop: 4, lineHeight: 1.4 }}>
+                {e.label}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div style={{
+        display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap",
+        padding: "9px 16px 12px", borderTop: "1px solid #141b28", marginTop: 4,
+      }}>
+        <span style={{ fontSize: 11, fontFamily: "monospace", color: lineColor }}
+              title={`${view.dates[0]} to ${view.dates[n - 1]}, ${n} bars`}>
+          {activeRange} {rangeReturn == null ? "—" : `${rangeReturn >= 0 ? "+" : ""}${(rangeReturn * 100).toFixed(1)}%`}
+        </span>
+        {activeRange !== range && (
+          <span style={{ fontSize: 9.5, color: "#ffa502", fontFamily: "monospace" }}>
+            only {series.bars} bars stored — showing everything there is
+          </span>
+        )}
+        {drawMA && has50 && <LegendDot color="#3d8bff" label="50DMA" />}
+        {drawMA && has200 && <LegendDot color="#a855f7" label="200DMA" />}
+        {[...new Set(eventsOnChart.flatMap(g => g.list.map(e => e.type)))].map(t => (
+          <LegendDot key={t} color={(EVENT_STYLE[t] ?? EVENT_STYLE.move).color} label={(EVENT_STYLE[t] ?? EVENT_STYLE.move).title} hollow />
+        ))}
+        <span style={{ fontSize: 9.5, color: "#3a4558", marginLeft: "auto" }}>
+          Daily closes from Meridian's own store. Hover for any day.
+        </span>
+      </div>
+    </Panel>
+  );
+}
+
+function LegendDot({ color, label, hollow = false }) {
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+      <span style={{
+        width: 7, height: 7, borderRadius: "50%",
+        background: hollow ? "transparent" : color,
+        border: hollow ? `1.5px solid ${color}` : "none",
+      }} />
+      <span style={{ fontSize: 9.5, color: "#4a6080", fontFamily: "monospace" }}>{label}</span>
+    </span>
+  );
+}
+
+// ─── Metrics ──────────────────────────────────────────────────
+
+function MetricTile({ label, value, color = "#c8d6e8", sub = null, hint = null, missing = null }) {
+  if (value == null || value === "") {
+    return (
+      <div title={missing ?? undefined} style={{
+        background: "#0a0d14", border: "1px dashed #141b28", borderRadius: 5,
+        padding: "9px 11px", cursor: missing ? "help" : "default",
+      }}>
+        <div style={{ fontSize: 8.5, color: "#2a3548", fontFamily: "monospace", letterSpacing: 0.5 }}>{label}</div>
+        <div style={{ fontSize: 10, color: "#2a3548", marginTop: 4 }}>not available</div>
+      </div>
+    );
+  }
+  return (
+    <div title={hint ?? undefined} style={{
+      background: "#0d1117", border: "1px solid #1a1f2e", borderRadius: 5,
+      padding: "9px 11px", cursor: hint ? "help" : "default",
+    }}>
+      <div style={{ fontSize: 8.5, color: "#4a6080", fontFamily: "monospace", letterSpacing: 0.5 }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 700, color, fontFamily: "monospace", marginTop: 3 }}>{value}</div>
+      {sub && <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/**
+ * "an index", "a common stock", "an ETF" — instrument labels mix ordinary
+ * words with acronyms, so neither blanket lowercasing nor a fixed article
+ * works. Acronyms keep their capitals and take the article their letter-name
+ * sound wants: "an ETF", because the F is read "eff".
+ */
+function anInstrumentLabel(label) {
+  const l = String(label ?? "instrument");
+  const acronym = /^[A-Z]{2,}/.test(l);
+  const word = acronym ? l : l.toLowerCase();
+  const vowelSound = acronym ? /^[AEIOUFLMNRSX]/.test(l) : /^[aeiou]/.test(word);
+  return `${vowelSound ? "an" : "a"} ${word}`;
+}
+
+const pctStr = (v, dp = 1) => (v == null ? null : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(dp)}%`);
+const absPctStr = (v, dp = 1) => (v == null ? null : `${(Math.abs(v) * 100).toFixed(dp)}%`);
+const dirColor = v => (v == null ? "#c8d6e8" : v > 0 ? "#00d4aa" : v < 0 ? "#ff4757" : "#c8d6e8");
+
+/** Trailing returns and the risk numbers computed alongside them. */
+function ResearchPerformancePanel({ tech, symbol }) {
+  if (!tech?.available) {
+    return (
+      <Panel>
+        <SectionHeader title="PERFORMANCE & RISK" subtitle="Not computable" />
+        <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>{tech?.reason ?? "No stored bars."}</div>
+      </Panel>
+    );
+  }
+  const r = tech.returns;
+  const rsiColor = tech.rsi14 == null ? "#c8d6e8" : tech.rsi14 > 70 ? "#ff8c42" : tech.rsi14 < 30 ? "#4ade80" : "#c8d6e8";
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="PERFORMANCE & RISK"
+        subtitle={`Computed from ${tech.bars.toLocaleString()} stored bars, to ${tech.asOf}`}
+      />
+      <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(104px, 1fr))", gap: 8 }}>
+        {["1W", "1M", "3M", "6M", "1Y", "YTD"].map(k => (
+          <MetricTile
+            key={k} label={k === "YTD" ? "YEAR TO DATE" : k}
+            value={pctStr(r[k])} color={dirColor(r[k])}
+            missing={`Needs more stored history than this symbol has to measure a ${k} return.`}
+          />
+        ))}
+      </div>
+      <div style={{ padding: "0 14px 14px", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(104px, 1fr))", gap: 8 }}>
+        <MetricTile
+          label="30D VOL" value={absPctStr(tech.vol30, 0)}
+          sub={tech.volRatio ? `${tech.volRatio.toFixed(2)}x its year` : null}
+          color={tech.volRatio > 1.35 ? "#ff8c42" : tech.volRatio < 0.7 ? "#4a90d9" : "#c8d6e8"}
+          hint="Annualised standard deviation of the last 30 daily returns. The sub-line compares it with the same figure over a full year."
+          missing="Needs at least 30 stored bars."
+        />
+        <MetricTile label="1Y VOL" value={absPctStr(tech.vol1y, 0)} hint="Annualised standard deviation of daily returns over the trailing year." missing="Needs a full year of stored bars." />
+        <MetricTile
+          label="RSI (14)" value={tech.rsi14 == null ? null : tech.rsi14.toFixed(0)} color={rsiColor}
+          sub={tech.rsi14 == null ? null : tech.rsi14 > 70 ? "overbought zone" : tech.rsi14 < 30 ? "oversold zone" : "mid-range"}
+          hint="Relative Strength Index over 14 bars. A momentum oscillator, not a forecast."
+          missing="Needs at least 15 stored bars."
+        />
+        <MetricTile
+          label="VS 50DMA" value={pctStr(tech.dist50dma)} color={dirColor(tech.dist50dma)}
+          hint="Distance of the last close from its own 50-day simple moving average."
+          missing="Needs at least 50 stored bars."
+        />
+        <MetricTile
+          label="VS 200DMA" value={pctStr(tech.dist200dma)} color={dirColor(tech.dist200dma)}
+          hint="Distance of the last close from its own 200-day simple moving average."
+          missing="Needs at least 200 stored bars."
+        />
+        <MetricTile
+          label="FROM 52W HIGH" value={pctStr(tech.fromHigh)} color={dirColor(tech.fromHigh)}
+          sub={tech.rangeBars < 252 ? `only ${tech.rangeBars} bars` : null}
+          hint="How far the last close sits below the highest close in the trailing window."
+        />
+        <MetricTile
+          label="MAX DD (1Y)" value={absPctStr(tech.maxDrawdown1y)} color="#ff4757"
+          sub={tech.maxDrawdownTrough ? `trough ${tech.maxDrawdownTrough}` : null}
+          hint="Largest peak-to-trough fall in the trailing year, measured on closes."
+        />
+        <MetricTile
+          label={`BETA VS ${tech.benchmark ?? "MKT"}`}
+          value={tech.beta == null ? null : tech.beta.toFixed(2)}
+          sub={tech.correlation == null ? null : `r = ${tech.correlation.toFixed(2)}`}
+          hint={`Regressed on the ${tech.benchmarkOverlap} trading days the two series actually share, not by position.`}
+          missing={tech.benchmarkReason ?? "No overlapping benchmark history."}
+        />
+      </div>
+      {tech.rangePosition != null && (
+        <div style={{ padding: "0 16px 16px" }}>
+          <RangeTrack
+            low={tech.low52} high={tech.high52} value={tech.lastClose} symbol={symbol}
+            lowLabel={tech.rangeBars >= 252 ? "52W LOW" : `${tech.rangeBars}-BAR LOW`}
+            highLabel={tech.rangeBars >= 252 ? "52W HIGH" : `${tech.rangeBars}-BAR HIGH`}
+          />
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+/**
+ * A value's position between two bounds, drawn as a track with a marker.
+ *
+ * A value outside the bounds is called out rather than quietly pinned to the
+ * end of the track. Clamping alone reads as "at the top of the range" when
+ * the truth is "past the top of it" — which is the more interesting fact, and
+ * a common one: a price above every published target says something the
+ * pinned marker actively hides.
+ */
+function RangeTrack({ low, high, value, symbol, lowLabel = "LOW", highLabel = "HIGH", color = "#00d4aa" }) {
+  if (low == null || high == null || value == null || !(high > low)) return null;
+  const raw = (value - low) / (high - low);
+  const outside = raw < 0 || raw > 1;
+  const pos = Math.min(Math.max(raw, 0), 1) * 100;
+  const markerColor = outside ? "#ffa502" : color;
+  return (
+    <div>
+      <div style={{ position: "relative", height: 6, background: "#141b28", borderRadius: 3, marginBottom: 7 }}>
+        <div style={{ position: "absolute", inset: 0, borderRadius: 3, background: "linear-gradient(90deg,#ff475730,#ffa50230,#00d4aa30)" }} />
+        <div style={{
+          position: "absolute", left: `${pos}%`, top: -3, width: 2, height: 12,
+          background: markerColor, transform: "translateX(-1px)", borderRadius: 1,
+          boxShadow: `0 0 6px ${markerColor}`,
+        }} />
+        {outside && (
+          <div style={{
+            position: "absolute", top: -5, [raw > 1 ? "left" : "right"]: `calc(${pos}% + 4px)`,
+            fontSize: 10, color: "#ffa502", lineHeight: 1, fontFamily: "monospace",
+          }}>{raw > 1 ? "›" : "‹"}</div>
+        )}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>
+        <span>{lowLabel} {formatPrice(low, symbol)}</span>
+        <span style={{ color: outside ? "#ffa502" : "#7a8ba0" }}>
+          {outside
+            ? `${raw > 1 ? "above" : "below"} the whole range`
+            : `${pos.toFixed(0)}% up the range`}
+        </span>
+        <span>{highLabel} {formatPrice(high, symbol)}</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Narrative ────────────────────────────────────────────────
+
+/**
+ * "Where things stand", as composed by the server from the same numbers shown
+ * elsewhere on the page.
+ *
+ * Labelled as composed rather than generated, and it says so in the footer.
+ * A block of prose on a research page reads like a model wrote it unless it
+ * tells you otherwise, and the distinction matters: nothing here can drift
+ * away from the figures beside it, because every sentence was emitted by a
+ * branch that had the numbers in hand.
+ */
+function NarrativePanel({ narrative }) {
+  if (!narrative) return null;
+  const sections = [narrative.priceAction, narrative.street, narrative.coming].filter(Boolean);
+  return (
+    <Panel>
+      <SectionHeader title="WHERE THINGS STAND" subtitle={narrative.asOf ? `Bars to ${narrative.asOf}` : undefined} />
+      <div style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 16 }}>
+        {sections.map(sec => (
+          <div key={sec.title}>
+            <div style={{ fontSize: 9.5, color: "#00d4aa", fontFamily: "monospace", letterSpacing: 1.2, marginBottom: 6 }}>
+              {sec.title}
+            </div>
+            <div style={{ fontSize: 12.5, lineHeight: 1.75, color: "#b8c6da" }}>
+              {sec.lines.join(" ")}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: "0 16px 13px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.6 }}>
+        {narrative.method}
+      </div>
+    </Panel>
+  );
+}
+
+// ─── Sentiment ────────────────────────────────────────────────
+
+/** News tone over 90 days, drawn as a zero-centred area. */
+function SentimentTrend({ sentiment }) {
+  const [wrapRef, width] = useElementWidth();
+  const gid = useId().replace(/:/g, "");
+
+  if (!sentiment?.available) {
+    return (
+      <Panel>
+        <SectionHeader title="NEWS SENTIMENT" subtitle="Coverage too thin" />
+        <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+          {sentiment?.reason ?? "No scored stories for this symbol."}
+        </div>
+      </Panel>
+    );
+  }
+
+  const pts = sentiment.points;
+  const H = 118, padL = 8, padR = 8, padT = 12, padB = 18;
+  const W = Math.max(width || 0, 300);
+  const innerW = Math.max(W - padL - padR, 10);
+  const innerH = H - padT - padB;
+  const n = pts.length;
+
+  const maxAbs = Math.max(0.25, ...pts.map(p => Math.abs(p.smooth)));
+  const x = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+  const y = v => padT + (1 - (v + maxAbs) / (2 * maxAbs)) * innerH;
+  const zero = y(0);
+
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.smooth).toFixed(1)}`).join("");
+  const area = `${line}L${x(n - 1).toFixed(1)},${zero.toFixed(1)}L${x(0).toFixed(1)},${zero.toFixed(1)}Z`;
+
+  const bandColor = { positive: "#00d4aa", negative: "#ff4757", neutral: "#ffa502" };
+  const nowColor = bandColor[sentiment.nowBand];
+
+  return (
+    <Panel>
+      <SectionHeader
+        title={`NEWS SENTIMENT, LAST ${sentiment.days} DAYS`}
+        subtitle={`${sentiment.stories} scored stories across ${n} days with coverage`}
+        extra={
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: nowColor, fontFamily: "monospace", letterSpacing: 1 }}>
+              NOW: {sentiment.nowBand.toUpperCase()}
+            </div>
+            {sentiment.priorBand && (
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", marginTop: 2 }}>
+                {/* Direction comes from the smoothed values, not the band
+                    names — "up from negative" would be wrong for a fall from
+                    positive to neutral, which is also a band change. */}
+                {sentiment.shifted
+                  ? `${sentiment.now >= sentiment.prior ? "up" : "down"} from ${sentiment.priorBand} 3 weeks ago`
+                  : "unchanged over 3 weeks"}
+              </div>
+            )}
+          </div>
+        }
+      />
+      <div ref={wrapRef} style={{ padding: "4px 8px 0" }}>
+        <svg width={W} height={H} style={{ display: "block" }}>
+          <defs>
+            <linearGradient id={`sup-${gid}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#00d4aa" stopOpacity="0.42" />
+              <stop offset="100%" stopColor="#00d4aa" stopOpacity="0.02" />
+            </linearGradient>
+            <linearGradient id={`sdn-${gid}`} x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0%" stopColor="#ff4757" stopOpacity="0.42" />
+              <stop offset="100%" stopColor="#ff4757" stopOpacity="0.02" />
+            </linearGradient>
+            {/* Clipped twice against the zero line so the fill is green above
+                and red below without splitting the path itself. */}
+            <clipPath id={`cup-${gid}`}><rect x="0" y="0" width={W} height={zero} /></clipPath>
+            <clipPath id={`cdn-${gid}`}><rect x="0" y={zero} width={W} height={H - zero} /></clipPath>
+          </defs>
+          <path d={area} fill={`url(#sup-${gid})`} clipPath={`url(#cup-${gid})`} />
+          <path d={area} fill={`url(#sdn-${gid})`} clipPath={`url(#cdn-${gid})`} />
+          <line x1={padL} x2={W - padR} y1={zero} y2={zero} stroke="#2a3548" strokeWidth="1" />
+          <path d={line} fill="none" stroke={nowColor} strokeWidth="1.5" strokeLinejoin="round" />
+          <circle cx={x(n - 1)} cy={y(pts[n - 1].smooth)} r="3" fill={nowColor} />
+          <text x={padL} y={H - 5} fontSize="9" fill="#3a4558" fontFamily="monospace">{shortDate(pts[0].date)}</text>
+          <text x={W - padR} y={H - 5} textAnchor="end" fontSize="9" fill="#3a4558" fontFamily="monospace">{shortDate(pts[n - 1].date)}</text>
+        </svg>
+      </div>
+      <div style={{ padding: "6px 16px 13px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.6 }}>
+        Seven-day trailing mean of story sentiment, over days that actually had coverage — gaps are not
+        interpolated. Positive and negative are relative to a neutral read, not a price forecast.
+      </div>
+    </Panel>
+  );
+}
+
+// ─── Right rail ───────────────────────────────────────────────
+
+function ConsensusPanel({ summary, price, symbol }) {
+  const a = summary?.analyst;
+  if (!a || a.targetMean == null) return null;
+  const gap = price ? a.targetMean / price - 1 : null;
+  const col = gap == null ? "#e8f0fc" : gap >= 0 ? "#00d4aa" : "#ff4757";
+  return (
+    <Panel>
+      <SectionHeader
+        title="CONSENSUS TARGET"
+        subtitle={a.numberOfAnalysts ? `${a.numberOfAnalysts} analyst${a.numberOfAnalysts === 1 ? "" : "s"}` : "Yahoo Finance"}
+      />
+      <div style={{ padding: "14px 16px 6px", textAlign: "center" }}>
+        <div style={{ fontSize: 30, fontWeight: 700, color: col, fontFamily: "monospace", lineHeight: 1.1 }}>
+          {formatPrice(a.targetMean, symbol)}
+        </div>
+        {gap != null && (
+          <div style={{ fontSize: 12, color: col, fontFamily: "monospace", marginTop: 3 }}>
+            {pctStr(gap)} vs current
+          </div>
+        )}
+      </div>
+      {a.targetLow != null && a.targetHigh != null && (
+        <div style={{ padding: "8px 16px 16px" }}>
+          <RangeTrack
+            low={a.targetLow} high={a.targetHigh} value={price ?? a.targetMean} symbol={symbol}
+            lowLabel="LOW" highLabel="HIGH" color={price ? "#e8f0fc" : "#4a6080"}
+          />
+          <div style={{ fontSize: 9, color: "#3a4558", marginTop: 7, lineHeight: 1.6 }}>
+            The marker is {price ? "the current price" : "the mean target"} within the published range. A spread
+            of forecasts, not a probability distribution.
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function RatingPanel({ summary }) {
+  const t = summary?.ratingTrend;
+  if (!t) return null;
+  const total = t.strongBuy + t.buy + t.hold + t.sell + t.strongSell;
+  if (!total) return null;
+  const buys = t.strongBuy + t.buy;
+  return (
+    <Panel>
+      <SectionHeader title="RATING" subtitle="Current analyst ratings" />
+      <div style={{ padding: "14px 16px 16px" }}>
+        <div style={{ textAlign: "center", fontSize: 17, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace", marginBottom: 12 }}>
+          {buys} of {total} rate <span style={{ color: "#00d4aa" }}>Buy</span>
+        </div>
+        <div style={{ display: "flex", height: 12, borderRadius: 3, overflow: "hidden", marginBottom: 10 }}>
+          {["strongBuy", "buy", "hold", "sell", "strongSell"].map(k => t[k] > 0 && (
+            <div key={k} style={{ flex: t[k], background: RATING_COLORS[k] }} title={`${RATING_LABELS[k]}: ${t[k]}`} />
+          ))}
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "5px 12px" }}>
+          {["strongBuy", "buy", "hold", "sell", "strongSell"].map(k => (
+            <span key={k} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <span style={{ width: 7, height: 7, borderRadius: 2, background: RATING_COLORS[k], opacity: t[k] > 0 ? 1 : 0.25 }} />
+              <span style={{ fontSize: 10, color: t[k] > 0 ? "#7a8ba0" : "#2a3548" }}>{RATING_LABELS[k]}</span>
+              <span style={{ fontSize: 10, color: t[k] > 0 ? "#c8d6e8" : "#2a3548", fontFamily: "monospace" }}>{t[k]}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/** Bear / base / bull, straight from the published low, mean and high targets. */
+function ScenarioPanelCompact({ summary, price, symbol }) {
+  const a = summary?.analyst;
+  if (!a || a.targetMean == null || !price) return null;
+  const cells = [
+    ["BEAR", a.targetLow, "#ff4757"],
+    ["BASE", a.targetMean, "#c8d6e8"],
+    ["BULL", a.targetHigh, "#00d4aa"],
+  ].filter(([, v]) => v != null);
+  if (cells.length < 2) return null;
+
+  return (
+    <Panel>
+      <SectionHeader title="TARGET SCENARIOS" subtitle="Published low / mean / high" />
+      <div style={{ padding: 14, display: "grid", gridTemplateColumns: `repeat(${cells.length},1fr)`, gap: 8 }}>
+        {cells.map(([label, val, col]) => (
+          <div key={label} style={{
+            background: "#0a0d14", border: `1px solid ${col}30`, borderTop: `2px solid ${col}`,
+            borderRadius: 5, padding: "10px 8px", textAlign: "center",
+          }}>
+            <div style={{ fontSize: 8.5, color: "#4a6080", fontFamily: "monospace", letterSpacing: 0.8 }}>{label}</div>
+            <div style={{ fontSize: 15, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace", marginTop: 4 }}>
+              {formatPrice(val, symbol)}
+            </div>
+            <div style={{ fontSize: 10, color: col, fontFamily: "monospace", marginTop: 2 }}>
+              {pctStr(val / price - 1)}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: "0 16px 14px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.6 }}>
+        These are the extremes of what analysts published, not modelled outcomes. The spread measures
+        disagreement, and nothing about it says any one of them is likely.
+      </div>
+    </Panel>
+  );
+}
+
+function NextDatesPanel({ summary }) {
+  const d = summary?.dates;
+  const rows = [
+    d?.nextEarnings && ["Earnings", d.nextEarnings + (d.nextEarningsLate && d.nextEarningsLate !== d.nextEarnings ? ` – ${d.nextEarningsLate}` : ""), "#3d8bff"],
+    d?.exDividendDate && ["Ex-dividend", d.exDividendDate, "#a855f7"],
+    d?.dividendDate && ["Dividend paid", d.dividendDate, "#00d4aa"],
+  ].filter(Boolean);
+  if (!rows.length) return null;
+  return (
+    <Panel>
+      <SectionHeader title="KEY DATES" subtitle="From Yahoo's calendar" />
+      <div style={{ padding: "4px 0" }}>
+        {rows.map(([label, val, col], i) => (
+          <div key={label} style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "9px 16px", borderBottom: i < rows.length - 1 ? "1px solid #12161f" : "none",
+          }}>
+            <span style={{ fontSize: 11, color: "#7a8ba0" }}>{label}</span>
+            <span style={{ fontSize: 11.5, color: col, fontFamily: "monospace" }}>{val}</span>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function RatingChangesPanel({ summary, symbol }) {
+  const rows = summary?.upgrades ?? [];
+  if (!rows.length) return null;
+  // Yahoo's upgrade/downgrade history carries no per-item article link — just
+  // the firm, the grades and the date, not which piece reported it. The
+  // honest link is to where this data itself comes from, same as the ↗ on
+  // each holdings row, rather than pretending to point at a specific story.
+  const sourceUrl = symbol ? `https://finance.yahoo.com/quote/${encodeURIComponent(symbol)}/analysis` : null;
+  return (
+    <Panel>
+      <SectionHeader title="RECENT RATING CHANGES" subtitle={`Last ${rows.length} · Yahoo Finance`} />
+      <div style={{ padding: "4px 0" }}>
+        {rows.map((u, i) => {
+          const col = u.action === "up" ? "#00d4aa" : u.action === "down" ? "#ff4757" : "#7a8ba0";
+          return (
+            <div key={i} style={{
+              display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10,
+              padding: "8px 16px", borderBottom: i < rows.length - 1 ? "1px solid #12161f" : "none",
+            }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 11.5, color: "#c8d6e8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{u.firm || "Unknown firm"}</span>
+                  {sourceUrl && (
+                    <a href={sourceUrl} target="_blank" rel="noopener noreferrer"
+                      title="View analyst ratings on Yahoo Finance — the source of this data, not a specific article"
+                      style={{ color: "#4a6080", fontSize: 11, textDecoration: "none", flexShrink: 0 }}>↗</a>
+                  )}
+                </div>
+                <div style={{ fontSize: 9.5, color: col, fontFamily: "monospace", marginTop: 1 }}>
+                  {u.fromGrade && u.toGrade && u.fromGrade !== u.toGrade ? `${u.fromGrade} → ${u.toGrade}` : (u.toGrade || "—")}
+                </div>
+              </div>
+              <span style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace", flexShrink: 0 }}>{u.date || "—"}</span>
+            </div>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+function KeyStatsPanel({ summary, symbol }) {
+  const s = summary;
+  if (!s) return null;
+  const rows = [
+    ["marketCap", "MARKET CAP", s.marketCap ? formatBigNumber(s.marketCap) : null],
+    ["pe", "P/E (TTM)", s.pe ? s.pe.toFixed(1) : null],
+    ["forwardPe", "FORWARD P/E", s.forwardPe ? s.forwardPe.toFixed(1) : null],
+    ["dividendYield", "DIV YIELD", s.dividendYield ? `${(s.dividendYield * 100).toFixed(2)}%` : null],
+    ["beta", "BETA (YAHOO)", s.beta ? s.beta.toFixed(2) : null],
+    ["avgVolume", "AVG VOLUME", s.avgVolume ? formatBigNumber(s.avgVolume) : null],
+    ["expenseRatio", "EXPENSE RATIO", s.expenseRatio ? `${(s.expenseRatio * 100).toFixed(2)}%` : null],
+    ["sharesOutstanding", "SHARES OUT", s.sharesOutstanding ? formatBigNumber(s.sharesOutstanding) : null],
+    // Deliberately no 52-week range here. Meridian computes that from its own
+    // stored bars in the Performance panel, and Yahoo's figure can disagree —
+    // two different "52W range" numbers on one screen is worse than one.
+  ];
+  const applies = ([key]) => !s.applicableStats || s.applicableStats.includes(key);
+  const applicable = rows.filter(applies);
+
+  // Two different empty states that must not be worded the same way. An index
+  // has no market cap or P/E as a matter of what it is; a stock that came back
+  // without one has a gap in the source. Collapsing both into a grid of dashed
+  // tiles reads as failure in the first case and as "not applicable" in the
+  // second, and both readings are wrong.
+  if (!applicable.length || !applicable.some(r => r[2] != null)) {
+    const byType = !applicable.length;
+    return (
+      <Panel>
+        <SectionHeader title="KEY STATS" subtitle={s.instrumentLabel ?? "No fundamentals"} />
+        <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+          {byType
+            ? `Company fundamentals — market cap, earnings multiples, dividend yield — do not apply to ${anInstrumentLabel(s.instrumentLabel)}. The price history and risk figures on the left are computed from its own bars and do apply.`
+            : `The source returned no fundamentals for ${symbol}, though ${anInstrumentLabel(s.instrumentLabel)} would normally have them. That is a gap in the data, not a property of the instrument.`}
+        </div>
+      </Panel>
+    );
+  }
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="KEY STATS"
+        subtitle={[s.instrumentLabel, s.sector, s.industry, s.country].filter(Boolean).join(" · ") || "Yahoo Finance"}
+      />
+      <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8 }}>
+        {rows.filter(applies).map(([key, label, value]) => (
+          <MetricTile
+            key={key} label={label} value={value}
+            missing="The source returned no value for this field."
+          />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function EarningsRecordPanel({ summary }) {
+  const rows = summary?.earningsHistory ?? [];
+  if (!rows.length) return null;
+  return (
+    <Panel>
+      <SectionHeader title="EARNINGS RECORD" subtitle="Actual vs estimate" />
+      <div style={{ padding: "4px 0" }}>
+        {rows.map((e, i) => (
+          <div key={i} style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "8px 16px", borderBottom: i < rows.length - 1 ? "1px solid #12161f" : "none",
+          }}>
+            <span style={{ fontSize: 11, color: "#c8d6e8", fontFamily: "monospace" }}>{e.quarter || "—"}</span>
+            <div style={{ display: "flex", gap: 12, alignItems: "baseline" }}>
+              <span style={{ fontSize: 10, color: "#4a6080" }}>est {e.epsEstimate != null ? e.epsEstimate.toFixed(2) : "—"}</span>
+              <span style={{ fontSize: 10.5, color: "#c8d6e8" }}>{e.epsActual != null ? e.epsActual.toFixed(2) : "—"}</span>
+              <span style={{ fontSize: 10.5, fontFamily: "monospace", color: e.surprisePercent > 0 ? "#00d4aa" : e.surprisePercent < 0 ? "#ff4757" : "#7a8ba0" }}>
+                {e.surprisePercent != null ? `${e.surprisePercent >= 0 ? "+" : ""}${e.surprisePercent.toFixed(1)}%` : "—"}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+/** Everything the street thinks, when none of it is available. */
+function NoCoveragePanel({ summary, symbol }) {
+  const why = summary?.hasAnalystCoverage === false
+    ? (summary.inapplicable?.analyst ?? `Analysts do not rate ${summary.instrumentLabel?.toLowerCase() ?? "an instrument"} like this.`)
+    : `No analyst coverage came back for ${symbol}. That is normal for index trackers, funds and smaller listings — it is not a failed fetch.`;
+  return (
+    <Panel>
+      <SectionHeader title="THE STREET" subtitle="No coverage" />
+      <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>{why}</div>
+    </Panel>
+  );
+}
+
+// ─── The tab ──────────────────────────────────────────────────
+
+// ─── Ownership & short interest ───────────────────────────────
+
+/**
+ * Who holds it and who is against it. All fields come from Yahoo's
+ * defaultKeyStatistics; the whole panel hides when none apply, which is
+ * every non-equity — an index has no float to short.
+ */
+function OwnershipShortPanel({ summary }) {
+  const o = summary?.ownership;
+  const si = summary?.shortInterest;
+  const hasOwnership = o && (o.insidersPct != null || o.institutionsPct != null);
+  const hasShort = si && (si.shortPctOfFloat != null || si.sharesShort != null || si.shortRatio != null);
+  if (!hasOwnership && !hasShort) return null;
+
+  const shortDelta = si?.sharesShort != null && si?.sharesShortPriorMonth > 0
+    ? si.sharesShort / si.sharesShortPriorMonth - 1 : null;
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="OWNERSHIP & SHORT INTEREST"
+        subtitle={si?.dateShortInterest ? `Short data as of ${si.dateShortInterest}` : "Yahoo Finance"}
+      />
+      <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 8 }}>
+        {hasOwnership && (
+          <>
+            <MetricTile label="INSIDERS HOLD" value={o.insidersPct != null ? `${(o.insidersPct * 100).toFixed(2)}%` : null}
+              hint="Fraction of shares held by officers and directors." missing="Not reported for this instrument." />
+            <MetricTile label="INSTITUTIONS HOLD" value={o.institutionsPct != null ? `${(o.institutionsPct * 100).toFixed(1)}%` : null}
+              hint="Fraction of shares held by institutions (funds, banks, pensions)." missing="Not reported for this instrument." />
+          </>
+        )}
+        {hasShort && (
+          <>
+            <MetricTile label="SHORT % OF FLOAT" value={si.shortPctOfFloat != null ? `${(si.shortPctOfFloat * 100).toFixed(2)}%` : null}
+              color={si.shortPctOfFloat > 0.1 ? "#ff8c42" : "#c8d6e8"}
+              hint="Shares sold short as a fraction of the tradable float. Above ~10% is historically elevated."
+              missing="Not reported for this instrument." />
+            <MetricTile label="DAYS TO COVER" value={si.shortRatio != null ? si.shortRatio.toFixed(1) : null}
+              hint="Shares short divided by average daily volume — how many days of normal trading it would take shorts to buy back."
+              missing="Not reported for this instrument." />
+            <MetricTile label="SHARES SHORT" value={si.sharesShort != null ? formatBigNumber(si.sharesShort) : null}
+              sub={shortDelta != null ? `${shortDelta >= 0 ? "+" : ""}${(shortDelta * 100).toFixed(1)}% vs prior month` : null}
+              color={shortDelta > 0.1 ? "#ff8c42" : shortDelta < -0.1 ? "#4ade80" : "#c8d6e8"}
+              missing="Not reported for this instrument." />
+          </>
+        )}
+      </div>
+      <div style={{ padding: "0 16px 13px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.6 }}>
+        Exchange-reported short interest, published twice monthly with a lag — a level, not a live flow.
+      </div>
+    </Panel>
+  );
+}
+
+// ─── Dividends & splits ───────────────────────────────────────
+
+/** Payouts per calendar year, drawn as bars, plus the split record. */
+function DividendHistoryPanel({ symbol, corporate, loading, price }) {
+  const [wrapRef, width] = useElementWidth();
+  if (loading) {
+    return <Panel><SectionHeader title="DIVIDENDS & SPLITS" subtitle="Loading…" /><div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>Fetching corporate actions…</div></Panel>;
+  }
+  if (!corporate) return null;
+  if (corporate.error) {
+    return <Panel><SectionHeader title="DIVIDENDS & SPLITS" subtitle="Unavailable" /><div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>Could not fetch corporate actions: {corporate.error}</div></Panel>;
+  }
+
+  const divs = corporate.dividends ?? [];
+  const splits = corporate.splits ?? [];
+  if (!divs.length && !splits.length) {
+    return (
+      <Panel>
+        <SectionHeader title="DIVIDENDS & SPLITS" subtitle="Yahoo Finance" />
+        <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+          No dividends or splits in Yahoo's record for {symbol}. Normal for non-payers, indices, FX and futures — an absence of record, not a failed fetch.
+        </div>
+      </Panel>
+    );
+  }
+
+  const byYear = new Map();
+  for (const d of divs) {
+    const y = d.date.slice(0, 4);
+    byYear.set(y, (byYear.get(y) ?? 0) + d.amount);
+  }
+  const years = [...byYear.entries()].sort((a, b) => a[0].localeCompare(b[0])).slice(-12);
+  const maxV = Math.max(...years.map(([, v]) => v), 0.0001);
+
+  // Trailing twelve months of actual payments — a realised yield, distinct
+  // from Yahoo's forward "dividend yield" stat in the rail.
+  const yearAgo = new Date(Date.now() - 365 * 86400_000).toISOString().slice(0, 10);
+  const ttm = divs.filter(d => d.date >= yearAgo).reduce((a, d) => a + d.amount, 0);
+
+  const W = Math.max(width || 0, 260), H = 120, padB = 18, padT = 8;
+  const bw = years.length ? Math.min(48, (W - 16) / years.length - 6) : 0;
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="DIVIDENDS & SPLITS"
+        subtitle={`${divs.length} payment${divs.length === 1 ? "" : "s"} on record${corporate.currency ? ` · ${corporate.currency}` : ""}`}
+        extra={ttm > 0 ? (
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#00d4aa", fontFamily: "monospace" }}>
+              {formatPrice(ttm, symbol)} / share TTM
+            </div>
+            {price > 0 && (
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>
+                {(ttm / price * 100).toFixed(2)}% trailing yield at current price
+              </div>
+            )}
+          </div>
+        ) : undefined}
+      />
+      {years.length > 0 && (
+        <div ref={wrapRef} style={{ padding: "6px 8px 0" }}>
+          <svg width={W} height={H} style={{ display: "block" }}>
+            {years.map(([y, v], i) => {
+              const x = 8 + (i + 0.5) * ((W - 16) / years.length) - bw / 2;
+              const h = Math.max((v / maxV) * (H - padB - padT), 2);
+              const isPartial = y === String(new Date().getFullYear());
+              return (
+                <g key={y}>
+                  <rect x={x} y={H - padB - h} width={bw} height={h} rx="2"
+                    fill={isPartial ? "#00d4aa55" : "#00d4aa"} opacity="0.85">
+                    <title>{y}{isPartial ? " (year to date)" : ""}: {v.toFixed(4)} per share</title>
+                  </rect>
+                  <text x={x + bw / 2} y={H - 5} textAnchor="middle" fontSize="8.5" fill="#3a4558" fontFamily="monospace">{y.slice(2)}</text>
+                </g>
+              );
+            })}
+          </svg>
+          <div style={{ fontSize: 9, color: "#3a4558", padding: "2px 8px 8px" }}>
+            Total paid per share, by calendar year. The current year is partial by construction, not a cut.
+          </div>
+        </div>
+      )}
+      {splits.length > 0 && (
+        <div style={{ padding: "4px 16px 13px", borderTop: years.length ? "1px solid #141b28" : "none" }}>
+          <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", letterSpacing: 1, margin: "8px 0 5px" }}>SPLITS</div>
+          {splits.slice(-5).reverse().map((s, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "3px 0" }}>
+              <span style={{ color: "#c8d6e8", fontFamily: "monospace" }}>{s.ratio ?? "—"}</span>
+              <span style={{ color: "#4a6080", fontFamily: "monospace" }}>{s.date}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ─── Chart annotations ────────────────────────────────────────
+
+/**
+ * The user's own dated notes, pinned to the chart above. Kept deliberately
+ * primitive — a date and a sentence — because the structured version of this
+ * already exists (the Bull / Bear thesis); this is the margin scribble.
+ */
+function NotesPanel({ symbol, notes, onAdd, onDelete }) {
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const submit = async () => {
+    if (!text.trim() || busy) return;
+    setBusy(true); setErr(null);
+    const r = await onAdd(date, text.trim());
+    if (r?.error) setErr(r.error); else setText("");
+    setBusy(false);
+  };
+
+  const inputStyle = { background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, color: "#c8d6e8", fontFamily: "monospace", fontSize: 11.5, padding: "7px 10px" };
+
+  return (
+    <Panel>
+      <SectionHeader title="YOUR NOTES" subtitle={`Pinned to the chart above · stored locally, only for ${symbol}`} />
+      <div style={{ padding: "12px 16px 4px", display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <input type="date" value={date} onChange={e => setDate(e.target.value)} style={{ ...inputStyle, colorScheme: "dark" }} />
+        <input
+          value={text} onChange={e => setText(e.target.value)}
+          onKeyDown={e => e.key === "Enter" && submit()}
+          placeholder="Why does this date matter? (Enter to pin)"
+          style={{ ...inputStyle, flex: 1, minWidth: 200 }}
+        />
+        <button onClick={submit} disabled={busy || !text.trim()} style={{
+          background: "#38bdf820", border: "1px solid #38bdf840", color: text.trim() ? "#38bdf8" : "#2a3548",
+          padding: "7px 14px", borderRadius: 4, cursor: text.trim() ? "pointer" : "default", fontFamily: "monospace", fontSize: 11,
+        }}>PIN</button>
+      </div>
+      {err && <div style={{ padding: "4px 16px", fontSize: 11, color: "#ff8c42" }}>{err}</div>}
+      <div style={{ padding: "6px 0 6px" }}>
+        {(notes ?? []).length === 0 ? (
+          <div style={{ padding: "6px 16px 10px", fontSize: 11, color: "#3a4558" }}>
+            Nothing pinned yet. Notes land on the price chart as <span style={{ color: "#38bdf8" }}>N</span> markers — a note on a non-trading day has no bar to sit on and shows only in this list.
+          </div>
+        ) : (notes ?? []).map(nt => (
+          <div key={nt.id} style={{ display: "flex", alignItems: "baseline", gap: 10, padding: "6px 16px", borderBottom: "1px solid #10141d" }}>
+            <span style={{ fontSize: 10, color: "#38bdf8", fontFamily: "monospace", flexShrink: 0 }}>{nt.date}</span>
+            <span style={{ fontSize: 12, color: "#b8c6da", flex: 1, lineHeight: 1.5 }}>{nt.text}</span>
+            <button onClick={() => onDelete(nt.id)} title="Delete this note" style={{
+              background: "transparent", border: "none", color: "#4a6080", cursor: "pointer", fontSize: 12, padding: 2,
+            }}>×</button>
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+// ─── Compare tab ──────────────────────────────────────────────
+
+const COMPARE_COLORS = ["#00d4aa", "#3d8bff", "#ffa502", "#a78bfa"];
+const COMPARE_WINDOWS = [["3M", 63], ["6M", 126], ["1Y", 252], ["3Y", 756], ["5Y", 1260]];
+
+/** Multi-line rebased chart with a shared hover readout. */
+function CompareChart({ data }) {
+  const [wrapRef, width] = useElementWidth();
+  const [hover, setHover] = useState(null);
+  if (!data?.available) return null;
+
+  const { dates, series, symbols } = data;
+  const n = dates.length;
+  const H = 300, padL = 46, padR = 14, padT = 12, padB = 22;
+  const W = Math.max(width || 0, 320);
+  const innerW = Math.max(W - padL - padR, 10), innerH = H - padT - padB;
+
+  const allVals = symbols.flatMap(s => series[s]);
+  let lo = Math.min(...allVals), hi = Math.max(...allVals);
+  if (!(hi > lo)) { hi = lo + 1; lo -= 1; }
+  const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+
+  const x = i => padL + (n === 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+  const y = v => padT + (1 - (v - lo) / (hi - lo)) * innerH;
+  const path = arr => arr.map((v, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+
+  const onMove = e => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const i = Math.round(((e.clientX - rect.left - padL) / innerW) * (n - 1));
+    setHover(i >= 0 && i < n ? i : null);
+  };
+
+  const yTicks = Array.from({ length: 5 }, (_, i) => lo + (i / 4) * (hi - lo));
+  const xTickIdx = Array.from({ length: Math.min(6, n) }, (_, i) => Math.round((i / (Math.min(6, n) - 1 || 1)) * (n - 1)));
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <svg width={W} height={H} onMouseMove={onMove} onMouseLeave={() => setHover(null)} style={{ display: "block", cursor: "crosshair" }}>
+        {yTicks.map((t, i) => (
+          <g key={i}>
+            <line x1={padL} x2={W - padR} y1={y(t)} y2={y(t)} stroke="#141b28" strokeWidth="1" />
+            <text x={padL - 7} y={y(t) + 3.5} textAnchor="end" fontSize="9" fill="#3a4558" fontFamily="monospace">{t.toFixed(0)}</text>
+          </g>
+        ))}
+        <line x1={padL} x2={W - padR} y1={y(100)} y2={y(100)} stroke="#2a3548" strokeWidth="1" strokeDasharray="4 4" />
+        {symbols.map((s, k) => (
+          <path key={s} d={path(series[s])} fill="none" stroke={COMPARE_COLORS[k % 4]} strokeWidth="1.6" strokeLinejoin="round" />
+        ))}
+        {hover != null && (
+          <line x1={x(hover)} x2={x(hover)} y1={padT} y2={padT + innerH} stroke="#4a6080" strokeWidth="1" strokeDasharray="3 3" />
+        )}
+        {xTickIdx.map(i => (
+          <text key={i} x={x(i)} y={H - 6} textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"} fontSize="9" fill="#3a4558" fontFamily="monospace">
+            {dates[i].slice(2)}
+          </text>
+        ))}
+      </svg>
+      {hover != null && (
+        <div style={{
+          position: "absolute", top: 8, left: Math.min(Math.max(x(hover) - 70, 4), Math.max(W - 190, 4)),
+          background: "#070a10", border: "1px solid #1a2535", borderRadius: 4, padding: "7px 10px", pointerEvents: "none",
+        }}>
+          <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>{dates[hover]}</div>
+          {symbols.map((s, k) => (
+            <div key={s} style={{ fontSize: 10.5, fontFamily: "monospace", color: COMPARE_COLORS[k % 4], marginTop: 2 }}>
+              {s} {series[s][hover].toFixed(1)} <span style={{ color: "#4a6080" }}>({(series[s][hover] - 100) >= 0 ? "+" : ""}{(series[s][hover] - 100).toFixed(1)}%)</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResearchCompareTab({ symbol, peersData, peersLoading, onNavigate }) {
+  const [others, setOthers] = useState([]);
+  const [windowId, setWindowId] = useState("1Y");
+  const [addQuery, setAddQuery] = useState("");
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const cache = useRef({});
+
+  const symbols = [symbol, ...others.filter(s => s !== symbol)].slice(0, 4);
+  const days = COMPARE_WINDOWS.find(([id]) => id === windowId)?.[1] ?? 252;
+
+  useEffect(() => {
+    if (symbols.length < 2) { setData(null); return; }
+    const key = symbols.join(",") + "|" + days;
+    if (cache.current[key]) { setData(cache.current[key]); return; }
+    let cancelled = false;
+    setLoading(true);
+    fetch(`${API}/research/compare?symbols=${encodeURIComponent(symbols.join(","))}&days=${days}`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) { cache.current[key] = d; setData(d); } })
+      .catch(() => { if (!cancelled) setData({ available: false, reason: "Could not reach the Meridian API." }); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [symbols.join(","), days]);
+
+  const addSymbol = s => {
+    const up = s.toUpperCase().trim();
+    if (!up || up === symbol || others.includes(up) || symbols.length >= 4) return;
+    setOthers(o => [...o, up]);
+    setAddQuery("");
+  };
+
+  const chip = (s, removable) => (
+    <span key={s} style={{
+      display: "inline-flex", alignItems: "center", gap: 6,
+      background: "#0d1117", border: `1px solid ${COMPARE_COLORS[symbols.indexOf(s) % 4]}50`,
+      borderRadius: 4, padding: "4px 9px", fontFamily: "monospace", fontSize: 11,
+      color: COMPARE_COLORS[symbols.indexOf(s) % 4],
+    }}>
+      {s}
+      {removable && (
+        <button onClick={() => setOthers(o => o.filter(x => x !== s))} style={{ background: "none", border: "none", color: "#4a6080", cursor: "pointer", fontSize: 11, padding: 0 }}>×</button>
+      )}
+    </span>
+  );
+
+  const inputStyle = { background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, color: "#c8d6e8", fontFamily: "monospace", fontSize: 11.5, padding: "6px 10px" };
+  const peers = peersData?.peers ?? [];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader
+          title="COMPARE"
+          subtitle="Rebased to 100 at the first shared date · stored daily closes, joined on dates both actually traded"
+          extra={
+            <div style={{ display: "flex", gap: 2 }}>
+              {COMPARE_WINDOWS.map(([id]) => (
+                <button key={id} onClick={() => setWindowId(id)} style={{
+                  background: "transparent", border: "none",
+                  borderBottom: windowId === id ? "2px solid #00d4aa" : "2px solid transparent",
+                  color: windowId === id ? "#00d4aa" : "#4a6080",
+                  padding: "3px 7px", cursor: "pointer", fontFamily: "monospace", fontSize: 10,
+                }}>{id}</button>
+              ))}
+            </div>
+          }
+        />
+        <div style={{ padding: "12px 16px 4px", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {symbols.map((s, i) => chip(s, i > 0))}
+          {symbols.length < 4 && (
+            <input
+              value={addQuery} onChange={e => setAddQuery(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && addSymbol(addQuery)}
+              placeholder="Add ticker (Enter)"
+              style={{ ...inputStyle, width: 150 }}
+            />
+          )}
+        </div>
+
+        {symbols.length < 2 ? (
+          <div style={{ padding: "12px 16px 16px", fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+            Add one to three more tickers to compare against {symbol}. Only symbols with stored history can be drawn — anything never synced here has no bars to compare.
+          </div>
+        ) : loading && !data ? (
+          <div style={{ padding: 24, textAlign: "center", fontSize: 12, color: "#4a6080" }}>Joining series…</div>
+        ) : data && !data.available ? (
+          <div style={{ padding: "12px 16px 16px", fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+            {data.reason}
+            {(data.missing ?? []).map(m => <div key={m.symbol} style={{ marginTop: 4, color: "#ff8c42" }}>{m.symbol}: {m.reason} Add it as a holding or watchlist entry and sync to store bars.</div>)}
+          </div>
+        ) : data ? (
+          <>
+            <CompareChart data={data} />
+            {(data.missing ?? []).length > 0 && (
+              <div style={{ padding: "0 16px 8px", fontSize: 10.5, color: "#ff8c42" }}>
+                Not drawn: {data.missing.map(m => `${m.symbol} (${m.reason.toLowerCase().replace(/\.$/, "")})`).join(", ")}.
+              </div>
+            )}
+            <div style={{ padding: "4px 16px 8px", fontSize: 9.5, color: "#3a4558" }}>
+              {data.overlapDays} shared trading days, {data.from} to {data.to}.
+            </div>
+          </>
+        ) : null}
+      </Panel>
+
+      {data?.available && (
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,3fr) minmax(0,2fr)", gap: 14, alignItems: "start" }} className="research-grid">
+          <Panel>
+            <SectionHeader title="OVER THIS WINDOW" subtitle="Computed on the shared dates above" />
+            <div style={{ padding: "6px 8px 10px", overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+                <thead>
+                  <tr style={{ color: "#4a6080", fontFamily: "monospace", fontSize: 9 }}>
+                    {["", "RETURN", "ANN VOL", "MAX DD", "SHARPE"].map(h => (
+                      <th key={h} style={{ textAlign: h ? "right" : "left", padding: "6px 8px", fontWeight: 400, letterSpacing: 0.5 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.symbols.map((s, k) => {
+                    const st = data.stats[s];
+                    return (
+                      <tr key={s} style={{ borderTop: "1px solid #141b28" }}>
+                        <td style={{ padding: "7px 8px", fontFamily: "monospace", color: COMPARE_COLORS[k % 4] }}>{s}</td>
+                        <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: st.totalReturn >= 0 ? "#00d4aa" : "#ff4757" }}>{pctStr(st.totalReturn)}</td>
+                        <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{absPctStr(st.annVol, 0)}</td>
+                        <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#ff4757" }}>{absPctStr(st.maxDrawdown)}</td>
+                        <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{st.sharpe.toFixed(2)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+
+          <Panel>
+            <SectionHeader title="RETURN CORRELATION" subtitle="Daily returns over the shared window" />
+            <div style={{ padding: "10px 16px 14px" }}>
+              {Object.entries(data.correlations).map(([pair, v]) => {
+                const [a, b] = pair.split("|");
+                return (
+                  <div key={pair} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0" }}>
+                    <span style={{ fontFamily: "monospace", fontSize: 10.5, color: "#7a8ba0", width: 130, flexShrink: 0 }}>{a} · {b}</span>
+                    <div style={{ flex: 1, height: 5, background: "#141b28", borderRadius: 3, position: "relative" }}>
+                      <div style={{
+                        position: "absolute", top: 0, bottom: 0, borderRadius: 3,
+                        left: v >= 0 ? "50%" : `${50 + v * 50}%`, width: `${Math.abs(v) * 50}%`,
+                        background: v >= 0.5 ? "#ff8c42" : v >= 0 ? "#3d8bff" : "#00d4aa",
+                      }} />
+                      <div style={{ position: "absolute", left: "50%", top: -2, width: 1, height: 9, background: "#2a3548" }} />
+                    </div>
+                    <span style={{ fontFamily: "monospace", fontSize: 11, color: "#c8d6e8", width: 44, textAlign: "right" }}>{v.toFixed(2)}</span>
+                  </div>
+                );
+              })}
+              <div style={{ fontSize: 9.5, color: "#3a4558", marginTop: 8, lineHeight: 1.6 }}>
+                High positive correlation means holding both diversifies less than it looks. Computed here from stored bars, not quoted from anywhere.
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      <Panel>
+        <SectionHeader
+          title="SIMILAR INSTRUMENTS"
+          subtitle={peersData?.error ? "Unavailable" : "Yahoo's similarity list, priced live — how Yahoo picks these is not published"}
+        />
+        {peersLoading ? (
+          <div style={{ padding: 20, textAlign: "center", fontSize: 12, color: "#4a6080" }}>Fetching peers…</div>
+        ) : peersData?.error ? (
+          <div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>Could not fetch peers: {peersData.error}</div>
+        ) : !peers.length ? (
+          <div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>Yahoo lists no similar instruments for {symbol} — common for indices, FX and funds.</div>
+        ) : (
+          <div style={{ padding: "4px 8px 10px", overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+              <thead>
+                <tr style={{ color: "#4a6080", fontFamily: "monospace", fontSize: 9 }}>
+                  {["NAME", "PRICE", "1D", "P/E", "FWD P/E", "MKT CAP", "52W POS", ""].map((h, i) => (
+                    <th key={i} style={{ textAlign: i === 0 ? "left" : "right", padding: "6px 8px", fontWeight: 400, letterSpacing: 0.5 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {peers.map(p => (
+                  <tr key={p.symbol} style={{ borderTop: "1px solid #141b28" }}>
+                    <td style={{ padding: "7px 8px" }}>
+                      <button onClick={() => onNavigate(p.symbol, p.name)} title={`Research ${p.symbol}`} style={{
+                        background: "none", border: "none", cursor: "pointer", textAlign: "left", padding: 0,
+                      }}>
+                        <span style={{ fontSize: 11.5, color: "#c8d6e8" }}>{p.name}</span>
+                        <span style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace", marginLeft: 6 }}>{p.symbol}</span>
+                      </button>
+                    </td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{p.price != null ? formatPrice(p.price, p.symbol) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: (p.changePct ?? 0) >= 0 ? "#00d4aa" : "#ff4757" }}>{p.changePct != null ? formatChange(p.changePct) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{p.pe != null ? p.pe.toFixed(1) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{p.forwardPe != null ? p.forwardPe.toFixed(1) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#c8d6e8" }}>{p.marketCap != null ? formatBigNumber(p.marketCap) : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: "#7a8ba0" }}>{p.rangePosition != null ? `${(p.rangePosition * 100).toFixed(0)}%` : "—"}</td>
+                    <td style={{ padding: "7px 8px", textAlign: "right" }}>
+                      <button
+                        onClick={() => addSymbol(p.symbol)}
+                        disabled={symbols.includes(p.symbol) || symbols.length >= 4}
+                        title={symbols.includes(p.symbol) ? "Already on the chart" : symbols.length >= 4 ? "Chart is full (4 max)" : "Add to the comparison chart — needs stored history to draw"}
+                        style={{
+                          background: "transparent", border: "1px solid #1a2535", borderRadius: 3,
+                          color: symbols.includes(p.symbol) || symbols.length >= 4 ? "#2a3548" : "#3d8bff",
+                          padding: "2px 8px", cursor: symbols.includes(p.symbol) || symbols.length >= 4 ? "default" : "pointer",
+                          fontFamily: "monospace", fontSize: 9.5,
+                        }}>+ CHART</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// ─── Precedents tab ───────────────────────────────────────────
+
+const CLOSENESS_STYLE = {
+  close:    { color: "#00d4aa", label: "CLOSE" },
+  moderate: { color: "#ffa502", label: "MODERATE" },
+  loose:    { color: "#4a6080", label: "LOOSE" },
+};
+
+/** Spaghetti of the 21-bar paths that followed each matched setup. */
+function PrecedentPathsChart({ matches }) {
+  const [wrapRef, width] = useElementWidth();
+  const paths = matches.filter(m => m.path?.length > 1);
+  if (!paths.length) return null;
+
+  const H = 240, padL = 46, padR = 14, padT = 12, padB = 22;
+  const W = Math.max(width || 0, 320);
+  const innerW = Math.max(W - padL - padR, 10), innerH = H - padT - padB;
+
+  const allV = paths.flatMap(m => m.path);
+  let lo = Math.min(...allV, 0), hi = Math.max(...allV, 0);
+  const pad = (hi - lo) * 0.08 || 0.01; lo -= pad; hi += pad;
+  const x = k => padL + (k / 21) * innerW;
+  const y = v => padT + (1 - (v - lo) / (hi - lo)) * innerH;
+
+  // Median path across matches, bar by bar, over however many paths reach
+  // that bar — a truncated path simply stops contributing.
+  const median = [];
+  for (let k = 0; k <= 21; k++) {
+    const vals = paths.map(m => m.path[k]).filter(v => v != null).sort((a, b) => a - b);
+    if (!vals.length) break;
+    const mid = vals.length >> 1;
+    median.push(vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2);
+  }
+
+  const line = arr => arr.map((v, k) => `${k ? "L" : "M"}${x(k).toFixed(1)},${y(v).toFixed(1)}`).join("");
+
+  return (
+    <div ref={wrapRef}>
+      <svg width={W} height={H} style={{ display: "block" }}>
+        {[lo, (lo + hi) / 2, hi].map((t, i) => (
+          <text key={i} x={padL - 7} y={y(t) + 3.5} textAnchor="end" fontSize="9" fill="#3a4558" fontFamily="monospace">
+            {(t * 100).toFixed(0)}%
+          </text>
+        ))}
+        <line x1={padL} x2={W - padR} y1={y(0)} y2={y(0)} stroke="#2a3548" strokeWidth="1" />
+        {paths.map((m, i) => (
+          <path key={i} d={line(m.path)} fill="none"
+            stroke={CLOSENESS_STYLE[m.closeness].color}
+            strokeWidth="1" opacity={m.closeness === "close" ? 0.55 : m.closeness === "moderate" ? 0.35 : 0.2}>
+            <title>{m.date}: {m.fwd21 != null ? `${(m.fwd21 * 100).toFixed(1)}% after 21 bars` : "truncated"}</title>
+          </path>
+        ))}
+        <path d={line(median)} fill="none" stroke="#e8f0fc" strokeWidth="2" strokeLinejoin="round" />
+        {[0, 5, 10, 15, 21].map(k => (
+          <text key={k} x={x(k)} y={H - 6} textAnchor="middle" fontSize="9" fill="#3a4558" fontFamily="monospace">
+            {k === 0 ? "match" : `+${k}`}
+          </text>
+        ))}
+      </svg>
+      <div style={{ display: "flex", gap: 14, padding: "6px 8px 0", flexWrap: "wrap", alignItems: "center" }}>
+        <LegendDot color="#e8f0fc" label="Median path" />
+        <LegendDot color="#00d4aa" label="Close match" hollow />
+        <LegendDot color="#ffa502" label="Moderate" hollow />
+        <LegendDot color="#4a6080" label="Loose" hollow />
+        <span style={{ fontSize: 9.5, color: "#3a4558", marginLeft: "auto" }}>Trading days after each matched date</span>
+      </div>
+    </div>
+  );
+}
+
+function ResearchPrecedentsTab({ symbol, data, loading }) {
+  if (loading && !data) {
+    return <Panel><div style={{ padding: 28, textAlign: "center", color: "#4a6080", fontSize: 12 }}>Matching against {symbol}'s own history…</div></Panel>;
+  }
+  if (!data) {
+    return <Panel><div style={{ padding: 20, fontSize: 12, color: "#4a6080" }}>Could not reach the Meridian API.</div></Panel>;
+  }
+  if (!data.available) {
+    return (
+      <Panel>
+        <SectionHeader title="PRECEDENTS" subtitle="Not computable" />
+        <div style={{ padding: 20, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>{data.reason}</div>
+      </Panel>
+    );
+  }
+
+  const s = data.setup;
+  const setupTiles = [
+    ["RSI (14)", s.rsi14.toFixed(0), null],
+    ["VS 50DMA", pctStr(s.dist50dma), dirColor(s.dist50dma)],
+    ["VS 200DMA", pctStr(s.dist200dma), dirColor(s.dist200dma)],
+    ["VOL VS ITS YEAR", `${s.volRatio.toFixed(2)}x`, s.volRatio > 1.35 ? "#ff8c42" : s.volRatio < 0.7 ? "#4a90d9" : "#c8d6e8"],
+    ["1M RETURN", pctStr(s.ret21d), dirColor(s.ret21d)],
+    ["RANGE POSITION", `${(s.rangePosition * 100).toFixed(0)}%`, null],
+  ];
+  const agg = data.aggregate;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader
+          title="TODAY'S SETUP"
+          subtitle={`The six measurements being matched · bars to ${data.asOf}`}
+        />
+        <div style={{ padding: 14, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8 }}>
+          {setupTiles.map(([label, value, color]) => (
+            <MetricTile key={label} label={label} value={value} color={color ?? "#c8d6e8"} />
+          ))}
+        </div>
+        {!data.hasClosePrecedent && (
+          <div style={{ margin: "0 14px 14px", padding: "10px 14px", background: "#ffa50210", border: "1px solid #ffa50230", borderRadius: 5, fontSize: 11.5, color: "#ffa502", lineHeight: 1.6 }}>
+            No close precedent: nothing in {symbol}'s own {data.bars.toLocaleString()}-bar history landed in the nearest decile of setups.
+            The matches below are the least-distant days, shown with their looseness stated — treat the sample accordingly.
+          </div>
+        )}
+      </Panel>
+
+      <Panel>
+        <SectionHeader
+          title="WHAT FOLLOWED SIMILAR SETUPS"
+          subtitle={`${data.matches.length} nearest days in ${symbol}'s own history, at least a month apart`}
+          extra={agg && (
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 12, fontFamily: "monospace", color: dirColor(agg.medianFwd21) }}>
+                median {pctStr(agg.medianFwd21)} after 21 bars
+              </div>
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", marginTop: 2 }}>
+                {agg.positiveFwd21} of {agg.n} were positive{agg.medianFwd63 != null ? ` · median ${pctStr(agg.medianFwd63)} after 63` : ""}
+              </div>
+            </div>
+          )}
+        />
+        <div style={{ padding: "8px 8px 0" }}>
+          <PrecedentPathsChart matches={data.matches} />
+        </div>
+        <div style={{ padding: "10px 8px 10px", overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+            <thead>
+              <tr style={{ color: "#4a6080", fontFamily: "monospace", fontSize: 9 }}>
+                {["MATCHED DATE", "SIMILARITY", "+5 BARS", "+21 BARS", "+63 BARS"].map((h, i) => (
+                  <th key={h} style={{ textAlign: i === 0 ? "left" : "right", padding: "6px 8px", fontWeight: 400, letterSpacing: 0.5 }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {data.matches.map(m => (
+                <tr key={m.date} style={{ borderTop: "1px solid #141b28" }}>
+                  <td style={{ padding: "7px 8px", fontFamily: "monospace", color: "#c8d6e8" }}>{m.date}</td>
+                  <td style={{ padding: "7px 8px", textAlign: "right" }}>
+                    <span title={`Distance ${m.distance} — nearer than ${((1 - m.distancePercentile) * 100).toFixed(0)}% of all comparable days`}
+                      style={{ fontFamily: "monospace", fontSize: 9.5, color: CLOSENESS_STYLE[m.closeness].color, cursor: "help" }}>
+                      {CLOSENESS_STYLE[m.closeness].label}
+                    </span>
+                  </td>
+                  {[m.fwd5, m.fwd21, m.fwd63].map((v, i) => (
+                    <td key={i} style={{ padding: "7px 8px", textAlign: "right", fontFamily: "monospace", color: v == null ? "#2a3548" : dirColor(v) }}
+                      title={v == null ? "Not enough bars after this date to measure" : undefined}>
+                      {v == null ? "—" : pctStr(v)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div style={{ padding: "0 16px 14px", fontSize: 9.5, color: "#3a4558", lineHeight: 1.7 }}>
+          {data.method}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function ResearchOverviewTab({ symbol, name, overview, loading, price, corporate, corporateLoading, notes, onAddNote, onDeleteNote }) {
+  // The user's pinned notes ride onto the chart as first-class event markers,
+  // beside the machine-derived ones. Computed unconditionally — hooks cannot
+  // sit behind the early returns below.
+  const events = useMemo(() => {
+    const noteEvents = (notes ?? []).map(nt => ({
+      date: nt.date, type: "note", label: nt.text, direction: "neutral", source: "Your note",
+    }));
+    return [...(overview?.events ?? []), ...noteEvents];
+  }, [overview, notes]);
+
+  if (loading && !overview) {
+    return <Panel><div style={{ padding: 28, textAlign: "center", color: "#4a6080", fontSize: 12 }}>Loading {name}…</div></Panel>;
+  }
+  if (!overview) {
+    return <Panel><div style={{ padding: 20, fontSize: 12, color: "#4a6080" }}>Could not reach the Meridian API for {symbol}.</div></Panel>;
+  }
+
+  const q = overview.quote && !overview.quote.error ? overview.quote : null;
+  const hasStreet = !!(q?.analyst || q?.ratingTrend || q?.upgrades?.length);
+
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 340px)", gap: 14, alignItems: "start" }}
+         className="research-grid">
+      <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+        <PriceChart
+          series={overview.series} events={events}
+          technicals={overview.technicals} symbol={symbol} name={name}
+        />
+        <NotesPanel symbol={symbol} notes={notes} onAdd={onAddNote} onDelete={onDeleteNote} />
+        <NarrativePanel narrative={overview.narrative} />
+        <ResearchPerformancePanel tech={overview.technicals} symbol={symbol} />
+        <SentimentTrend sentiment={overview.sentiment} />
+        <DividendHistoryPanel symbol={symbol} corporate={corporate} loading={corporateLoading} price={price} />
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
+        {hasStreet ? (
+          <>
+            <ConsensusPanel summary={q} price={price} symbol={symbol} />
+            <RatingPanel summary={q} />
+            <ScenarioPanelCompact summary={q} price={price} symbol={symbol} />
+            <RatingChangesPanel summary={q} symbol={symbol} />
+          </>
+        ) : (
+          <NoCoveragePanel summary={q} symbol={symbol} />
+        )}
+        <OwnershipShortPanel summary={q} />
+        <NextDatesPanel summary={q} />
+        <KeyStatsPanel summary={q} symbol={symbol} />
+        <EarningsRecordPanel summary={q} />
+        {q?.error && (
+          <Panel><div style={{ padding: 14, fontSize: 11, color: "#ff8c42" }}>Fundamentals fetch failed: {q.error}</div></Panel>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResearchNewsTab({ symbol, name, newsData, newsLoading }) {
+  if (newsLoading) return <Panel><div style={{ padding: 24, textAlign: "center", color: "#4a6080", fontSize: 12 }}>Searching feed and live sources for {name}…</div></Panel>;
+  const stories = newsData?.news ?? [];
+  if (!stories.length) {
+    return <Panel><div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>No news found for {name}. Try a broader company name in the search box above.</div></Panel>;
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace" }}>
+        {newsData.feedCount} from your tracked feed · {newsData.liveCount} from live search
+      </div>
+      {stories.map(story => {
+        const sentiment = newsSentimentMeta(story.sentiment);
+        return (
+          <Panel key={story.guid} style={{ borderLeft: `3px solid ${sentiment.color}` }}>
+            <div style={{ padding: "12px 16px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 5, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 10, fontWeight: 700, fontFamily: "monospace", background: story.live ? "#3d8bff18" : "#00d4aa18", color: story.live ? "#3d8bff" : "#00d4aa", padding: "2px 7px", borderRadius: 3 }}>
+                  {story.live ? "LIVE SEARCH" : "TRACKED FEED"}
+                </span>
+                <span style={{ fontSize: 10, fontWeight: 700, background: `${sentiment.color}18`, color: sentiment.color, padding: "2px 7px", borderRadius: 3, fontFamily: "monospace" }}>{sentiment.label}</span>
+                <span style={{ fontSize: 11, color: "#3a4558" }}>{story.source}</span>
+                <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace" }}>{newsRelativeTime(story.published)}</span>
+              </div>
+              <div style={{ fontSize: 14, color: "#c8d6e8", lineHeight: 1.4 }}>{story.title}</div>
+              {story.summary && <div style={{ fontSize: 12, color: "#7a8ba0", marginTop: 5, lineHeight: 1.5 }}>{story.summary}</div>}
+              {story.url && (
+                <a href={story.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: "#3d8bff", textDecoration: "none", marginTop: 6, display: "inline-block" }}>
+                  Read full story ↗
+                </a>
+              )}
+            </div>
+          </Panel>
+        );
+      })}
+    </div>
+  );
+}
+
+const FORM_COLORS = {
+  "10-K": "#00d4aa", "10-Q": "#4ade80", "8-K": "#ffa502",
+  "4": "#3d8bff", "DEF 14A": "#a855f7", "S-1": "#ff7043",
+};
+
+/** Compact money — EDGAR reports in full units, which are unreadable raw. */
+function edgarMoney(v) {
+  if (v == null) return null;
+  const abs = Math.abs(v);
+  const sign = v < 0 ? "-" : "";
+  if (abs >= 1e12) return `${sign}${(abs / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${sign}${(abs / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${sign}${(abs / 1e6).toFixed(1)}M`;
+  if (abs >= 1e3) return `${sign}${(abs / 1e3).toFixed(1)}K`;
+  return `${sign}${abs.toFixed(2)}`;
+}
+
+/** A concept's reported annual history, as a sparkline-style bar row. */
+function FactRow({ concept, unit }) {
+  const vals = concept.series.map(s => s.value);
+  const max = Math.max(...vals.map(Math.abs), 1);
+  const isPerShare = unit === "USD/shares";
+  return (
+    <div style={{ padding: "8px 16px", borderBottom: "1px solid #12161f" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 5 }}>
+        <span style={{ fontSize: 11, color: "#7a8ba0" }}>{concept.label}</span>
+        <span style={{ fontSize: 11, fontFamily: "monospace", color: "#c8d6e8" }}>
+          {isPerShare ? `$${vals[vals.length - 1]?.toFixed(2)}` : edgarMoney(vals[vals.length - 1])}
+        </span>
+      </div>
+      {/* Zero baseline kept deliberately. Truncating the axis would make a
+          steady 8% grower look like a rocket, which is the standard way this
+          kind of chart misleads. Height instead of truncation gives the shape
+          room to read honestly. */}
+      <div style={{ display: "flex", gap: 3, alignItems: "flex-end", height: 46 }}>
+        {concept.series.map(s => (
+          <div key={s.fy} title={`FY${s.fy}: ${isPerShare ? `$${s.value.toFixed(2)}` : edgarMoney(s.value)}`}
+               style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", height: "100%" }}>
+            <div style={{
+              height: `${Math.max(3, (Math.abs(s.value) / max) * 100)}%`,
+              background: s.value < 0 ? "#ff4757" : "#3d8bff55",
+              borderTop: `1px solid ${s.value < 0 ? "#ff4757" : "#3d8bff"}`,
+              borderRadius: 1,
+            }} />
+          </div>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 3, marginTop: 2 }}>
+        {concept.series.map(s => (
+          <span key={s.fy} style={{ flex: 1, fontSize: 8, color: "#2a3548", textAlign: "center", fontFamily: "monospace" }}>
+            {String(s.fy).slice(2)}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ResearchFilingsTab({ symbol, filingsData, insidersData, fundamentals, filingsLoading }) {
+  const [formFilter, setFormFilter] = useState("all");
+
+  if (filingsLoading) {
+    return <Panel><div style={{ padding: 24, textAlign: "center", color: "#4a6080", fontSize: 12 }}>Loading SEC data…</div></Panel>;
+  }
+  if (filingsData?.error) {
+    return (
+      <Panel>
+        <div style={{ padding: 16, fontSize: 12, color: "#4a6080", lineHeight: 1.7 }}>
+          {filingsData.error}
+          <div style={{ color: "#2a3548", marginTop: 6 }}>
+            SEC EDGAR covers US registrants only, so this is expected for LSE-listed and other non-US symbols.
+          </div>
+        </div>
+      </Panel>
+    );
+  }
+
+  const filings = filingsData?.filings ?? [];
+  const insiders = insidersData?.filings ?? [];
+  const summary = insidersData?.summary;
+  const facts = fundamentals && !fundamentals.error ? fundamentals : null;
+  const trends = facts?.trends;
+
+  const forms = [...new Set(filings.map(f => f.form))].slice(0, 8);
+  const shown = formFilter === "all" ? filings : filings.filter(f => f.form === formFilter);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      {/* Reported fundamentals — the part of EDGAR that needed history. */}
+      {facts && (
+        <>
+          {trends?.available && (
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {[
+                ["REVENUE CAGR", trends.revenueCagr],
+                ["NET INCOME CAGR", trends.netIncomeCagr],
+                ["EPS CAGR", trends.epsCagr],
+              ].map(([label, v]) => (
+                <div key={label} style={{ flex: 1, minWidth: 150, background: "#0d1117", border: "1px solid #1a1f2e", borderRadius: 6, padding: "12px 16px" }}>
+                  <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", letterSpacing: 1 }}>{label}</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "monospace", marginTop: 3, color: v == null ? "#3a4558" : v >= 0 ? "#00d4aa" : "#ff4757" }}>
+                    {v == null ? <NoData reason="Not enough reported years" /> : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`}
+                  </div>
+                  <div style={{ fontSize: 9, color: "#2a3548", marginTop: 2 }}>
+                    {trends.years ? `over ${trends.years} reported year${trends.years === 1 ? "" : "s"}` : "annualised"}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Dilution: invisible on a price chart, and the single most useful
+              thing in this dataset for someone holding for years. */}
+          {trends?.shareChange && (
+            <Panel>
+              <SectionHeader title="SHARE COUNT" subtitle="Diluted weighted average, as reported" />
+              <div style={{ padding: 14, fontSize: 12, color: trends.shareChange.changePct > 0 ? "#ffa502" : "#00d4aa", lineHeight: 1.6 }}>
+                {trends.shareChange.note}
+              </div>
+            </Panel>
+          )}
+
+          <Panel>
+            <SectionHeader
+              title="REPORTED FUNDAMENTALS"
+              subtitle={`${facts.company ?? symbol} · from filed XBRL, not a vendor summary`}
+            />
+            {Object.entries(facts.concepts).map(([id, c]) => (
+              <FactRow key={id} concept={c} unit={c.unit} />
+            ))}
+            {facts.missing?.length > 0 && (
+              <div style={{ padding: "10px 16px", fontSize: 10, color: "#2a3548", fontFamily: "monospace" }}>
+                Not reported under a recognised tag: {facts.missing.join(", ")}
+              </div>
+            )}
+            <div style={{ padding: "0 16px 12px", fontSize: 10, color: "#2a3548" }}>{facts.source}</div>
+          </Panel>
+        </>
+      )}
+
+      {/* Insider activity, with the open-market signal separated from the noise. */}
+      <Panel>
+        <SectionHeader
+          title="INSIDER ACTIVITY"
+          subtitle={summary?.available
+            ? `${summary.distinctInsiders} insider${summary.distinctInsiders === 1 ? "" : "s"} · last ${summary.days} days`
+            : "Form 4 transactions"}
+        />
+        {summary?.available ? (
+          <div style={{ padding: "12px 16px", display: "flex", gap: 20, flexWrap: "wrap", borderBottom: "1px solid #12161f" }}>
+            <div>
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>BOUGHT</div>
+              <div style={{ fontFamily: "monospace", fontSize: 15, color: "#00d4aa", fontWeight: 700 }}>
+                {edgarMoney(summary.buyValue)} <span style={{ fontSize: 10, color: "#4a6080" }}>({summary.buys})</span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>SOLD</div>
+              <div style={{ fontFamily: "monospace", fontSize: 15, color: "#ff4757", fontWeight: 700 }}>
+                {edgarMoney(summary.sellValue)} <span style={{ fontSize: 10, color: "#4a6080" }}>({summary.sells})</span>
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace" }}>NET</div>
+              <div style={{ fontFamily: "monospace", fontSize: 15, fontWeight: 700, color: summary.net >= 0 ? "#00d4aa" : "#ff4757" }}>
+                {summary.net >= 0 ? "+" : ""}{edgarMoney(summary.net)}
+              </div>
+            </div>
+            <div style={{ flex: 1, minWidth: 200, fontSize: 10, color: "#2a3548", alignSelf: "center" }}>
+              Open-market purchases and sales only. Awards, option exercises and tax withholding are excluded —
+              they are compensation mechanics, not a view on the price.
+            </div>
+          </div>
+        ) : summary?.reason ? (
+          <div style={{ padding: "12px 16px", fontSize: 11, color: "#4a6080" }}>{summary.reason}</div>
+        ) : null}
+
+        {insiders.length === 0 ? (
+          <div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>No Form 4 transactions on record.</div>
+        ) : (
+          <div style={{ padding: "4px 0" }}>
+            {insiders.slice(0, 20).map(f => {
+              const isBuy = f.tx_type === "Buy";
+              const isSell = f.tx_type === "Sell";
+              return (
+                <div key={f.id} style={{
+                  display: "grid", gridTemplateColumns: "1.4fr 90px 100px 90px 100px 50px",
+                  gap: 10, alignItems: "center", padding: "7px 16px", borderBottom: "1px solid #12161f",
+                }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: 11, color: "#c8d6e8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {f.filer || symbol}
+                    </div>
+                    {f.role && <div style={{ fontSize: 9, color: "#3a4558" }}>{f.role}</div>}
+                  </div>
+                  <span style={{ fontSize: 10, fontFamily: "monospace",
+                                 color: isBuy ? "#00d4aa" : isSell ? "#ff4757" : "#4a6080" }}>
+                    {f.tx_type}
+                  </span>
+                  <span style={{ fontSize: 11, fontFamily: "monospace", color: "#7a8ba0", textAlign: "right" }}>
+                    {f.shares != null ? f.shares.toLocaleString() : <NoData compact />}
+                  </span>
+                  <span style={{ fontSize: 11, fontFamily: "monospace", color: "#7a8ba0", textAlign: "right" }}>
+                    {f.price ? `$${f.price.toFixed(2)}` : <NoData compact reason="No price on this transaction type" />}
+                  </span>
+                  <span style={{ fontSize: 11, fontFamily: "monospace", color: "#c8d6e8", textAlign: "right" }}>
+                    {f.value ? edgarMoney(f.value) : <NoData compact />}
+                  </span>
+                  <a href={f.url} target="_blank" rel="noopener noreferrer"
+                     style={{ fontSize: 10, color: "#3d8bff", textDecoration: "none", textAlign: "right" }}>
+                    {f.date?.slice(5) ?? "↗"}
+                  </a>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Panel>
+
+      {/* Every recent form, not only Form 4 — 8-K and 10-K are where the news is. */}
+      <Panel>
+        <SectionHeader
+          title="SEC FILINGS"
+          subtitle={filingsData?.company ? `${filingsData.company} · CIK ${filingsData.cik}` : undefined}
+        />
+        {forms.length > 1 && (
+          <div style={{ padding: "8px 16px", display: "flex", gap: 5, flexWrap: "wrap", borderBottom: "1px solid #12161f" }}>
+            {["all", ...forms].map(f => (
+              <button key={f} onClick={() => setFormFilter(f)} style={{
+                background: formFilter === f ? "#0d1421" : "transparent",
+                border: `1px solid ${formFilter === f ? (FORM_COLORS[f] ?? "#3d8bff") + "50" : "#1a2535"}`,
+                color: formFilter === f ? (FORM_COLORS[f] ?? "#3d8bff") : "#4a6080",
+                fontFamily: "monospace", fontSize: 10, padding: "2px 8px", borderRadius: 3, cursor: "pointer",
+              }}>{f === "all" ? "All" : f}</button>
+            ))}
+          </div>
+        )}
+        {shown.length === 0 ? (
+          <div style={{ padding: 16, fontSize: 12, color: "#4a6080" }}>No filings found.</div>
+        ) : (
+          <div style={{ padding: "4px 0" }}>
+            {shown.slice(0, 30).map(f => (
+              <div key={f.accession} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "7px 16px", borderBottom: "1px solid #12161f" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, fontFamily: "monospace", minWidth: 46, textAlign: "center",
+                    background: "#1a2535", color: FORM_COLORS[f.form] ?? "#7a8ba0", padding: "2px 6px", borderRadius: 3,
+                  }}>{f.form}</span>
+                  <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace" }}>{f.date}</span>
+                  {f.description && (
+                    <span style={{ fontSize: 10, color: "#3a4558", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {f.description}
+                    </span>
+                  )}
+                </div>
+                <a href={f.url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: "#3d8bff", textDecoration: "none", flexShrink: 0 }}>View ↗</a>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+/**
+ * Net lean — a straight count of which way the computed signals point.
+ *
+ * Deliberately a count and not a score. A weighted 0-100 "conviction" number
+ * would imply the weights mean something, and there is no basis for any
+ * particular set of them; a count is honest about being a count. It sits next
+ * to the argument rather than above it because the argument is the product.
+ */
+function NetLean({ lean, compact = false }) {
+  if (!lean || (lean.bull + lean.bear) === 0) return null;
+  const total = lean.bull + lean.bear;
+  const bullPct = (lean.bull / total) * 100;
+  const label = lean.bull > lean.bear ? "BULL" : lean.bear > lean.bull ? "BEAR" : "SPLIT";
+  const color = lean.bull > lean.bear ? "#00d4aa" : lean.bear > lean.bull ? "#ff4757" : "#ffa502";
+
+  return (
+    <div
+      title={`${lean.bull} signal${lean.bull === 1 ? "" : "s"} point bullish, ${lean.bear} bearish${lean.neutral ? `, ${lean.neutral} neutral` : ""}. A count, not a score.`}
+      style={{ display: "flex", alignItems: "center", gap: 8, cursor: "help" }}
+    >
+      {!compact && (
+        <span style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1 }}>NET LEAN</span>
+      )}
+      <span style={{ fontSize: compact ? 10 : 12, fontWeight: 700, color, fontFamily: "monospace", letterSpacing: 1 }}>
+        {label}
+      </span>
+      <div style={{ display: "flex", width: compact ? 60 : 96, height: 4, borderRadius: 2, overflow: "hidden", background: "#141b28" }}>
+        <div style={{ width: `${bullPct}%`, background: "#00d4aa" }} />
+        <div style={{ width: `${100 - bullPct}%`, background: "#ff4757" }} />
+      </div>
+      <span style={{ fontSize: 9, color: "#4a6080", fontFamily: "monospace", whiteSpace: "nowrap" }}>
+        {lean.bull}·{lean.bear}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Compact instrument header.
+ *
+ * Replaces a 90px-tall panel that held the same four facts on three lines.
+ * Everything sits on one row so the tab bar — and therefore the content — is
+ * visible without scrolling, which matters because this page is a place you
+ * move between tabs rather than read top to bottom.
+ */
+/**
+ * Signal balance, drawn as a ring.
+ *
+ * Deliberately not a "conviction score". A single number out of 100 would need
+ * weights across signals of completely different kinds — a 52-week range
+ * position against an insider sale against a target revision — and no such
+ * weighting could be defended, so any number produced would be authoritative-
+ * looking and arbitrary. What the ring actually shows is the count: how many
+ * of the computed signals lean each way, with the arc split in proportion.
+ * Same information as the bar next to it, in a form that reads at a glance.
+ */
+function SignalRing({ tally, size = 54 }) {
+  if (!tally) return null;
+  const total = tally.bull + tally.bear + tally.neutral;
+  if (!total) return null;
+
+  const r = (size - 7) / 2;
+  const c = 2 * Math.PI * r;
+  const segs = [
+    ["#00d4aa", tally.bull],
+    ["#ffa502", tally.neutral],
+    ["#ff4757", tally.bear],
+  ].filter(([, n]) => n > 0);
+
+  const net = tally.bull - tally.bear;
+  const label = net > 0 ? "BULL" : net < 0 ? "BEAR" : "SPLIT";
+  const color = net > 0 ? "#00d4aa" : net < 0 ? "#ff4757" : "#ffa502";
+
+  let offset = 0;
+  return (
+    <div
+      title={`${tally.bull} of ${total} computed signals lean bullish, ${tally.bear} bearish${tally.neutral ? `, ${tally.neutral} neutral` : ""}. A count of signals, not a score — see the Bull / Bear tab for what each one is.`}
+      style={{ position: "relative", width: size, height: size, flexShrink: 0, cursor: "help" }}
+    >
+      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="#141b28" strokeWidth="5" />
+        {segs.map(([col, n], i) => {
+          const len = (n / total) * c;
+          const dash = `${Math.max(len - 2, 0.5)} ${c}`;
+          const el = (
+            <circle key={i} cx={size / 2} cy={size / 2} r={r} fill="none"
+              stroke={col} strokeWidth="5" strokeLinecap="butt"
+              strokeDasharray={dash} strokeDashoffset={-offset} />
+          );
+          offset += len;
+          return el;
+        })}
+      </svg>
+      <div style={{
+        position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+        alignItems: "center", justifyContent: "center", lineHeight: 1,
+      }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color, fontFamily: "monospace" }}>
+          {tally.bull}<span style={{ color: "#2a3548" }}>·</span>{tally.bear}
+        </span>
+        <span style={{ fontSize: 6.5, color: "#3a4558", fontFamily: "monospace", letterSpacing: 0.5, marginTop: 2 }}>
+          {label}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function InstrumentBar({ symbol, name, data, isTracked, instrument, lean, spark, sparkColor, exchange }) {
+  const up = (data?.changePct ?? 0) >= 0;
+  return (
+    <div style={{
+      background: "linear-gradient(180deg,#0f141d,#0b0f16)", border: "1px solid #1a2535",
+      borderRadius: 8, padding: "12px 18px", display: "flex", alignItems: "center",
+      gap: 18, flexWrap: "wrap",
+    }}>
+      <div style={{ minWidth: 0, flex: "1 1 220px" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 18, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace" }}>{name}</span>
+          <span style={{ fontSize: 12, color: "#4a6080", fontFamily: "monospace" }}>{symbol}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap", marginTop: 4 }}>
+          {instrument && (
+            <span style={{ fontSize: 8.5, color: "#4a6080", fontFamily: "monospace", border: "1px solid #1a2535", borderRadius: 3, padding: "1px 5px", letterSpacing: 0.5 }}>
+              {instrument.toUpperCase()}
+            </span>
+          )}
+          {exchange && (
+            <span style={{ fontSize: 8.5, color: "#3a4558", fontFamily: "monospace", letterSpacing: 0.5 }}>{exchange}</span>
+          )}
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 8.5, color: isTracked ? "#00d4aa" : "#3a4558", fontFamily: "monospace", letterSpacing: 0.5 }}>
+            <span style={{ width: 5, height: 5, borderRadius: "50%", background: isTracked ? "#00d4aa" : "#2a3548" }} />
+            {isTracked ? "LIVE TRACKED" : "NOT TRACKED"}
+          </span>
+        </div>
+      </div>
+
+      {spark?.length > 1 && (
+        <div style={{ flexShrink: 0, opacity: 0.9 }} title="Closes over the window shown on the chart below.">
+          <Sparkline data={spark} color={sparkColor ?? (up ? "#00d4aa" : "#ff4757")} width={130} height={34} id={`hero-${symbol}`} />
+        </div>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginLeft: "auto", flexShrink: 0 }}>
+        <div style={{ textAlign: "right" }}>
+          <div style={{ fontSize: 26, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace", lineHeight: 1.1 }}>
+            {data ? formatPrice(data.price, symbol) : <NoData reason="No live price for this symbol in the terminal feed" />}
+          </div>
+          {data && (
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 4 }}>
+              <span style={{ fontSize: 11, fontFamily: "monospace", color: up ? "#00d4aa" : "#ff4757" }}>
+                1D {formatChange(data.changePct)}
+              </span>
+              <span style={{ fontSize: 11, fontFamily: "monospace", color: (data.weekChangePct ?? 0) >= 0 ? "#00d4aa" : "#ff4757" }}>
+                1W {data.weekChangePct == null ? <NoData compact reason="No week-ago close stored" /> : formatChange(data.weekChangePct)}
+              </span>
+            </div>
+          )}
+        </div>
+        {lean && <SignalRing tally={lean} />}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// BULL / BEAR
+//
+// The reasoning for and against an instrument: what has to be true for each
+// side, and what would prove each side wrong.
+//
+// Not a verdict. There is no overall score, no 0-100 conviction number and no
+// "VERDICT: BULLISH" banner, because none of those could be honest — they
+// would need weights nothing here can justify. The one aggregate shown is a
+// straight count of which way the signals point, sitting beside the argument
+// rather than above it.
+//
+// Every signal carries the date it was computed from and where it came from.
+// Signals that cannot be computed for this instrument are listed with the
+// reason instead of being dropped, so a thin case is visibly thin.
+// ============================================================
+
+const BB = { bull: "#00d4aa", bear: "#ff4757", neutral: "#ffa502", muted: "#4a6080", border: "#1a2535" };
+
+const SIGNAL_ICON = {
+  valuation: "◈", momentum: "◬", analyst: "◎", news: "◉", insider: "▣",
+};
+
+function bbAge(iso) {
+  if (!iso) return null;
+  const days = Math.round((Date.now() - Date.parse(`${iso}T12:00:00Z`)) / 86400_000);
+  if (!Number.isFinite(days)) return null;
+  if (days <= 0) return "today";
+  if (days === 1) return "1d ago";
+  if (days < 30) return `${days}d ago`;
+  return `${Math.round(days / 30)}mo ago`;
+}
+
+/** One grounding fact, with its provenance attached. */
+function SignalCard({ s }) {
+  const c = s.direction === "bull" ? BB.bull : s.direction === "bear" ? BB.bear : BB.neutral;
+  return (
+    <div style={{
+      borderLeft: `2px solid ${c}`, background: "#0b0f18",
+      borderRadius: "0 4px 4px 0", padding: "9px 12px", marginBottom: 6,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
+        <span style={{ color: c, fontSize: 10 }}>{SIGNAL_ICON[s.category] ?? "·"}</span>
+        <span style={{
+          fontSize: 9, fontFamily: "monospace", letterSpacing: 0.5, color: c,
+          border: `1px solid ${c}35`, borderRadius: 3, padding: "1px 6px", textTransform: "uppercase",
+        }}>{s.label}</span>
+        <span style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace" }}>{bbAge(s.asOf)}</span>
+        <span style={{ flex: 1 }} />
+        <span title={`Source: ${s.source}`} style={{ fontSize: 9, color: "#2a3548", fontFamily: "monospace", cursor: "help" }}>
+          {s.source}
+        </span>
+      </div>
+      <div style={{ fontSize: 12.5, color: "#c8d6e8", lineHeight: 1.5 }}>{s.claim}</div>
+    </div>
+  );
+}
+
+/** Bear / base / bull targets, plus where the price sits between them. */
+function ScenarioPanel({ scenario, symbol }) {
+  if (!scenario?.available) {
+    return (
+      <Panel>
+        <SectionHeader title="PRICE SCENARIOS" />
+        <div style={{ padding: 16, fontSize: 12, color: BB.muted, lineHeight: 1.7 }}>
+          {scenario?.reason ?? "No analyst targets available."}
+          <div style={{ color: "#2a3548", marginTop: 5 }}>
+            Scenario prices come from published analyst targets, which exist for individual
+            companies rather than for funds, indices, currencies or commodities.
+          </div>
+        </div>
+      </Panel>
+    );
+  }
+
+  const { bear, base, bull, current, pctToBear, pctToBase, pctToBull } = scenario;
+  // Position of the live price on the low-to-high track.
+  const span = (bull ?? 0) - (bear ?? 0);
+  const marker = span > 0 ? Math.max(0, Math.min(100, ((current - bear) / span) * 100)) : 50;
+
+  const card = (label, value, delta, color) => (
+    <div style={{
+      flex: 1, minWidth: 150, background: "#0b0f18",
+      border: `1px solid ${color}30`, borderTop: `2px solid ${color}`,
+      borderRadius: 5, padding: "12px 14px", textAlign: "center",
+    }}>
+      <div style={{ fontSize: 9, color, fontFamily: "monospace", letterSpacing: 1 }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 700, color: "#e8f0fc", fontFamily: "monospace", marginTop: 4 }}>
+        {value != null ? formatPrice(value, symbol) : <NoData reason="Not published" />}
+      </div>
+      <div style={{ fontSize: 11, color, fontFamily: "monospace", marginTop: 2 }}>
+        {delta != null ? `${delta >= 0 ? "+" : ""}${(delta * 100).toFixed(1)}%` : ""}
+      </div>
+    </div>
+  );
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="PRICE SCENARIOS"
+        subtitle={`${scenario.analysts ? `${scenario.analysts} analysts · ` : ""}${scenario.source}`}
+      />
+      <div style={{ padding: 14 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {card("BEAR CASE", bear, pctToBear, BB.bear)}
+          {card("BASE CASE", base, pctToBase, "#7a8ba0")}
+          {card("BULL CASE", bull, pctToBull, BB.bull)}
+        </div>
+
+        {/* Where the traded price sits between the low and high target. */}
+        <div style={{ marginTop: 18, padding: "0 6px" }}>
+          <div style={{ position: "relative", height: 6, background: "linear-gradient(90deg,#ff475740,#7a8ba030,#00d4aa40)", borderRadius: 3 }}>
+            <div style={{ position: "absolute", left: `${marker}%`, top: -5, transform: "translateX(-50%)" }}>
+              <div style={{ width: 2, height: 16, background: "#e8f0fe", borderRadius: 1 }} />
+            </div>
+          </div>
+          {/* The current-price label tracks the marker. Sitting it in the
+              middle of a space-between row implied the price was halfway
+              between the targets no matter where it actually was. */}
+          <div style={{ position: "relative", height: 14, marginTop: 5 }}>
+            <span style={{
+              position: "absolute", left: `${marker}%`, transform: "translateX(-50%)",
+              fontSize: 10, color: "#c8d6e8", fontFamily: "monospace", whiteSpace: "nowrap",
+            }}>
+              {current != null ? formatPrice(current, symbol) : "—"}
+            </span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#3a4558", fontFamily: "monospace" }}>
+            <span>{bear != null ? formatPrice(bear, symbol) : "—"} low</span>
+            <span>high {bull != null ? formatPrice(bull, symbol) : "—"}</span>
+          </div>
+        </div>
+
+        <div style={{ marginTop: 12, fontSize: 10, color: "#2a3548", lineHeight: 1.5 }}>
+          These are the range of published analyst targets, not a model output. The spread between
+          them is a measure of how much analysts disagree, not a probability distribution.
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+/** One side's argument: assumption, bullets, and what would disprove it. */
+function ThesisColumn({ side, thesis, signals, symbol, editing, draft, onDraft }) {
+  const isBull = side === "bull";
+  const c = isBull ? BB.bull : BB.bear;
+  const title = isBull ? "BULL CASE" : "BEAR CASE";
+  const sideSignals = signals.filter(s => s.direction === side);
+
+  const textarea = (value, onChange, rows = 3, placeholder = "") => (
+    <textarea
+      value={value} onChange={e => onChange(e.target.value)} rows={rows} placeholder={placeholder}
+      style={{
+        width: "100%", background: "#080b12", border: `1px solid ${BB.border}`, borderRadius: 4,
+        color: "#c8d6e8", fontFamily: "monospace", fontSize: 12, padding: "7px 9px",
+        lineHeight: 1.6, resize: "vertical",
+      }}
+    />
+  );
+
+  return (
+    <div style={{
+      flex: 1, minWidth: 300, background: "#0b0f18",
+      border: `1px solid ${c}25`, borderRadius: 6, overflow: "hidden",
+    }}>
+      <div style={{
+        padding: "10px 14px", background: `${c}10`, borderBottom: `1px solid ${c}25`,
+        display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+      }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: c, fontFamily: "monospace", letterSpacing: 1 }}>{title}</span>
+        <span style={{ fontSize: 10, color: BB.muted, fontFamily: "monospace" }}>
+          {sideSignals.length} signal{sideSignals.length === 1 ? "" : "s"}
+          {thesis?.target != null && ` · ${formatPrice(thesis.target, symbol)}`}
+        </span>
+      </div>
+
+      <div style={{ padding: 14 }}>
+        {/* The load-bearing claim, given its own emphasis. */}
+        <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, marginBottom: 5 }}>
+          THIS DEPENDS ON
+        </div>
+        {editing ? (
+          textarea(draft.keyAssumption, v => onDraft({ keyAssumption: v }), 2, "The single thing this side needs to be true")
+        ) : (
+          <div style={{ fontSize: 13, color: "#e8f0fc", lineHeight: 1.6, fontStyle: "italic" }}>
+            {thesis?.keyAssumption || <span style={{ color: "#3a4558", fontStyle: "normal" }}>Not stated.</span>}
+          </div>
+        )}
+
+        <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, margin: "16px 0 6px" }}>
+          ARGUMENT
+        </div>
+        {editing ? (
+          textarea(draft.argument, v => onDraft({ argument: v }), 5, "One point per line")
+        ) : thesis?.argument?.length ? (
+          <ul style={{ margin: 0, paddingLeft: 16, display: "flex", flexDirection: "column", gap: 7 }}>
+            {thesis.argument.map((a, i) => (
+              <li key={i} style={{ fontSize: 12.5, color: "#c8d6e8", lineHeight: 1.55 }}>{a}</li>
+            ))}
+          </ul>
+        ) : (
+          <div style={{ fontSize: 12, color: "#3a4558" }}>Not written.</div>
+        )}
+
+        {/* Falsification is the part that makes this a thesis rather than a pitch. */}
+        <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, margin: "16px 0 6px" }}>
+          WHAT WOULD PROVE THIS WRONG
+        </div>
+        {editing ? (
+          textarea(draft.disproof, v => onDraft({ disproof: v }), 3, "One per line")
+        ) : thesis?.disproof?.length ? (
+          <ul style={{ margin: 0, paddingLeft: 16, display: "flex", flexDirection: "column", gap: 6 }}>
+            {thesis.disproof.map((d, i) => (
+              <li key={i} style={{ fontSize: 12, color: "#7a8ba0", lineHeight: 1.5 }}>{d}</li>
+            ))}
+          </ul>
+        ) : (
+          <div style={{ fontSize: 12, color: "#3a4558" }}>Not stated.</div>
+        )}
+
+        {sideSignals.length > 0 && (
+          <>
+            <div style={{ fontSize: 9, color: "#3a4558", fontFamily: "monospace", letterSpacing: 1, margin: "18px 0 7px" }}>
+              GROUNDED IN
+            </div>
+            {sideSignals.map(s => <SignalCard key={s.label} s={s} />)}
+          </>
+        )}
+
+        {thesis?.source && (
+          <div style={{ fontSize: 9, color: "#2a3548", fontFamily: "monospace", marginTop: 10 }}>
+            {thesis.source === "ai" ? "Drafted by AI from the signals above"
+              : thesis.source === "ai_edited" ? "AI draft, edited by hand"
+              : "Written by hand"}
+            {thesis.updatedAt ? ` · ${thesis.updatedAt.slice(0, 10)}` : ""}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResearchBullBearTab({ symbol, name, bullbearData, bullbearLoading, onReload }) {
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState(null);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [drafts, setDrafts] = useState({ bull: null, bear: null });
+
+  const d = bullbearData;
+
+  // Newline-separated text is the right editing affordance for a bullet list —
+  // one line per point, no list-item chrome to fight with.
+  const startEditing = () => {
+    const toDraft = side => ({
+      keyAssumption: d?.thesis?.[side]?.keyAssumption ?? "",
+      argument: (d?.thesis?.[side]?.argument ?? []).join("\n"),
+      disproof: (d?.thesis?.[side]?.disproof ?? []).join("\n"),
+    });
+    setDrafts({ bull: toDraft("bull"), bear: toDraft("bear") });
+    setEditing(true);
+  };
+
+  async function save() {
+    setSaving(true);
+    try {
+      for (const side of ["bull", "bear"]) {
+        const dr = drafts[side];
+        if (!dr) continue;
+        await fetch(`${API}/research/bullbear/thesis`, {
+          method: "PUT", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol, side,
+            keyAssumption: dr.keyAssumption.trim() || null,
+            argument: dr.argument.split("\n").map(x => x.trim()).filter(Boolean),
+            disproof: dr.disproof.split("\n").map(x => x.trim()).filter(Boolean),
+          }),
+        });
+      }
+      setEditing(false);
+      await onReload();
+    } finally { setSaving(false); }
+  }
+
+  async function generate() {
+    setGenerating(true); setGenError(null);
+    try {
+      const res = await fetch(`${API}/research/bullbear/generate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, name }),
+      });
+      const r = await res.json();
+      if (!r.ok) setGenError(r.message ?? "Generation failed.");
+      else await onReload();
+    } catch {
+      setGenError("Could not reach the Meridian API.");
+    } finally { setGenerating(false); }
+  }
+
+  if (bullbearLoading && !d) {
+    return <Panel><div style={{ padding: 24, textAlign: "center", color: BB.muted, fontSize: 12 }}>Reading signals…</div></Panel>;
+  }
+  if (!d || d.error) {
+    return (
+      <Panel>
+        <div style={{ padding: 16, fontSize: 12, color: "#ff4757" }}>{d?.error ?? "Could not load the bull / bear view."}</div>
+      </Panel>
+    );
+  }
+
+  const hasThesis = !!(d.thesis?.bull || d.thesis?.bear);
+  const neutral = d.signals.filter(s => s.direction === "neutral");
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      <ScenarioPanel scenario={d.scenario} symbol={symbol} />
+
+      {/* The argument. */}
+      <Panel>
+        <SectionHeader
+          title="THE CASE"
+          subtitle={hasThesis ? "What has to be true, and what would prove it wrong" : "Not drafted yet"}
+          action={editing ? (saving ? "SAVING…" : "SAVE") : (generating ? "DRAFTING…" : hasThesis ? "REGENERATE" : "DRAFT FROM SIGNALS")}
+          onAction={editing ? save : generate}
+          extra={
+            hasThesis && !generating ? (
+              <button onClick={editing ? () => setEditing(false) : startEditing} style={{
+                background: "transparent", border: `1px solid ${BB.border}`, color: BB.muted,
+                fontSize: 10, padding: "3px 9px", borderRadius: 3, cursor: "pointer", fontFamily: "monospace",
+              }}>{editing ? "CANCEL" : "EDIT"}</button>
+            ) : null
+          }
+        />
+
+        {genError && (
+          <div style={{ padding: "10px 14px", fontSize: 11, color: "#ff4757", borderBottom: `1px solid ${BB.border}` }}>
+            {genError}
+          </div>
+        )}
+
+        {!hasThesis && !editing ? (
+          <div style={{ padding: 20, fontSize: 12, color: BB.muted, lineHeight: 1.8 }}>
+            {d.signals.length === 0 ? (
+              <>
+                No signal could be computed for {symbol}, so there is nothing to argue from yet.
+                <div style={{ color: "#2a3548", marginTop: 6 }}>
+                  Sync price history for this symbol and the range and momentum signals will appear.
+                </div>
+              </>
+            ) : !d.aiAvailable ? (
+              <>
+                {d.signals.length} signal{d.signals.length === 1 ? "" : "s"} computed below. Drafting the
+                argument needs a Gemini API key — add one in Settings, or write the case by hand.
+              </>
+            ) : (
+              <>
+                {d.signals.length} signal{d.signals.length === 1 ? "" : "s"} computed for {symbol}.
+                Draft the argument from them, then edit it by hand.
+                <div style={{ color: "#2a3548", marginTop: 6 }}>
+                  The model is given only the signals below — no prices, no company narrative — so it
+                  cannot argue from anything that is not on this page.
+                </div>
+              </>
+            )}
+          </div>
+        ) : (
+          <div style={{ padding: 14, display: "flex", gap: 14, flexWrap: "wrap" }}>
+            <ThesisColumn
+              side="bull" thesis={d.thesis?.bull} signals={d.signals} symbol={symbol}
+              editing={editing} draft={drafts.bull ?? {}}
+              onDraft={p => setDrafts(s => ({ ...s, bull: { ...s.bull, ...p } }))}
+            />
+            <ThesisColumn
+              side="bear" thesis={d.thesis?.bear} signals={d.signals} symbol={symbol}
+              editing={editing} draft={drafts.bear ?? {}}
+              onDraft={p => setDrafts(s => ({ ...s, bear: { ...s.bear, ...p } }))}
+            />
+          </div>
+        )}
+      </Panel>
+
+      {/* Where the two sides actually diverge. */}
+      {d.disagreement && (
+        <Panel>
+          <SectionHeader title="WHERE THEY DISAGREE" subtitle="The question that would settle it" />
+          <div style={{ padding: 16, fontSize: 13, lineHeight: 1.8, color: "#a0b4c8", borderLeft: "2px solid #3d8bff40", margin: "0 14px 14px", paddingLeft: 14 }}>
+            {d.disagreement}
+          </div>
+        </Panel>
+      )}
+
+      {/* Signals that point neither way, and those that could not be computed. */}
+      {(neutral.length > 0 || d.unavailable.length > 0) && (
+        <Panel>
+          <SectionHeader
+            title="OTHER SIGNALS"
+            subtitle={`${neutral.length} neutral · ${d.unavailable.length} not available for this instrument`}
+          />
+          <div style={{ padding: 14 }}>
+            {neutral.map(s => <SignalCard key={s.label} s={s} />)}
+            {d.unavailable.length > 0 && (
+              <div style={{ marginTop: neutral.length ? 12 : 0 }}>
+                {/* Listed rather than hidden: a case built on three signals
+                    instead of eight is a thinner case, and that should show. */}
+                {d.unavailable.map(s => (
+                  <div key={s.label} style={{ display: "flex", gap: 10, padding: "5px 0", fontSize: 11, alignItems: "baseline" }}>
+                    <span style={{ color: "#2a3548", fontFamily: "monospace", minWidth: 110, textTransform: "uppercase", fontSize: 9, letterSpacing: 0.5 }}>
+                      {s.label}
+                    </span>
+                    <span style={{ color: "#3a4558", lineHeight: 1.5 }}>{s.reason}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </Panel>
+      )}
+
+      {/* Dated events behind the signals. */}
+      {d.timeline?.events?.length > 0 && (
+        <Panel>
+          <SectionHeader
+            title="WHAT HAPPENED"
+            subtitle={`Last ${d.timeline.days} days · ${d.timeline.counts.bull} bullish · ${d.timeline.counts.bear} bearish`}
+          />
+          <div style={{ padding: "6px 0" }}>
+            {d.timeline.events.map((e, i) => {
+              const c = e.direction === "bull" ? BB.bull : e.direction === "bear" ? BB.bear : BB.neutral;
+              const body = (
+                <>
+                  <span style={{ width: 6, height: 6, borderRadius: "50%", background: c, flexShrink: 0 }} />
+                  <span style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace", minWidth: 64 }}>{e.date}</span>
+                  <span style={{
+                    fontSize: 8.5, fontFamily: "monospace", letterSpacing: 0.5, color: c,
+                    border: `1px solid ${c}30`, borderRadius: 3, padding: "1px 5px",
+                    textTransform: "uppercase", minWidth: 52, textAlign: "center", flexShrink: 0,
+                  }}>{e.category}</span>
+                  <span style={{ fontSize: 12, color: "#a0b4c8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {e.claim}
+                  </span>
+                </>
+              );
+              const style = { display: "flex", gap: 10, alignItems: "center", padding: "7px 16px", borderBottom: "1px solid #10151f", textDecoration: "none" };
+              return e.url && e.url !== "#"
+                ? <a key={i} href={e.url} target="_blank" rel="noopener noreferrer" style={style}>{body}</a>
+                : <div key={i} style={style}>{body}</div>;
+            })}
+          </div>
+        </Panel>
+      )}
+
+      <div style={{ fontSize: 10, color: "#2a3548", fontFamily: "monospace", padding: "0 4px", lineHeight: 1.6 }}>
+        Signals computed locally from stored bars, the news feed, SEC filings and Yahoo's analyst modules.
+        No overall score is shown — weighting these against each other would need weights nothing here can justify.
+      </div>
+    </div>
+  );
+}
+
+function ResearchPage({ prices, jumpTo, tabJump, onTabChange }) {
+  const trackedSymbols = Object.keys(DISPLAY_NAMES);
+  const [query, setQuery] = useState("^GSPC");
+  const [symbol, setSymbol] = useState("^GSPC");
+  const [companyName, setCompanyName] = useState(null);
+  const [suggestions, setSuggestions] = useState([]);
+  const [tab, setTab] = useState("overview");
+
+  // One payload backs the whole Overview tab and the instrument bar: the Yahoo
+  // summary plus everything derived from stored bars. Cached per symbol so
+  // moving between tabs and back is free, and so the chart cannot flicker
+  // through a loading state on a symbol already fetched.
+  const [overview, setOverview] = useState(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const overviewCache = useRef({});
+
+  const [newsData, setNewsData] = useState(null);
+  const [newsLoading, setNewsLoading] = useState(false);
+  const newsCache = useRef({});
+
+  const [bullbearData, setBullbearData] = useState(null);
+  const [bullbearLoading, setBullbearLoading] = useState(false);
+  const bullbearCache = useRef({});
+
+  const [filingsData, setFilingsData] = useState(null);
+  const [insidersData, setInsidersData] = useState(null);
+  const [fundamentals, setFundamentals] = useState(null);
+  const [filingsLoading, setFilingsLoading] = useState(false);
+  const filingsCache = useRef({});
+
+  const [aiText, setAiText] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+
+  // Dividends & splits: a live Yahoo read, so lazy per symbol and cached.
+  const [corporate, setCorporate] = useState(null);
+  const [corporateLoading, setCorporateLoading] = useState(false);
+  const corporateCache = useRef({});
+
+  // Precedents: stored-bars only, fetched when its tab opens.
+  const [precedentsData, setPrecedentsData] = useState(null);
+  const [precedentsLoading, setPrecedentsLoading] = useState(false);
+  const precedentsCache = useRef({});
+
+  // Peers for the Compare tab: live Yahoo read, lazy and cached.
+  const [peersData, setPeersData] = useState(null);
+  const [peersLoading, setPeersLoading] = useState(false);
+  const peersCache = useRef({});
+
+  // The user's chart notes. Seeded from the overview payload, then kept in
+  // sync locally after each add/delete — the CRUD responses return the fresh
+  // list, so no refetch of the whole overview is ever needed.
+  const [notes, setNotes] = useState([]);
+
+  const data = prices?.[symbol];
+  const name = companyName || DISPLAY_NAMES[symbol] || symbol;
+  const isTracked = trackedSymbols.includes(symbol);
+  const summary = overview?.quote && !overview.quote.error ? overview.quote : null;
+  const price = data?.price ?? summary?.price ?? null;
+
+  // The last 90 stored closes, for the sparkline in the instrument bar. Sliced
+  // from the series already fetched rather than costing its own request.
+  const heroSpark = useMemo(() => {
+    const s = overview?.series;
+    return s?.available ? s.close.slice(-90).filter(v => v != null) : null;
+  }, [overview]);
+
+  // Company-name autocomplete. Debounced so every keystroke doesn't fire a
+  // request, and skipped once the query already matches the selected symbol.
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 2 || q === symbol) { setSuggestions([]); return; }
+    const t = setTimeout(() => {
+      fetch(`${API}/search?q=${encodeURIComponent(q)}`).then(r => r.json())
+        .then(d => setSuggestions(d.results ?? []))
+        .catch(() => setSuggestions([]));
+    }, 300);
+    return () => clearTimeout(t);
+  }, [query, symbol]);
+
+  const selectSymbol = (sym, nm) => {
+    setSymbol(sym); setQuery(sym); setCompanyName(nm || DISPLAY_NAMES[sym] || null);
+    setSuggestions([]); setAiText("");
+  };
+
+  // Arriving from the command palette: land on the requested symbol's
+  // Overview. The timestamp in jumpTo makes re-selecting the same symbol
+  // still fire, since the object identity changes each time.
+  useEffect(() => {
+    if (!jumpTo?.symbol) return;
+    selectSymbol(jumpTo.symbol.toUpperCase(), jumpTo.name ?? null);
+    setTab("overview");
+  }, [jumpTo?.ts]);
+
+  // Arriving via a sidebar sub-item (e.g. Research > Precedents) — same
+  // symbol, just a different tab.
+  useEffect(() => {
+    if (!tabJump?.tab) return;
+    setTab(tabJump.tab);
+  }, [tabJump?.ts]);
+
+  useEffect(() => { onTabChange?.(tab); }, [tab]);
+
+  const runSearch = () => {
+    const s = query.trim();
+    if (!s) return;
+    selectSymbol(s.toUpperCase(), null);
+  };
+
+  // The overview payload, fetched for every symbol regardless of which tab is
+  // open — the instrument bar shows the price, sparkline and signal ring from
+  // it on all of them.
+  useEffect(() => {
+    let cancelled = false;
+    const cached = overviewCache.current[symbol];
+    if (cached) {
+      setOverview(cached);
+      setNotes(cached.notes ?? []);
+      if (cached.quote?.name && !cached.quote.error) setCompanyName(cached.quote.name);
+      return;
+    }
+    setOverview(null);
+    setNotes([]);
+    setSummaryLoading(true);
+    fetch(`${API}/research/overview?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(d => {
+        if (cancelled) return;
+        overviewCache.current[symbol] = d;
+        setOverview(d);
+        setNotes(d?.notes ?? []);
+        if (d?.quote?.name && !d.quote.error) setCompanyName(d.quote.name);
+      })
+      .catch(() => { if (!cancelled) setOverview(null); })
+      .finally(() => { if (!cancelled) setSummaryLoading(false); });
+    return () => { cancelled = true; };
+  }, [symbol]);
+
+  // Note add/delete: the API responds with the fresh list, which also gets
+  // written back into the overview cache so revisiting the symbol keeps them.
+  const syncNotes = useCallback((sym, fresh) => {
+    setNotes(fresh);
+    const cached = overviewCache.current[sym];
+    if (cached) overviewCache.current[sym] = { ...cached, notes: fresh };
+  }, []);
+
+  const addNote = useCallback(async (date, text) => {
+    try {
+      const r = await fetch(`${API}/research/notes`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, date, text }),
+      }).then(x => x.json());
+      if (r?.notes) syncNotes(symbol, r.notes);
+      return r;
+    } catch { return { error: "Could not reach the Meridian API." }; }
+  }, [symbol, syncNotes]);
+
+  const deleteNote = useCallback(async (id) => {
+    try {
+      const r = await fetch(`${API}/research/notes?id=${id}`, { method: "DELETE" }).then(x => x.json());
+      if (r?.notes) syncNotes(symbol, r.notes);
+    } catch { /* leave the list as-is; the delete button can be pressed again */ }
+  }, [symbol, syncNotes]);
+
+  // Dividends & splits: fetched once the Overview tab is (or becomes) active.
+  useEffect(() => {
+    if (tab !== "overview") return;
+    if (corporateCache.current[symbol]) { setCorporate(corporateCache.current[symbol]); return; }
+    let cancelled = false;
+    setCorporate(null);
+    setCorporateLoading(true);
+    fetch(`${API}/research/corporate?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(d => { if (!cancelled) { corporateCache.current[symbol] = d; setCorporate(d); } })
+      .catch(() => { if (!cancelled) setCorporate({ error: "Could not reach the Meridian API." }); })
+      .finally(() => { if (!cancelled) setCorporateLoading(false); });
+    return () => { cancelled = true; };
+  }, [tab, symbol]);
+
+  // Precedents tab: local computation server-side, still cached per symbol so
+  // flicking between tabs is free.
+  useEffect(() => {
+    if (tab !== "precedents") return;
+    if (precedentsCache.current[symbol]) { setPrecedentsData(precedentsCache.current[symbol]); return; }
+    let cancelled = false;
+    setPrecedentsData(null);
+    setPrecedentsLoading(true);
+    fetch(`${API}/research/precedents?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(d => { if (!cancelled) { precedentsCache.current[symbol] = d; setPrecedentsData(d); } })
+      .catch(() => { if (!cancelled) setPrecedentsData(null); })
+      .finally(() => { if (!cancelled) setPrecedentsLoading(false); });
+    return () => { cancelled = true; };
+  }, [tab, symbol]);
+
+  // Peers: fetched when the Compare tab opens.
+  useEffect(() => {
+    if (tab !== "compare") return;
+    if (peersCache.current[symbol]) { setPeersData(peersCache.current[symbol]); return; }
+    let cancelled = false;
+    setPeersData(null);
+    setPeersLoading(true);
+    fetch(`${API}/research/peers?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(d => { if (!cancelled) { peersCache.current[symbol] = d; setPeersData(d); } })
+      .catch(() => { if (!cancelled) setPeersData({ peers: [], error: "Could not reach the Meridian API." }); })
+      .finally(() => { if (!cancelled) setPeersLoading(false); });
+    return () => { cancelled = true; };
+  }, [tab, symbol]);
+
+  // News tab: lazy-loaded on first visit per symbol, then cached.
+  useEffect(() => {
+    if (tab !== "news") return;
+    if (newsCache.current[symbol]) { setNewsData(newsCache.current[symbol]); return; }
+    setNewsLoading(true);
+    const params = new URLSearchParams({ symbol, query: name, limit: "30" });
+    fetch(`${API}/research/news?${params}`).then(r => r.json())
+      .then(d => { newsCache.current[symbol] = d; setNewsData(d); })
+      .catch(() => setNewsData({ news: [], feedCount: 0, liveCount: 0 }))
+      .finally(() => setNewsLoading(false));
+  }, [tab, symbol, name]);
+
+  // Bull / Bear tab: same lazy-load-and-cache pattern. loadBullBear is also the
+  // reload path after generating or editing a thesis, so it takes a flag to
+  // bypass the cache rather than being duplicated.
+  const loadBullBear = useCallback(async (sym, { fresh = false } = {}) => {
+    if (!fresh && bullbearCache.current[sym]) { setBullbearData(bullbearCache.current[sym]); return; }
+    setBullbearLoading(true);
+    try {
+      const d = await fetch(`${API}/research/bullbear?symbol=${encodeURIComponent(sym)}`).then(r => r.json());
+      bullbearCache.current[sym] = d;
+      setBullbearData(d);
+    } catch {
+      setBullbearData({ error: "Could not reach the Meridian API." });
+    } finally { setBullbearLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "bullbear") return;
+    loadBullBear(symbol);
+  }, [tab, symbol, loadBullBear]);
+
+  // Filings tab: same lazy-load-and-cache pattern.
+  useEffect(() => {
+    if (tab !== "filings") return;
+    if (filingsCache.current[symbol]) {
+      const c = filingsCache.current[symbol];
+      setFilingsData(c.filings); setInsidersData(c.insiders); setFundamentals(c.fundamentals);
+      return;
+    }
+    setFilingsLoading(true);
+    // Four independent EDGAR reads. Each resolves to its own error object
+    // rather than rejecting, so one unavailable dataset cannot blank the
+    // other three — a company with no parsed Form 4s should still show its
+    // filings and its reported fundamentals.
+    Promise.all([
+      fetch(`${API}/filings?symbol=${encodeURIComponent(symbol)}&type=all&limit=60`).then(r => r.json()).catch(() => ({ error: "Filings unavailable." })),
+      fetch(`${API}/insiders?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()).catch(() => null),
+      fetch(`${API}/insiders/summary?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()).catch(() => null),
+      fetch(`${API}/fundamentals?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()).catch(() => null),
+    ]).then(([f, i, sum, fun]) => {
+      const insiders = i ? { ...i, summary: sum } : null;
+      filingsCache.current[symbol] = { filings: f, insiders, fundamentals: fun };
+      setFilingsData(f); setInsidersData(insiders); setFundamentals(fun);
+    }).catch(() => {
+      setFilingsData({ error: "Could not reach the server." }); setInsidersData(null); setFundamentals(null);
+    }).finally(() => setFilingsLoading(false));
+  }, [tab, symbol]);
+
+  const runAI = async () => {
+    setAiLoading(true);
+    // The note is handed the same measured figures the Overview tab displays,
+    // rather than only a price. Without them the model had almost nothing to
+    // reason from and filled the gap from training memory — which for a
+    // specific instrument on a specific day is exactly the failure mode this
+    // app exists to avoid. Every line below is a number computed here, so a
+    // note that contradicts one is visibly wrong rather than plausible.
+    const t = overview?.technicals;
+    const facts = [];
+    if (data) facts.push(`Live price ${formatPrice(data.price, symbol)}, 1D ${formatChange(data.changePct)}, 1W ${formatChange(data.weekChangePct)}.`);
+    else facts.push("No live price available for this asset in the terminal feed.");
+    if (t?.available) {
+      const r = t.returns;
+      const rr = Object.entries(r).filter(([, v]) => v != null)
+        .map(([k, v]) => `${k} ${(v * 100).toFixed(1)}%`).join(", ");
+      if (rr) facts.push(`Trailing returns: ${rr}.`);
+      if (t.dist50dma != null) facts.push(`${(t.dist50dma * 100).toFixed(1)}% versus its 50-day average${t.dist200dma != null ? `, ${(t.dist200dma * 100).toFixed(1)}% versus its 200-day` : ""}.`);
+      if (t.fromHigh != null) facts.push(`${Math.abs(t.fromHigh * 100).toFixed(1)}% below its ${t.rangeBars >= 252 ? "52-week" : `${t.rangeBars}-bar`} high; ${(t.rangePosition * 100).toFixed(0)}% up that range.`);
+      if (t.vol30 != null) facts.push(`30-day annualised volatility ${(t.vol30 * 100).toFixed(0)}%${t.volRatio != null ? ` (${t.volRatio.toFixed(2)}x its yearly level)` : ""}.`);
+      if (t.rsi14 != null) facts.push(`RSI(14) ${t.rsi14.toFixed(0)}.`);
+      if (t.beta != null) facts.push(`Beta ${t.beta.toFixed(2)} against ${t.benchmark} over ${t.benchmarkOverlap} shared trading days.`);
+      facts.push(`All computed from ${t.bars.toLocaleString()} stored daily bars, to ${t.asOf}.`);
+    } else if (t?.reason) {
+      facts.push(`No technical picture available: ${t.reason}`);
+    }
+    const a = summary?.analyst;
+    if (a?.targetMean != null) {
+      facts.push(`Analyst consensus target ${a.targetMean.toFixed(2)}${a.numberOfAnalysts ? ` from ${a.numberOfAnalysts} analysts` : ""}${a.targetLow != null && a.targetHigh != null ? `, range ${a.targetLow.toFixed(2)}–${a.targetHigh.toFixed(2)}` : ""}.`);
+    } else if (summary?.hasAnalystCoverage === false) {
+      facts.push("No analyst coverage exists for this instrument type.");
+    }
+    if (overview?.sentiment?.available) {
+      facts.push(`News tone over 90 days reads ${overview.sentiment.nowBand} across ${overview.sentiment.stories} scored stories.`);
+    }
+
+    const prompt = `${AI_RULES}
+
+Asset: ${name} (${symbol}).
+
+Measured facts, all computed by this application from its own stored data:
+${facts.map(f => `- ${f}`).join("\n")}
+
+Write a structured note in four labelled sections, each 2-3 sentences:
+BULL CASE: The strongest argument to be long.
+BEAR CASE: The strongest argument against.
+BASE CASE: The most probable path from here.
+WHAT WOULD CHANGE THIS: The specific, observable signals that would shift the
+picture either way.
+
+Reason only from the facts listed above. Where they do not settle something,
+say so rather than filling the gap from memory — a note that names its own
+blind spots is more useful than one that reads confidently past them. Do not
+restate a figure with a different value than the one given.`;
+    const { text } = await callAI(prompt, 900);
+    setAiText(text);
+    setAiLoading(false);
+  };
+
+  const inputStyle = { background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, color: "#c8d6e8", fontFamily: "monospace", fontSize: 13, padding: "9px 12px" };
+  // Analyst coverage and SEC filings are equity concepts. Rather than showing
+  // an always-empty tab for an index or a currency pair, each tab declares
+  // whether it applies to this instrument and why not when it doesn't.
+  const inst = summary;
+  // The signal count behind the ring in the instrument bar. It arrives with
+  // the overview payload rather than waiting for the Bull / Bear tab to be
+  // opened — the tally is computed locally from stored observations, so
+  // including it costs the page nothing, and the ring was useless when it
+  // only appeared after visiting another tab. Falls back to the Bull / Bear
+  // response when that tab has been opened, since the two agree by
+  // construction and it keeps the bar populated if the overview call failed.
+  const lean = overview?.signals?.tally
+    ?? (bullbearData && !bullbearData.error && bullbearData.symbol === symbol ? bullbearData.tally : null);
+  const tabNA = {
+    // filingsSupport is false for instrument types with no filings at all, and
+    // 'us-only' where EDGAR applies if — and only if — the issuer is a US
+    // registrant, which only the fetch itself can settle.
+    filings: inst?.filingsSupport === false
+      ? `A ${inst.instrumentLabel?.toLowerCase() ?? "instrument"} has no SEC filings.`
+      : null,
+  };
+  // Analyst no longer has its own tab — its content is the right-hand rail of
+  // Overview now. Splitting "what the price did" from "what the street thinks"
+  // across two tabs meant every research session was read in two halves with
+  // a click in the middle.
+  const tabs = [["overview", "Overview"], ["compare", "Compare"], ["precedents", "Precedents"], ["news", "News"], ["bullbear", "Bull / Bear"], ["filings", "Filings"], ["ai", "AI Note"]];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Panel>
+        <SectionHeader title="ASSET RESEARCH" subtitle="Any Ticker/Company" />
+        <div style={{ padding: 14, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", position: "relative" }}>
+          <div style={{ flex: 1, minWidth: 220, position: "relative" }}>
+            <input
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && runSearch()}
+              placeholder="Company Name or Symbol"
+              style={{ ...inputStyle, width: "100%" }}
+            />
+            {suggestions.length > 0 && (
+              <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, background: "#0d1117", border: "1px solid #1a2535", borderRadius: 4, zIndex: 10, maxHeight: 260, overflowY: "auto" }}>
+                {suggestions.map(r => (
+                  <div key={r.symbol} onMouseDown={() => selectSymbol(r.symbol, r.name)} style={{ padding: "8px 12px", cursor: "pointer", borderBottom: "1px solid #12161f", display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ fontSize: 12, color: "#c8d6e8" }}>{r.name}</span>
+                    <span style={{ fontSize: 11, color: "#4a6080", fontFamily: "monospace", flexShrink: 0 }}>{r.symbol}{r.exchange ? ` \u00b7 ${r.exchange}` : ""}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <button onClick={runSearch} style={{ background: "#3d8bff20", border: "1px solid #3d8bff40", color: "#3d8bff", padding: "9px 18px", borderRadius: 4, cursor: "pointer", fontFamily: "monospace", fontSize: 12 }}>ANALYSE</button>
+        </div>
+        <div style={{ padding: "0 14px 12px", display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {trackedSymbols.slice(0, 10).map(s => (
+            <button key={s} onClick={() => selectSymbol(s, null)} style={{ background: symbol === s ? "#00d4aa20" : "#0d1117", border: `1px solid ${symbol === s ? "#00d4aa40" : "#1a2535"}`, color: symbol === s ? "#00d4aa" : "#7a8ba0", padding: "4px 10px", borderRadius: 4, cursor: "pointer", fontFamily: "monospace", fontSize: 10 }}>{DISPLAY_NAMES[s] || s}</button>
+          ))}
+        </div>
+      </Panel>
+
+      <InstrumentBar
+        symbol={symbol} name={name} data={data} isTracked={isTracked}
+        instrument={inst?.instrumentLabel ?? null} lean={lean}
+        spark={heroSpark} exchange={inst?.country ?? null}
+      />
+
+      <div style={{ display: "flex", gap: 2, borderBottom: "1px solid #1a1f2e" }}>
+        {tabs.map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)} title={tabNA[id] ?? undefined} style={{
+            opacity: tabNA[id] ? 0.45 : 1,
+            background: "transparent", border: "none",
+            borderBottom: tab === id ? "2px solid #00d4aa" : "2px solid transparent",
+            color: tab === id ? "#00d4aa" : "#4a6080",
+            padding: "8px 14px", cursor: "pointer", fontFamily: "monospace",
+            fontSize: 11, letterSpacing: 1, textTransform: "uppercase",
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "overview" && (
+        <ResearchOverviewTab
+          symbol={symbol} name={name} overview={overview}
+          loading={summaryLoading} price={price}
+          corporate={corporate} corporateLoading={corporateLoading}
+          notes={notes} onAddNote={addNote} onDeleteNote={deleteNote}
+        />
+      )}
+      {tab === "compare" && (
+        <ResearchCompareTab
+          symbol={symbol} peersData={peersData} peersLoading={peersLoading}
+          onNavigate={(sym, nm) => selectSymbol(sym, nm)}
+        />
+      )}
+      {tab === "precedents" && (
+        <ResearchPrecedentsTab symbol={symbol} data={precedentsData} loading={precedentsLoading} />
+      )}
+      {tab === "news" && <ResearchNewsTab symbol={symbol} name={name} newsData={newsData} newsLoading={newsLoading} />}
+      {tab === "bullbear" && (
+        <ResearchBullBearTab
+          symbol={symbol} name={name}
+          bullbearData={bullbearData} bullbearLoading={bullbearLoading}
+          onReload={() => loadBullBear(symbol, { fresh: true })}
+        />
+      )}
+      {tab === "filings" && <ResearchFilingsTab symbol={symbol} filingsData={filingsData} insidersData={insidersData} fundamentals={fundamentals} filingsLoading={filingsLoading} />}
+      {tab === "ai" && (
+        <Panel>
+          <SectionHeader title="AI RESEARCH NOTE" subtitle="Bull / bear / base case" action={aiLoading ? "THINKING..." : "GENERATE"} onAction={runAI} />
+          <div style={{ padding: 16 }}>
+            {aiText
+              ? <div style={{ fontSize: 12.5, lineHeight: 1.8, color: "#b8c6da", whiteSpace: "pre-wrap", fontFamily: "'Courier New', monospace" }}>{aiText}</div>
+              : <div style={{ fontSize: 12, color: "#4a6080" }}>Click GENERATE for a structured bull / bear / base research note on {name}. Requires a Gemini API key (Settings).</div>}
+          </div>
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// RISK PAGE
+// New in v2 — reads live from the local risk engine at :4001/risk.
+// Built to match the existing Panel / SectionHeader / GaugeBar conventions
+// used elsewhere in this file, so it doesn't look bolted on.
+// ============================================================
+
+function RiskMetric({ label, value, sub, color, align = "left" }) {
+  const t = useTheme();
+  const centered = align === "center";
+  return (
+    <div style={{
+      padding: "18px 22px", borderRight: `1px solid ${t.border}`,
+      ...(centered && { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }),
+    }}>
+      <div style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1, marginBottom: 8 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 30, fontWeight: 700, color: color ?? t.text, fontFamily: "monospace" }}>
+        {value}
+      </div>
+      {sub && (
+        <div style={{ fontSize: 12, color: t.textMuted, marginTop: 5 }}>{sub}</div>
+      )}
+    </div>
+  );
+}
+
+function RiskContributionRow({ row }) {
+  const gap = row.pctOfRisk - row.weight;
+  const gapColor = gap > 3 ? "#ff4757" : gap < -3 ? "#00d4aa" : "#7a8ba0";
+  const barMax = Math.max(row.weight, row.pctOfRisk, 1);
+  return (
+    <div style={{ padding: "10px 16px", borderBottom: "1px solid #12161f" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: "#c8d6e8", fontFamily: "monospace" }}>
+          {row.symbol}
+        </span>
+        <span style={{ fontSize: 11, color: gapColor, fontFamily: "monospace" }}>
+          {gap > 0 ? "+" : ""}{gap.toFixed(1)}pp risk vs weight
+        </span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 3 }}>
+        <span style={{ fontSize: 9, color: "#4a6080", width: 44 }}>WEIGHT</span>
+        <div style={{ flex: 1, height: 5, background: "#1a2535", borderRadius: 3 }}>
+          <div style={{ width: `${(row.weight / barMax) * 100}%`, height: "100%", background: "#3d8bff", borderRadius: 3 }} />
+        </div>
+        <span style={{ fontSize: 10, color: "#7a8ba0", width: 44, textAlign: "right", fontFamily: "monospace" }}>{row.weight.toFixed(1)}%</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 9, color: "#4a6080", width: 44 }}>RISK</span>
+        <div style={{ flex: 1, height: 5, background: "#1a2535", borderRadius: 3 }}>
+          <div style={{ width: `${(row.pctOfRisk / barMax) * 100}%`, height: "100%", background: gapColor, borderRadius: 3 }} />
+        </div>
+        <span style={{ fontSize: 10, color: "#7a8ba0", width: 44, textAlign: "right", fontFamily: "monospace" }}>{row.pctOfRisk.toFixed(1)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function CorrelationCell({ value }) {
+  const v = value;
+  const bg = v >= 0.99 ? "#1a2535"
+    : v > 0.5 ? `rgba(255,71,87,${Math.min(v, 1) * 0.55})`
+    : v > 0.15 ? `rgba(255,165,2,${v * 0.5})`
+    : v < -0.15 ? `rgba(0,212,170,${Math.min(-v, 1) * 0.55})`
+    : "transparent";
+  return (
+    <div style={{
+      width: 52, height: 30, display: "flex", alignItems: "center", justifyContent: "center",
+      background: bg, fontSize: 10, fontFamily: "monospace", color: "#c8d6e8",
+      border: "1px solid #12161f",
+    }}>
+      {v.toFixed(2)}
+    </div>
+  );
+}
+
+// ============================================================
+// CORRELATION
+// ============================================================
+//
+// The panel leads with a heatmap rather than a table because the question it
+// answers is a shape question — where are the hot blocks — and a grid of
+// numbers makes that the reader's job instead of the page's.
+//
+// Three rules the rendering has to keep, because the engine goes to some
+// trouble to make them true:
+//   - a cell with no measurement is drawn as visibly absent, never as the
+//     colour for zero. Zero means "these move independently" and is a real
+//     finding; absent means "we could not tell".
+//   - the number a cell rests on is available on hover, because a correlation
+//     from 31 days and one from 1,200 look identical otherwise.
+//   - anything the engine returned null for renders as a dash, not a 0.00.
+
+/** Short display form: SHEL.L -> SHEL, 0P0001O7DK.L -> 0P0001O7DK. */
+const shortSym = s => String(s ?? "").replace(/\.(L|DE|PA|AS|MI|TO|T|HK|SW|ST|OL|CO|HE)$/i, "");
+
+/**
+ * Diverging colour scale for a correlation.
+ * Neutral at zero, blue as it goes negative, amber-into-red as it goes
+ * positive — high positive correlation is the finding that costs you money in
+ * a diversification tool, so it gets the hot end.
+ */
+function corrColor(r, t) {
+  if (r == null) return null;
+  const mix = (a, b, k) => {
+    const pa = [parseInt(a.slice(1, 3), 16), parseInt(a.slice(3, 5), 16), parseInt(a.slice(5, 7), 16)];
+    const pb = [parseInt(b.slice(1, 3), 16), parseInt(b.slice(3, 5), 16), parseInt(b.slice(5, 7), 16)];
+    const c = pa.map((x, i) => Math.round(x + (pb[i] - x) * Math.max(0, Math.min(1, k))));
+    return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
+  };
+  const neutral = t.surfaceInset;
+  if (r < 0) return mix(neutral, t.info, Math.min(Math.abs(r) * 1.25, 1));
+  if (r <= 0.6) return mix(neutral, t.warning, r / 0.6 * 0.75);
+  return mix(t.warning, t.negative, (r - 0.6) / 0.4);
+}
+
+/** Cell background for "no measurement" — hatched, so it cannot be mistaken
+ *  for a colour on the scale. */
+function noDataFill(t) {
+  return `repeating-linear-gradient(45deg, ${t.surfaceAlt} 0px, ${t.surfaceAlt} 3px, ${t.surface} 3px, ${t.surface} 6px)`;
+}
+
+function CorrelationHeatmap({ data }) {
+  const t = useTheme();
+  const syms = data?.symbols ?? [];
+  if (syms.length < 2) return <div style={{ padding: 16 }}><NoData reason="Need at least two holdings with stored history" /></div>;
+
+  // Label gutter scales with the longest symbol so nothing is clipped.
+  const longest = Math.max(...syms.map(s => shortSym(s).length));
+  const gutter = Math.min(Math.max(longest * 7 + 10, 48), 104);
+  const cell = syms.length > 10 ? 30 : syms.length > 7 ? 38 : 46;
+
+  return (
+    <div style={{ padding: "12px 16px 16px", overflowX: "auto" }}>
+      <div style={{ display: "inline-block", minWidth: "min-content" }}>
+        {/* Column headers, rotated so long tickers do not force a wide grid */}
+        <div style={{ display: "flex", marginLeft: gutter, height: 62 }}>
+          {syms.map(s => (
+            <div key={s} style={{ width: cell, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+              <span style={{
+                fontSize: 9.5, fontFamily: "monospace", color: t.textMuted,
+                transform: "rotate(-55deg)", transformOrigin: "left bottom",
+                whiteSpace: "nowrap", display: "block", marginLeft: cell / 2 - 2,
+              }}>{shortSym(s)}</span>
+            </div>
+          ))}
+        </div>
+
+        {syms.map((rowSym, i) => (
+          <div key={rowSym} style={{ display: "flex", alignItems: "center" }}>
+            <div style={{
+              width: gutter, fontSize: 9.5, fontFamily: "monospace", color: t.textMuted,
+              textAlign: "right", paddingRight: 8, whiteSpace: "nowrap", overflow: "hidden",
+            }}>{shortSym(rowSym)}</div>
+
+            {syms.map((colSym, j) => {
+              const r = data.matrix[i][j];
+              const obs = data.observations?.[i]?.[j] ?? null;
+              const diag = i === j;
+              const bg = diag ? t.surfaceInset : (r == null ? null : corrColor(r, t));
+              return (
+                <div
+                  key={colSym}
+                  title={
+                    diag ? shortSym(rowSym)
+                      : r == null
+                        ? `${shortSym(rowSym)} / ${shortSym(colSym)} — not measurable${obs ? ` (only ${obs} overlapping days)` : " (no overlapping history)"}`
+                        : `${shortSym(rowSym)} / ${shortSym(colSym)} — ${r.toFixed(2)} over ${obs} days`
+                  }
+                  style={{
+                    width: cell, height: cell,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    background: bg ?? noDataFill(t),
+                    border: `1px solid ${t.appBg}`,
+                    fontSize: cell > 36 ? 10 : 9, fontFamily: "monospace",
+                    color: diag ? t.textFaint : r == null ? t.textFaint : (Math.abs(r) > 0.55 ? "#0a0d13" : t.text),
+                    cursor: "help", boxSizing: "border-box",
+                  }}
+                >
+                  {diag ? "—" : r == null ? "·" : r.toFixed(2)}
+                </div>
+              );
+            })}
+          </div>
+        ))}
+
+        {/* Scale legend, so the colours mean something without a caption */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14, marginLeft: gutter }}>
+          <span style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>-1</span>
+          <div style={{ display: "flex", height: 8, borderRadius: 2, overflow: "hidden" }}>
+            {Array.from({ length: 41 }, (_, k) => {
+              const r = -1 + k * 0.05;
+              return <div key={k} style={{ width: 6, height: 8, background: corrColor(r, t) }} />;
+            })}
+          </div>
+          <span style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>+1</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, marginLeft: 10 }}>
+            <div style={{ width: 14, height: 10, background: noDataFill(t), border: `1px solid ${t.border}` }} />
+            <span style={{ fontSize: 9.5, color: t.textFaint }}>not measurable</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Calm versus stressed, as a paired bar per holding pair. The jump between
+ *  the two bars is the whole point, so they share one axis and sit adjacent. */
+function StressPairBars({ stress, limit = 6 }) {
+  const t = useTheme();
+  if (!stress?.available) {
+    return <div style={{ padding: 16 }}><NoData reason={stress?.reason ?? "Not enough history to split calm from stressed days"} /></div>;
+  }
+  const rows = [...(stress.pairs ?? [])]
+    .filter(p => p.gap != null)
+    .sort((a, b) => b.gap - a.gap)
+    .slice(0, limit);
+
+  if (!rows.length) return <div style={{ padding: 16 }}><NoData reason="No pair could be measured on both calm and stressed days" /></div>;
+
+  // Correlation runs -1..+1, so the track is centred on zero and bars grow
+  // left or right from it. Clamping negatives to zero width — the obvious
+  // shortcut — draws -0.01 and -0.22 as the same empty bar, which throws away
+  // exactly the difference the panel exists to show.
+  const bar = (v, color) => {
+    if (v == null) {
+      return (
+        <div style={{ flex: 1, height: 9, background: t.surfaceInset, borderRadius: 2, position: "relative" }}>
+          <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: t.border }} />
+        </div>
+      );
+    }
+    const c = Math.max(-1, Math.min(v, 1));
+    const half = Math.abs(c) / 2 * 100;
+    return (
+      <div style={{ flex: 1, height: 9, background: t.surfaceInset, borderRadius: 2, position: "relative", overflow: "hidden" }}>
+        <div style={{
+          position: "absolute", top: 1, bottom: 1,
+          left: c >= 0 ? "50%" : `${50 - half}%`,
+          width: `${Math.max(half, c === 0 ? 0 : 0.8)}%`,
+          background: color, borderRadius: 1,
+        }} />
+        {/* Zero line stays visible above the fill so the sign is unambiguous */}
+        <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: t.borderStrong }} />
+      </div>
+    );
+  };
+
+  return (
+    <div style={{ padding: "12px 16px 16px" }}>
+      {rows.map(p => (
+        <div key={`${p.a}|${p.b}`} style={{ marginBottom: 13 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+            <span style={{ fontSize: 11, fontFamily: "monospace", color: t.textSecondary }}>
+              {shortSym(p.a)} · {shortSym(p.b)}
+            </span>
+            <span style={{
+              fontSize: 11, fontFamily: "monospace",
+              color: p.failsUnderStress ? t.negative : t.textMuted,
+            }}>
+              {p.gap > 0 ? "+" : ""}{p.gap.toFixed(2)}{p.failsUnderStress ? "  fails" : ""}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
+            <span style={{ width: 52, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>calm</span>
+            {bar(p.calm, t.info)}
+            <span style={{ width: 34, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace", textAlign: "right" }}>
+              {p.calm == null ? "—" : p.calm.toFixed(2)}
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+            <span style={{ width: 52, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>selloff</span>
+            {bar(p.stressed, p.failsUnderStress ? t.negative : t.warning)}
+            <span style={{ width: 34, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace", textAlign: "right" }}>
+              {p.stressed == null ? "—" : p.stressed.toFixed(2)}
+            </span>
+          </div>
+        </div>
+      ))}
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 2, marginBottom: 6 }}>
+        <span style={{ width: 52 }} />
+        <div style={{ flex: 1, display: "flex", justifyContent: "space-between", fontSize: 9, color: t.textFaint, fontFamily: "monospace" }}>
+          <span>-1</span><span>0</span><span>+1</span>
+        </div>
+        <span style={{ width: 34 }} />
+      </div>
+      <div style={{ fontSize: 10, color: t.textFaint, lineHeight: 1.5 }}>
+        {stress.stressedDays} worst days against {stress.calmDays} others. {stress.basis}.
+      </div>
+    </div>
+  );
+}
+
+/** Clusters as blocs — a set of chips per group, sized by membership. */
+function ClusterBlocs({ clusters }) {
+  const t = useTheme();
+  if (!clusters?.available) {
+    return <div style={{ padding: 16 }}><NoData reason={clusters?.reason ?? "Not enough overlapping history to cluster"} /></div>;
+  }
+  const groups = clusters.clusters ?? [];
+  return (
+    <div style={{ padding: "12px 16px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+      {groups.map((g, i) => {
+        const solo = g.size === 1;
+        const hot = (g.averageInternalCorrelation ?? 0) >= 0.8;
+        return (
+          <div key={i} style={{
+            border: `1px solid ${solo ? t.borderSubtle : hot ? t.negative + "66" : t.border}`,
+            background: solo ? "transparent" : t.surfaceAlt,
+            borderRadius: 4, padding: "8px 10px",
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: solo ? 0 : 6 }}>
+              <span style={{ fontSize: 10, letterSpacing: 1, fontFamily: "monospace", color: t.textMuted }}>
+                {solo ? "ON ITS OWN" : `BLOC OF ${g.size}`}
+              </span>
+              {!solo && (
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: hot ? t.negative : t.textMuted }}>
+                  {g.averageInternalCorrelation == null ? "—" : `r ${g.averageInternalCorrelation.toFixed(2)} internally`}
+                </span>
+              )}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+              {g.members.map(m => (
+                <span key={m} style={{
+                  fontSize: 10.5, fontFamily: "monospace",
+                  background: solo ? t.surfaceInset : t.surfaceInset,
+                  color: solo ? t.textMuted : t.text,
+                  padding: "3px 7px", borderRadius: 3,
+                }}>{shortSym(m)}</span>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      <div style={{ fontSize: 10, color: t.textFaint, lineHeight: 1.5 }}>{clusters.basis}.</div>
+    </div>
+  );
+}
+
+function RedundancyRows({ redundancies }) {
+  const t = useTheme();
+  const rows = redundancies?.pairs ?? [];
+  if (!rows.length) {
+    return (
+      <div style={{ padding: 16, fontSize: 11, color: t.textMuted, lineHeight: 1.6 }}>
+        No pair of holdings is correlated above {((redundancies?.threshold ?? 0.9) * 100).toFixed(0)}% with enough
+        combined weight to matter. Nothing here is a duplicate of anything else.
+      </div>
+    );
+  }
+  return (
+    <div style={{ padding: "4px 0 10px" }}>
+      {rows.map(p => (
+        <div key={`${p.a}|${p.b}`} style={{
+          display: "flex", alignItems: "center", gap: 12,
+          padding: "9px 16px", borderBottom: `1px solid ${t.borderSubtle}`,
+        }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 11.5, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {p.nameA ?? shortSym(p.a)} <span style={{ color: t.textFaint }}>+</span> {p.nameB ?? shortSym(p.b)}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, fontFamily: "monospace", marginTop: 2 }}>
+              {p.observations} days
+              {p.smallerLeg ? ` · smaller leg ${shortSym(p.smallerLeg)}` : ""}
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 13, fontFamily: "monospace", color: t.negative }}>{p.correlation.toFixed(2)}</div>
+            <div style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>
+              {p.combinedWeight == null ? <NoData compact reason="No priced value for these holdings" />
+                : `${(p.combinedWeight * 100).toFixed(1)}% of book`}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** The big number: how many independent bets the book actually contains,
+ *  drawn against the number of holdings so the gap is the thing you see. */
+function EffectiveBetsDial({ independence }) {
+  const t = useTheme();
+  if (!independence?.available || independence.effectiveBets == null) {
+    return (
+      <div style={{ padding: "18px 16px" }}>
+        <div style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace", marginBottom: 6 }}>
+          INDEPENDENT BETS
+        </div>
+        <NoData reason={independence?.reason ?? "Needs priced holdings and a shared window of stored history"} />
+      </div>
+    );
+  }
+  const n = independence.holdingsCount;
+  const bets = independence.effectiveBets;
+  const ratio = Math.max(0, Math.min(bets / Math.max(n, 1), 1));
+  const colour = ratio < 0.34 ? t.negative : ratio < 0.6 ? t.warning : t.positive;
+
+  return (
+    <div style={{ padding: "16px 16px 14px" }}>
+      <div style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace", marginBottom: 8 }}>
+        INDEPENDENT BETS
+      </div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 6, marginBottom: 10 }}>
+        <span style={{ fontSize: 34, fontWeight: 700, fontFamily: "monospace", color: colour, lineHeight: 1 }}>
+          {bets.toFixed(1)}
+        </span>
+        <span style={{ fontSize: 13, color: t.textMuted, fontFamily: "monospace" }}>of {n} holdings</span>
+      </div>
+      {/* One segment per holding, filled up to the effective count — the empty
+          segments are the holdings that are not buying you anything. */}
+      <div style={{ display: "flex", gap: 3, marginBottom: 8 }}>
+        {Array.from({ length: n }, (_, i) => {
+          const fill = Math.max(0, Math.min(bets - i, 1));
+          return (
+            <div key={i} style={{ flex: 1, height: 9, background: t.surfaceInset, borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ width: `${fill * 100}%`, height: "100%", background: colour }} />
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: t.textFaint, lineHeight: 1.5 }}>
+        {independence.diversificationRatio != null && (
+          <>Diversification ratio {independence.diversificationRatio.toFixed(2)} · </>
+        )}
+        {independence.observations} shared days
+        {independence.excluded?.length ? ` · ${independence.excluded.length} holding(s) excluded for short history` : ""}
+      </div>
+    </div>
+  );
+}
+
+function CorrelationReportPanel() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [window_, setWindow] = useState("1y");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(`${API}/correlation?window=${window_}`, { signal: AbortSignal.timeout(20000) });
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.error) { setError(json.error); setData(null); }
+        else { setData(json); setError(null); }
+      } catch (e) {
+        if (!cancelled) setError("Could not reach the correlation engine.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [window_]);
+
+  const windows = ["3m", "6m", "1y", "max"];
+
+  const header = (
+    <SectionHeader
+      title="CORRELATION"
+      subtitle="what actually moves together"
+      extra={
+        <div style={{ display: "flex", gap: 4 }}>
+          {windows.map(w => (
+            <button
+              key={w}
+              onClick={() => setWindow(w)}
+              style={{
+                fontSize: 10, fontFamily: "monospace", padding: "3px 8px",
+                background: w === window_ ? t.accentSoft : "transparent",
+                color: w === window_ ? t.accent : t.textMuted,
+                border: `1px solid ${w === window_ ? t.accent : t.border}`,
+                borderRadius: 3, cursor: "pointer",
+              }}
+            >{w}</button>
+          ))}
+        </div>
+      }
+    />
+  );
+
+  if (loading && !data) {
+    return <Panel>{header}<div style={{ padding: 24, textAlign: "center", color: t.textMuted, fontSize: 11 }}>Measuring…</div></Panel>;
+  }
+  if (error) {
+    return <Panel>{header}<div style={{ padding: 20, color: t.negative, fontSize: 11 }}>⚠ {error}</div></Panel>;
+  }
+  if (!data?.available) {
+    return (
+      <Panel>{header}
+        <div style={{ padding: 20, fontSize: 11, color: t.textMuted, lineHeight: 1.6 }}>
+          {data?.reason ?? "Nothing to correlate yet."}
+        </div>
+      </Panel>
+    );
+  }
+
+  const stressGap = data.stress?.available ? data.stress.averageGap : null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Panel>
+        {header}
+
+        {/* Headline row: the four things worth knowing before any detail */}
+        <div style={{
+          display: "grid", gridTemplateColumns: "1.3fr 1fr 1fr 1fr",
+          borderBottom: `1px solid ${t.border}`,
+        }}>
+          <div style={{ borderRight: `1px solid ${t.border}` }}>
+            <EffectiveBetsDial independence={data.independence} />
+          </div>
+          <div style={{ borderRight: `1px solid ${t.border}`, padding: "16px 14px" }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace", marginBottom: 8 }}>
+              AVERAGE PAIR
+            </div>
+            <div style={{ fontSize: 26, fontFamily: "monospace", fontWeight: 700, color: t.text, lineHeight: 1 }}>
+              {data.matrix?.averageCorrelation == null ? <NoData /> : data.matrix.averageCorrelation.toFixed(2)}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8 }}>
+              {data.coverage.pairsMeasured} of {data.coverage.pairsTotal} pairs measurable
+            </div>
+          </div>
+          <div style={{ borderRight: `1px solid ${t.border}`, padding: "16px 14px" }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace", marginBottom: 8 }}>
+              IN A SELLOFF
+            </div>
+            <div style={{
+              fontSize: 26, fontFamily: "monospace", fontWeight: 700, lineHeight: 1,
+              color: stressGap == null ? t.text
+                : stressGap > 0.15 ? t.negative
+                : stressGap < -0.05 ? t.positive : t.text,
+            }}>
+              {data.stress?.available && data.stress.averageStressed != null
+                ? data.stress.averageStressed.toFixed(2)
+                : <NoData reason={data.stress?.reason ?? "Not enough history"} />}
+            </div>
+            {/* A gap below zero means these holdings pulled apart in a selloff
+                rather than converging — the diversification actually held. That
+                is good news and is coloured as such, not left neutral. */}
+            <div style={{
+              fontSize: 10, marginTop: 8,
+              color: stressGap == null ? t.textFaint
+                : stressGap > 0.15 ? t.negative
+                : stressGap < -0.05 ? t.positive : t.textFaint,
+            }}>
+              {stressGap == null ? "—"
+                : `${stressGap > 0 ? "+" : ""}${stressGap.toFixed(2)} vs calm${stressGap < -0.05 ? " — held up" : stressGap > 0.15 ? " — converged" : ""}`}
+            </div>
+          </div>
+          <div style={{ padding: "16px 14px" }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace", marginBottom: 8 }}>
+              DUPLICATED
+            </div>
+            <div style={{
+              fontSize: 26, fontFamily: "monospace", fontWeight: 700, lineHeight: 1,
+              color: (data.redundancies?.count ?? 0) > 0 ? t.warning : t.text,
+            }}>
+              {data.redundancies?.weightsAvailable
+                ? `${((data.redundancies.weightInvolved ?? 0) * 100).toFixed(0)}%`
+                : (data.redundancies?.count ?? 0)}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8 }}>
+              {data.redundancies?.count ?? 0} redundant pair{(data.redundancies?.count ?? 0) === 1 ? "" : "s"}
+            </div>
+          </div>
+        </div>
+
+        <CorrelationHeatmap data={data.matrix} />
+
+        {data.unassessable?.length > 0 && (
+          <div style={{
+            padding: "9px 16px", borderTop: `1px solid ${t.borderSubtle}`,
+            fontSize: 10.5, color: t.warning, fontFamily: "monospace",
+          }}>
+            ⚠ {data.unassessable.map(shortSym).join(", ")} ha{data.unassessable.length === 1 ? "s" : "ve"} too
+            little overlapping history to correlate against anything — excluded from every figure above.
+          </div>
+        )}
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <Panel>
+          <SectionHeader title="WHEN IT MATTERS" subtitle="correlation on the worst days vs the rest" />
+          <StressPairBars stress={data.stress} />
+        </Panel>
+        <Panel>
+          <SectionHeader title="BLOCS" subtitle="holdings that move as one thing" />
+          <ClusterBlocs clusters={data.clusters} />
+        </Panel>
+      </div>
+
+      <Panel>
+        <SectionHeader
+          title="DUPLICATION"
+          subtitle="pairs you are arguably holding twice, ranked by how much of the book they cover"
+        />
+        <RedundancyRows redundancies={data.redundancies} />
+      </Panel>
+    </div>
+  );
+}
+
+// ============================================================
+// STATEMENT IMPORT
+// ============================================================
+//
+// The engine refuses to write on the first call, and the UI has to make that
+// visible rather than merely true: nothing here has an "import" button until a
+// preview has been read. The apply step sends the preview's own rows back, so
+// what gets written is what was on screen.
+
+function ImportPanel() {
+  const t = useTheme();
+  const [text, setText] = useState("");
+  const [mode, setMode] = useState("holdings");
+  const [preview, setPreview] = useState(null);
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [dateOrder, setDateOrder] = useState("");
+  const [updateExisting, setUpdateExisting] = useState(false);
+
+  // keepResult is set when the refresh follows an apply: the whole point of
+  // that refresh is to show the new state next to the confirmation of what was
+  // just written, and clearing the result first makes the import look like it
+  // did nothing.
+  async function runPreview(orderOverride, { keepResult = false } = {}) {
+    setBusy(true);
+    if (!keepResult) setResult(null);
+    try {
+      const res = await fetch(`${API}/import/preview`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text, mode,
+          dateOrder: (orderOverride ?? dateOrder) || null,
+        }),
+      });
+      setPreview(await res.json());
+    } catch (e) {
+      setPreview({ available: false, reason: "Could not reach the import engine." });
+    } finally { setBusy(false); }
+  }
+
+  async function runApply() {
+    if (!preview?.available) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API}/import/apply`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: preview.rows, mode, updateExisting }),
+      });
+      setResult(await res.json());
+      await runPreview(undefined, { keepResult: true });
+    } catch (e) {
+      setResult({ applied: 0, reason: "The request failed." });
+    } finally { setBusy(false); }
+  }
+
+  function onFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { setText(String(r.result ?? "")); setPreview(null); setResult(null); };
+    r.readAsText(f);
+  }
+
+  const statusColour = s => s === "error" ? t.negative : s === "warning" ? t.warning : t.positive;
+  const counts = preview?.counts;
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="IMPORT A STATEMENT"
+        subtitle="paste or open a broker CSV — nothing is written until you say so"
+        extra={
+          <div style={{ display: "flex", gap: 4 }}>
+            {["holdings", "transactions"].map(m => (
+              <button key={m} onClick={() => { setMode(m); setPreview(null); setResult(null); }} style={{
+                fontSize: 10, fontFamily: "monospace", padding: "3px 8px",
+                background: m === mode ? t.accentSoft : "transparent",
+                color: m === mode ? t.accent : t.textMuted,
+                border: `1px solid ${m === mode ? t.accent : t.border}`,
+                borderRadius: 3, cursor: "pointer",
+              }}>{m}</button>
+            ))}
+          </div>
+        }
+      />
+
+      <div style={{ padding: "14px 18px" }}>
+        <div style={{ display: "flex", gap: 10, marginBottom: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <input id="import-file" type="file" accept=".csv,.txt,.tsv" onChange={onFile}
+            style={{ fontSize: 11, color: t.textMuted }} />
+          <span style={{ fontSize: 10.5, color: t.textFaint }}>or paste below</span>
+        </div>
+
+        <textarea
+          id="import-text"
+          value={text}
+          onChange={e => { setText(e.target.value); setPreview(null); setResult(null); }}
+          placeholder={"Stock,Units held,Price,Account Type\nSHEL.L,1000,27.50,ISA"}
+          spellCheck={false}
+          style={{
+            width: "100%", minHeight: 110, resize: "vertical",
+            background: t.surfaceInset, color: t.textSecondary,
+            border: `1px solid ${t.border}`, borderRadius: 4,
+            padding: 10, fontFamily: "monospace", fontSize: 11.5, lineHeight: 1.5,
+          }}
+        />
+
+        <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <button onClick={() => runPreview()} disabled={busy || !text.trim()} style={{
+            fontSize: 11, fontFamily: "monospace", padding: "6px 14px",
+            background: "transparent", color: text.trim() ? t.accent : t.textFaint,
+            border: `1px solid ${text.trim() ? t.accent : t.border}`,
+            borderRadius: 3, cursor: text.trim() ? "pointer" : "default",
+          }}>{busy ? "reading…" : "preview"}</button>
+
+          {preview?.available && (
+            <>
+              <button onClick={runApply} disabled={busy || !counts || counts.total === counts.failed} style={{
+                fontSize: 11, fontFamily: "monospace", padding: "6px 14px",
+                background: t.accentSoft, color: t.accent,
+                border: `1px solid ${t.accent}`, borderRadius: 3, cursor: "pointer",
+              }}>import {counts.total - counts.failed} row{counts.total - counts.failed === 1 ? "" : "s"}</button>
+
+              {mode === "holdings" && (
+                <label style={{ fontSize: 10.5, color: t.textMuted, display: "flex", alignItems: "center", gap: 5 }}>
+                  <input id="import-update" type="checkbox" checked={updateExisting}
+                    onChange={e => setUpdateExisting(e.target.checked)} />
+                  update positions I already hold
+                </label>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* A date column that could be read either way blocks everything until
+            the reader settles it. The engine will not pick one. */}
+        {preview?.available && ["ambiguous", "conflicting"].includes(preview.dateOrder) && (
+          <div style={{
+            marginTop: 12, padding: "10px 12px", borderRadius: 4,
+            border: `1px solid ${t.warning}66`, background: `${t.warning}11`,
+          }}>
+            <div style={{ fontSize: 11.5, color: t.warning, marginBottom: 7 }}>
+              Every date in this file could be read day-first or month-first, and nothing in the
+              column settles it. Choose, and nothing is guessed on your behalf.
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {[["dmy", "day first (03/04 = 3 April)"], ["mdy", "month first (03/04 = 4 March)"]].map(([v, label]) => (
+                <button key={v} onClick={() => { setDateOrder(v); runPreview(v); }} style={{
+                  fontSize: 10.5, fontFamily: "monospace", padding: "4px 10px",
+                  background: "transparent", color: t.text,
+                  border: `1px solid ${t.borderStrong}`, borderRadius: 3, cursor: "pointer",
+                }}>{label}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {preview && !preview.available && (
+          <div style={{ marginTop: 12, fontSize: 11.5, color: t.negative, lineHeight: 1.6 }}>
+            ⚠ {preview.reason}
+            {preview.hint && <div style={{ color: t.textMuted, marginTop: 4 }}>{preview.hint}</div>}
+          </div>
+        )}
+
+        {preview?.available && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ display: "flex", gap: 14, fontSize: 10.5, color: t.textMuted, fontFamily: "monospace", marginBottom: 8, flexWrap: "wrap" }}>
+              <span>{counts.total} rows</span>
+              <span style={{ color: t.positive }}>{counts.ok} clean</span>
+              <span style={{ color: t.warning }}>{counts.warned} with warnings</span>
+              <span style={{ color: t.negative }}>{counts.failed} unusable</span>
+              <span>{counts.new} new to the portfolio</span>
+              <span style={{ color: t.textFaint }}>header on line {preview.headerLine} · {preview.delimiter}-separated</span>
+            </div>
+
+            <div style={{ maxHeight: 340, overflowY: "auto", border: `1px solid ${t.border}`, borderRadius: 4 }}>
+              {preview.rows.map(r => (
+                <div key={r.row} style={{
+                  padding: "8px 11px", borderBottom: `1px solid ${t.borderSubtle}`,
+                  background: r.status === "error" ? `${t.negative}0f` : "transparent",
+                }}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace", width: 30 }}>{r.row}</span>
+                    <span style={{ fontSize: 8, color: statusColour(r.status) }}>●</span>
+                    <span style={{ fontSize: 11.5, color: t.text, fontFamily: "monospace", minWidth: 80 }}>{r.symbol ?? "—"}</span>
+                    <span style={{ fontSize: 11, color: t.textSecondary, fontFamily: "monospace" }}>
+                      {r.quantity ?? "—"} @ {r.price == null ? "—" : r.price}
+                      {r.priceDerived ? " (from value)" : ""}
+                    </span>
+                    {r.date && <span style={{ fontSize: 10.5, color: t.textMuted, fontFamily: "monospace" }}>{r.date}</span>}
+                    {r.side && <span style={{ fontSize: 10.5, color: t.textMuted }}>{r.side}</span>}
+                    {r.existing && (
+                      <span style={{ fontSize: 9.5, color: t.info, border: `1px solid ${t.info}55`, borderRadius: 2, padding: "1px 5px" }}>
+                        already held
+                      </span>
+                    )}
+                  </div>
+                  {r.issues?.map((i, k) => (
+                    <div key={k} style={{
+                      fontSize: 10.5, marginTop: 4, marginLeft: 40, lineHeight: 1.5,
+                      color: i.level === "error" ? t.negative : t.warning,
+                    }}>{i.message}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 9, lineHeight: 1.6 }}>
+              {preview.note} Holdings missing from the file are never removed — a statement not
+              mentioning a position is not evidence it was sold.
+            </div>
+          </div>
+        )}
+
+        {result && (
+          <div style={{
+            marginTop: 14, padding: "11px 13px", borderRadius: 4,
+            border: `1px solid ${result.applied > 0 ? t.accent : t.border}`,
+            background: result.applied > 0 ? t.accentSoft : t.surfaceAlt,
+          }}>
+            <div style={{ fontSize: 12, color: result.applied > 0 ? t.accent : t.textMuted }}>
+              {result.applied > 0
+                ? `Wrote ${result.applied} row${result.applied === 1 ? "" : "s"}.`
+                : (result.reason ?? "Nothing was written.")}
+            </div>
+            {result.updated?.length > 0 && (
+              <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 6, lineHeight: 1.6 }}>
+                {result.updated.map(u => `${u.symbol}: ${u.from.qty} → ${u.to.qty}`).join(" · ")}
+              </div>
+            )}
+            {result.skippedRows?.length > 0 && (
+              <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 6, lineHeight: 1.6 }}>
+                Skipped: {result.skippedRows.map(s => `${s.symbol} (${s.reason})`).join(" · ")}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+// ============================================================
+// REPORTS
+// ============================================================
+
+function ReportsPage() {
+  const t = useTheme();
+  const [list, setList] = useState(null);
+  const [open, setOpen] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    try {
+      const res = await fetch(`${API}/reports`);
+      const j = await res.json();
+      setList(j.reports ?? []);
+    } catch (e) { setList([]); }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function generate(period) {
+    setBusy(true);
+    try {
+      await fetch(`${API}/reports/generate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ period }),
+      });
+      await load();
+    } finally { setBusy(false); }
+  }
+
+  async function view(id) {
+    const res = await fetch(`${API}/reports/one?id=${id}`);
+    setOpen(await res.json());
+  }
+
+  async function remove(id) {
+    await fetch(`${API}/reports?id=${id}`, { method: "DELETE" });
+    if (open?.id === id) setOpen(null);
+    await load();
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <div style={{ fontSize: 16, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>REPORTS</div>
+        <div style={{ fontSize: 11, color: t.textMuted, marginTop: 2 }}>
+          Written automatically once a period ends, and kept so last month's version is still
+          there when you want to compare.
+        </div>
+      </div>
+
+      <Panel>
+        <SectionHeader
+          title="ARCHIVE"
+          subtitle={list == null ? "loading…" : `${list.length} report${list.length === 1 ? "" : "s"}`}
+          extra={
+            <div style={{ display: "flex", gap: 4 }}>
+              {["weekly", "monthly", "quarterly"].map(p => (
+                <button key={p} onClick={() => generate(p)} disabled={busy} style={{
+                  fontSize: 10, fontFamily: "monospace", padding: "3px 8px",
+                  background: "transparent", color: busy ? t.textFaint : t.accent,
+                  border: `1px solid ${busy ? t.border : t.accent}`, borderRadius: 3,
+                  cursor: busy ? "default" : "pointer",
+                }}>build {p}</button>
+              ))}
+            </div>
+          }
+        />
+        {list == null ? (
+          <div style={{ padding: 22, textAlign: "center", color: t.textMuted, fontSize: 11.5 }}>Loading…</div>
+        ) : list.length === 0 ? (
+          <div style={{ padding: 18, fontSize: 11.5, color: t.textMuted, lineHeight: 1.6 }}>
+            No reports yet. One is written automatically after each period ends — or build one now
+            with the buttons above.
+          </div>
+        ) : (
+          <div style={{ padding: "4px 0 8px" }}>
+            {list.map(r => (
+              <div key={r.id} style={{
+                display: "flex", alignItems: "center", gap: 12,
+                padding: "9px 18px", borderBottom: `1px solid ${t.borderSubtle}`,
+              }}>
+                <span style={{ fontSize: 12, color: t.text, fontFamily: "monospace", width: 92 }}>{r.periodKey}</span>
+                <span style={{ fontSize: 10.5, color: t.textMuted, width: 76 }}>{r.period}</span>
+                <span style={{ fontSize: 10.5, color: t.textFaint, flex: 1, fontFamily: "monospace" }}>
+                  {r.from} → {r.to}
+                </span>
+                <button onClick={() => view(r.id)} style={{
+                  fontSize: 10, fontFamily: "monospace", padding: "3px 10px",
+                  background: "transparent", color: t.accent,
+                  border: `1px solid ${t.accent}`, borderRadius: 3, cursor: "pointer",
+                }}>open</button>
+                <AlertButton danger onClick={() => remove(r.id)}>DELETE</AlertButton>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      {open && (
+        <Panel>
+          <SectionHeader
+            title={`${open.periodKey}`}
+            subtitle={`${open.from} to ${open.to} · generated ${open.generatedAt?.slice(0, 10)}`}
+            extra={
+              <button onClick={() => setOpen(null)} style={{
+                fontSize: 10, fontFamily: "monospace", padding: "3px 10px",
+                background: "transparent", color: t.textMuted,
+                border: `1px solid ${t.border}`, borderRadius: 3, cursor: "pointer",
+              }}>close</button>
+            }
+          />
+          {/* The stored document is rendered in a sandboxed frame rather than
+              injected into this page: it is a standalone file with its own
+              styling, and it should look here exactly as it does when opened
+              from disk. */}
+          <iframe
+            title={`report-${open.id}`}
+            sandbox=""
+            srcDoc={open.html ?? "<p>This report has no stored document.</p>"}
+            style={{ width: "100%", height: 760, border: "none", borderRadius: "0 0 4px 4px", background: "#fff" }}
+          />
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// RETURN ATTRIBUTION
+// ============================================================
+//
+// Effects here are measured against the portfolio's own average, not against
+// an index — a Brinson attribution would need the benchmark's sector weights
+// and sector returns as a time series, which no free source publishes. The
+// labelling has to carry that distinction everywhere, because "allocation
+// effect" means something specific to anyone who has seen the term before, and
+// letting them assume it is index-relative would be the misleading part.
+
+/** A bar that grows left or right from a centre line. Contributions are
+ *  signed, and a chart that only draws the positive half hides half the
+ *  answer. */
+function SignedBar({ value, max, color, height = 9 }) {
+  const t = useTheme();
+  const m = max || 1;
+  const half = Math.min(Math.abs(value) / m, 1) / 2 * 100;
+  return (
+    <div style={{ flex: 1, height, background: t.surfaceInset, borderRadius: 2, position: "relative", overflow: "hidden" }}>
+      <div style={{
+        position: "absolute", top: 1, bottom: 1,
+        left: value >= 0 ? "50%" : `${50 - half}%`,
+        width: `${Math.max(half, value === 0 ? 0 : 0.6)}%`,
+        background: color, borderRadius: 1,
+      }} />
+      <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: t.borderStrong }} />
+    </div>
+  );
+}
+
+const pctPP = v => `${v >= 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
+
+function ContributionRows({ holdings, limit = 12 }) {
+  const t = useTheme();
+  const rows = (holdings ?? []).slice(0, limit);
+  if (!rows.length) return <div style={{ padding: 18 }}><NoData reason="Nothing to decompose" /></div>;
+  const max = Math.max(...rows.map(h => Math.abs(h.contribution)), 1e-6);
+
+  return (
+    <div style={{ padding: "12px 18px 16px" }}>
+      {rows.map(h => (
+        <div key={h.symbol} style={{ marginBottom: 11 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+            <span style={{ fontSize: 11.5, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "62%" }}>
+              {h.name ?? h.symbol}
+              <span style={{ color: t.textFaint, marginLeft: 6, fontSize: 10, fontFamily: "monospace" }}>
+                {(h.averageWeight * 100).toFixed(1)}% avg
+              </span>
+            </span>
+            <span style={{
+              fontSize: 11.5, fontFamily: "monospace",
+              color: h.contribution >= 0 ? t.positive : t.negative,
+            }}>{pctPP(h.contribution)}</span>
+          </div>
+          <SignedBar value={h.contribution} max={max} color={h.contribution >= 0 ? t.positive : t.negative} />
+          {/* Selection is meaningful at this level even though it cancels at
+              group level: it says whether this holding beat the group it sits in. */}
+          <div style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace", marginTop: 3 }}>
+            {h.group} · {h.selection >= 0 ? "beat" : "lagged"} it by {Math.abs(h.selection * 100).toFixed(2)}%
+          </div>
+        </div>
+      ))}
+      <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8, lineHeight: 1.5 }}>
+        Contribution to the total return, not each holding's own return — a big mover at
+        1% of the book contributes less than a small mover at 30%. The average weight is
+        shown so the two are distinguishable.
+      </div>
+    </div>
+  );
+}
+
+function GroupEffectRows({ groups }) {
+  const t = useTheme();
+  const rows = groups ?? [];
+  if (!rows.length) return <div style={{ padding: 18 }}><NoData reason="No groups to decompose" /></div>;
+  const max = Math.max(...rows.flatMap(g => [Math.abs(g.allocation), Math.abs(g.selection)]), 1e-6);
+
+  return (
+    <div style={{ padding: "4px 0 10px" }}>
+      {rows.map(g => (
+        <div key={g.group} style={{ padding: "10px 18px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 7 }}>
+            <span style={{ fontSize: 11.5, color: t.text }}>
+              {g.group}
+              <span style={{ color: t.textFaint, marginLeft: 6, fontSize: 10, fontFamily: "monospace" }}>
+                {g.holdingCount} holding{g.holdingCount === 1 ? "" : "s"} · {(g.averageWeight * 100).toFixed(0)}%
+              </span>
+            </span>
+            <span style={{
+              fontSize: 11.5, fontFamily: "monospace",
+              color: g.contribution >= 0 ? t.positive : t.negative,
+            }}>{pctPP(g.contribution)}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+            <span style={{ width: 62, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>allocation</span>
+            <SignedBar value={g.allocation} max={max} color={t.info} height={7} />
+            <span style={{ width: 52, fontSize: 9.5, fontFamily: "monospace", color: t.textMuted, textAlign: "right" }}>
+              {pctPP(g.allocation)}
+            </span>
+          </div>
+          {/* Selection is shown as a spread, not a sum. Within a group the
+              selection effects necessarily cancel — the group return IS the
+              weighted average of its members — so a summed figure would read
+              0.00% for every group forever. The spread says how much the
+              picking moved between them, which is the real content. */}
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 62, fontSize: 9.5, color: t.textFaint, fontFamily: "monospace" }}>picking</span>
+            <div style={{ flex: 1, height: 7, background: t.surfaceInset, borderRadius: 2, overflow: "hidden" }}>
+              <div style={{
+                width: `${Math.min((g.selectionSpread ?? 0) / max, 1) * 100}%`,
+                height: "100%", background: t.warning, borderRadius: 1,
+              }} />
+            </div>
+            <span style={{ width: 52, fontSize: 9.5, fontFamily: "monospace", color: t.textMuted, textAlign: "right" }}>
+              {g.holdingCount < 2 ? "—" : `±${((g.selectionSpread ?? 0) * 100).toFixed(2)}%`}
+            </span>
+          </div>
+        </div>
+      ))}
+      <div style={{ padding: "10px 18px 0", fontSize: 10, color: t.textFaint, lineHeight: 1.6 }}>
+        <strong style={{ color: t.textMuted }}>Allocation</strong> — this group did better or worse than
+        the portfolio average, scaled by how much was in it. Sums to zero across groups.{" "}
+        <strong style={{ color: t.textMuted }}>Picking</strong> — how much moved between holdings
+        inside the group, from the laggards to the leaders. Both are measured against this
+        portfolio, not against an index.
+      </div>
+    </div>
+  );
+}
+
+function AttributionPanel() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [grouping, setGrouping] = useState("sector");
+  const [error, setError] = useState(null);
+  const [note, setNote] = useState(null);
+  const [noteLoading, setNoteLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setData(null);
+    (async () => {
+      try {
+        const res = await fetch(`${API}/attribution?grouping=${grouping}`, { signal: AbortSignal.timeout(25000) });
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.error) setError(json.error); else { setData(json); setError(null); }
+      } catch (e) {
+        if (!cancelled) setError("Could not reach the attribution engine.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [grouping]);
+
+  async function writeNote() {
+    setNoteLoading(true);
+    try {
+      const res = await fetch(`${API}/attribution/explain`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ grouping }),
+      });
+      setNote(await res.json());
+    } catch (e) {
+      setNote({ available: false, reason: "The request failed." });
+    } finally {
+      setNoteLoading(false);
+    }
+  }
+
+  const groupings = ["sector", "geography", "wrapper", "currency", "account"];
+
+  const header = (
+    <SectionHeader
+      title="ATTRIBUTION"
+      subtitle="where the return came from"
+      extra={
+        <div style={{ display: "flex", gap: 4 }}>
+          {groupings.map(g => (
+            <button key={g} onClick={() => setGrouping(g)} style={{
+              fontSize: 10, fontFamily: "monospace", padding: "3px 8px",
+              background: g === grouping ? t.accentSoft : "transparent",
+              color: g === grouping ? t.accent : t.textMuted,
+              border: `1px solid ${g === grouping ? t.accent : t.border}`,
+              borderRadius: 3, cursor: "pointer",
+            }}>{g}</button>
+          ))}
+        </div>
+      }
+    />
+  );
+
+  if (error) return <Panel>{header}<div style={{ padding: 20, color: t.negative, fontSize: 11.5 }}>⚠ {error}</div></Panel>;
+  if (!data) return <Panel>{header}<div style={{ padding: 26, textAlign: "center", color: t.textMuted, fontSize: 11.5 }}>Decomposing…</div></Panel>;
+  if (!data.available) {
+    return <Panel>{header}<div style={{ padding: 20, fontSize: 11.5, color: t.textMuted }}>{data.reason}</div></Panel>;
+  }
+
+  const b = data.benchmark;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
+      <Panel>
+        {header}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", borderBottom: `1px solid ${t.border}` }}>
+          <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>TOTAL RETURN</div>
+            <div style={{
+              fontSize: 26, fontWeight: 700, fontFamily: "monospace", lineHeight: 1,
+              color: data.totalReturn >= 0 ? t.positive : t.negative,
+            }}>{pctPP(data.totalReturn)}</div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7 }}>{data.days} trading days</div>
+          </div>
+          <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>
+              VS {b?.available ? b.symbol.replace("^", "") : "BENCHMARK"}
+            </div>
+            <div style={{
+              fontSize: 26, fontWeight: 700, fontFamily: "monospace", lineHeight: 1,
+              color: !b?.available ? t.text : b.excess >= 0 ? t.positive : t.negative,
+            }}>
+              {b?.available ? pctPP(b.excess) : <NoData reason={b?.reason ?? "No benchmark history"} />}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7 }}>
+              {b?.available ? `index ${pctPP(b.benchmarkReturn)}` : "—"}
+            </div>
+          </div>
+          <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>BEST</div>
+            <div style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: t.positive, lineHeight: 1 }}>
+              {data.winners[0] ? pctPP(data.winners[0].contribution) : <NoData />}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {data.winners[0]?.name ?? "nothing positive"}
+            </div>
+          </div>
+          <div style={{ padding: "16px 18px" }}>
+            <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>WORST</div>
+            <div style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: t.negative, lineHeight: 1 }}>
+              {data.losers[0] ? pctPP(data.losers[0].contribution) : <NoData />}
+            </div>
+            <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {data.losers[0]?.name ?? "nothing negative"}
+            </div>
+          </div>
+        </div>
+        <div style={{ padding: "9px 18px", fontSize: 10, color: t.textFaint, lineHeight: 1.55 }}>
+          {data.basis} {data.reconciles
+            ? "Contributions reconcile to the total exactly."
+            : "⚠ Contributions do not reconcile to the total — treat the split with caution."}
+        </div>
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <Panel>
+          <SectionHeader title="BY HOLDING" subtitle="contribution to the total return" />
+          <ContributionRows holdings={data.holdings} />
+        </Panel>
+        <Panel>
+          <SectionHeader title={`BY ${grouping.toUpperCase()}`} subtitle="split into allocation and selection" />
+          <GroupEffectRows groups={data.groups} />
+        </Panel>
+      </div>
+
+      <Panel>
+        <SectionHeader
+          title="WHAT THIS SAYS"
+          subtitle="written from the figures above, and nothing else"
+          extra={
+            <button onClick={writeNote} disabled={noteLoading} style={{
+              fontSize: 10, fontFamily: "monospace", padding: "4px 10px",
+              background: "transparent", color: noteLoading ? t.textFaint : t.accent,
+              border: `1px solid ${noteLoading ? t.border : t.accent}`,
+              borderRadius: 3, cursor: noteLoading ? "default" : "pointer",
+            }}>{noteLoading ? "writing…" : note ? "rewrite" : "write a note"}</button>
+          }
+        />
+        <div style={{ padding: "14px 18px" }}>
+          {!note && (
+            <div style={{ fontSize: 11, color: t.textMuted, lineHeight: 1.6 }}>
+              Not written yet. The note costs an API call, so it is not generated automatically
+              with the numbers.
+            </div>
+          )}
+          {note && !note.available && (
+            <div style={{ fontSize: 11, color: t.textMuted, lineHeight: 1.6 }}>{note.reason}</div>
+          )}
+          {note?.available && (
+            <>
+              <div style={{ fontSize: 12.5, color: t.textSecondary, lineHeight: 1.7, whiteSpace: "pre-wrap" }}>
+                {note.text}
+              </div>
+              <div style={{ fontSize: 10, color: t.textFaint, marginTop: 12 }}>{note.basis}</div>
+            </>
+          )}
+        </div>
+      </Panel>
+
+      <div style={{ fontSize: 10, color: t.textFaint, lineHeight: 1.6, padding: "0 2px" }}>
+        {data.caveat}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PORTFOLIO X-RAY
+// ============================================================
+//
+// Every weight this panel shows is a floor, because fund compositions publish
+// roughly a top ten and the rest of each fund is not disclosed anywhere free.
+// The UI has to carry that or it lies by omission: the coverage bar leads,
+// every figure is prefixed "at least", and the undisclosed remainder is drawn
+// rather than described, so a reader cannot mistake a partial picture for a
+// complete one. Scaling the disclosed weights up to fill the gap would make
+// all of this look much better and would be false.
+
+function CoverageBar({ coverage }) {
+  const t = useTheme();
+  const seen = Math.max(0, Math.min(coverage?.seen ?? 0, 1));
+  const unseen = Math.max(0, 1 - seen);
+  return (
+    <div style={{ padding: "16px 18px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+        <span style={{ fontSize: 10, letterSpacing: 1.4, color: t.textMuted, fontFamily: "monospace" }}>
+          HOW MUCH OF THE BOOK CAN BE SEEN THROUGH
+        </span>
+        <span style={{ fontSize: 22, fontWeight: 700, fontFamily: "monospace", color: seen > 0.5 ? t.accent : t.warning }}>
+          {(seen * 100).toFixed(1)}%
+        </span>
+      </div>
+      <div style={{ display: "flex", height: 18, borderRadius: 3, overflow: "hidden", border: `1px solid ${t.border}` }}>
+        <div style={{ width: `${seen * 100}%`, background: t.accent }} />
+        <div style={{
+          width: `${unseen * 100}%`,
+          background: `repeating-linear-gradient(45deg, ${t.surfaceAlt} 0px, ${t.surfaceAlt} 4px, ${t.surfaceInset} 4px, ${t.surfaceInset} 8px)`,
+        }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginTop: 7, fontSize: 10, color: t.textFaint }}>
+        <span>disclosed holdings</span>
+        <span>{(unseen * 100).toFixed(1)}% not published by the funds</span>
+      </div>
+      <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 10, lineHeight: 1.55 }}>
+        Funds publish roughly their ten largest holdings. Everything below is what those
+        disclosures add up to, so each figure is a floor — the true exposure can only be higher.
+        {coverage?.positionsUnseen > 0 && (coverage.positionsUnseen === 1
+          ? " 1 holding publishes nothing at all."
+          : ` ${coverage.positionsUnseen} holdings publish nothing at all.`)}
+      </div>
+    </div>
+  );
+}
+
+/** Underlying companies as horizontal bars. Route count is drawn as pips
+ *  beside the bar, because "arrives three different ways" is the finding. */
+function UnderlyingBars({ underlyings, limit = 14 }) {
+  const t = useTheme();
+  const rows = (underlyings ?? []).slice(0, limit);
+  if (!rows.length) return <div style={{ padding: 18 }}><NoData reason="Nothing could be looked through" /></div>;
+  const max = rows[0].weight || 1;
+
+  return (
+    <div style={{ padding: "12px 18px 16px" }}>
+      {rows.map(u => (
+        <div key={u.key} style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+            <span style={{ fontSize: 11.5, color: t.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "70%" }}>
+              {u.name ?? u.symbol}
+              {u.viaCount > 1 && (
+                <span style={{
+                  marginLeft: 7, fontSize: 9.5, fontFamily: "monospace",
+                  color: t.warning, border: `1px solid ${t.warning}66`,
+                  borderRadius: 2, padding: "1px 4px",
+                }}>×{u.viaCount}</span>
+              )}
+            </span>
+            <span style={{ fontSize: 11.5, fontFamily: "monospace", color: t.textSecondary }}>
+              {u.exact ? "" : "≥"}{(u.weight * 100).toFixed(2)}%
+            </span>
+          </div>
+          <div style={{ height: 8, background: t.surfaceInset, borderRadius: 2, overflow: "hidden", display: "flex" }}>
+            {/* Segmented by route, so a name that is one big holding reads
+                differently from one assembled out of four small ones. */}
+            {u.via.map((v, i) => (
+              <div key={v.symbol + i}
+                title={`${v.name ?? v.symbol}: ${(v.contribution * 100).toFixed(2)}%`}
+                style={{
+                  width: `${(v.contribution / max) * 100}%`,
+                  height: "100%",
+                  background: i % 2 === 0 ? t.accent : t.info,
+                  borderRight: u.via.length > 1 ? `1px solid ${t.appBg}` : "none",
+                }} />
+            ))}
+          </div>
+        </div>
+      ))}
+      <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8, lineHeight: 1.5 }}>
+        ≥ marks a floor from partial fund disclosure. Bars are split by which holding each
+        part arrived through — hover a segment to see it.
+      </div>
+    </div>
+  );
+}
+
+function OverlapList({ overlaps }) {
+  const t = useTheme();
+  const rows = (overlaps ?? []).slice(0, 8);
+  if (!rows.length) {
+    return (
+      <div style={{ padding: 18, fontSize: 11, color: t.textMuted, lineHeight: 1.6 }}>
+        No company is reached through more than one holding, among the holdings that
+        publish their contents.
+      </div>
+    );
+  }
+  return (
+    <div style={{ padding: "4px 0 8px" }}>
+      {rows.map(o => (
+        <div key={o.key} style={{ padding: "10px 18px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+            <span style={{ fontSize: 11.5, color: t.text }}>{o.name ?? o.symbol}</span>
+            <span style={{ fontSize: 11.5, fontFamily: "monospace", color: t.warning }}>
+              ≥{(o.weight * 100).toFixed(2)}%
+            </span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+            {o.via.map((v, i) => (
+              <span key={v.symbol + i} style={{
+                fontSize: 9.5, fontFamily: "monospace", background: t.surfaceInset,
+                color: t.textMuted, padding: "2px 6px", borderRadius: 3,
+              }}>
+                {v.name ?? v.symbol} {(v.contribution * 100).toFixed(2)}%
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SectorBlend({ sectors }) {
+  const t = useTheme();
+  if (!sectors?.available) {
+    return <div style={{ padding: 18 }}><NoData reason={sectors?.reason ?? "No holding publishes a sector split"} /></div>;
+  }
+  const rows = sectors.sectors.slice(0, 12);
+  const max = Math.max(...rows.map(r => r.weightOfBook), 0.0001);
+  const palette = [t.accent, t.info, t.warning, t.positive, "#a78bfa", "#f472b6", "#38bdf8", "#facc15"];
+
+  return (
+    <div style={{ padding: "12px 18px 16px" }}>
+      {rows.map((s, i) => (
+        <div key={s.sector} style={{ marginBottom: 9 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+            <span style={{ fontSize: 11, color: t.textSecondary, textTransform: "capitalize" }}>{s.sector}</span>
+            <span style={{ fontSize: 11, fontFamily: "monospace", color: t.textMuted }}>
+              {(s.weightOfBook * 100).toFixed(1)}%
+            </span>
+          </div>
+          <div style={{ height: 7, background: t.surfaceInset, borderRadius: 2, overflow: "hidden" }}>
+            <div style={{ width: `${(s.weightOfBook / max) * 100}%`, height: "100%", background: palette[i % palette.length] }} />
+          </div>
+        </div>
+      ))}
+      <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8, lineHeight: 1.5 }}>
+        Percentages are of the whole book. {sectors.basis}
+      </div>
+    </div>
+  );
+}
+
+function XRayTab() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/xray`, { signal: AbortSignal.timeout(20000) });
+        const json = await res.json();
+        if (cancelled) return;
+        if (json.error) { setError(json.error); } else { setData(json); setError(null); }
+      } catch (e) {
+        if (!cancelled) setError("Could not reach the X-ray engine.");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  if (error) return <Panel><div style={{ padding: 20, color: t.negative, fontSize: 12 }}>⚠ {error}</div></Panel>;
+  if (!data) return <Panel><div style={{ padding: 26, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Looking through the funds…</div></Panel>;
+  if (!data.available) {
+    return <Panel><div style={{ padding: 20, fontSize: 11.5, color: t.textMuted }}>{data.reason}</div></Panel>;
+  }
+
+  const c = data.concentration;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, marginTop: 16 }}>
+      <Panel>
+        <SectionHeader title="X-RAY" subtitle="what you actually own, rather than what you bought" />
+        <CoverageBar coverage={data.coverage} />
+      </Panel>
+
+      {/* The contrast that justifies the whole tab */}
+      {c?.available && (
+        <Panel>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)" }}>
+            <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+              <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>YOU BOUGHT</div>
+              <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: t.text, lineHeight: 1 }}>{c.positionCount}</div>
+              <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7 }}>holdings</div>
+            </div>
+            <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+              <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>YOU OWN</div>
+              <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: t.accent, lineHeight: 1 }}>{c.distinctNames}</div>
+              <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7 }}>disclosed companies</div>
+            </div>
+            <div style={{ padding: "16px 18px", borderRight: `1px solid ${t.border}` }}>
+              <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>LARGEST COMPANY</div>
+              <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: t.text, lineHeight: 1 }}>
+                {c.largestName ? `≥${(c.largestName.weight * 100).toFixed(1)}%` : <NoData />}
+              </div>
+              <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {c.largestName?.name ?? "—"}
+              </div>
+            </div>
+            <div style={{ padding: "16px 18px" }}>
+              <div style={{ fontSize: 10, letterSpacing: 1.3, color: t.textMuted, fontFamily: "monospace", marginBottom: 7 }}>HELD TWICE OVER</div>
+              <div style={{
+                fontSize: 26, fontWeight: 700, fontFamily: "monospace", lineHeight: 1,
+                color: (data.overlaps?.length ?? 0) > 0 ? t.warning : t.text,
+              }}>{data.overlaps?.length ?? 0}</div>
+              <div style={{ fontSize: 10, color: t.textFaint, marginTop: 7 }}>via several holdings</div>
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.25fr 1fr", gap: 16 }}>
+        <Panel>
+          <SectionHeader title="WHAT YOU ACTUALLY HOLD" subtitle="largest underlying companies across every fund" />
+          <UnderlyingBars underlyings={data.underlyings} />
+        </Panel>
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <Panel>
+            <SectionHeader title="REACHED MORE THAN ONCE" subtitle="the same company, arriving several ways" />
+            <OverlapList overlaps={data.overlaps} />
+          </Panel>
+          <Panel>
+            <SectionHeader title="SECTORS, BLENDED" subtitle="through every fund that publishes a split" />
+            <SectorBlend sectors={data.sectors} />
+          </Panel>
+        </div>
+      </div>
+
+      {data.unseenPositions?.length > 0 && (
+        <Panel>
+          <SectionHeader title="COULD NOT BE SEEN THROUGH" subtitle="excluded from every figure above" />
+          <div style={{ padding: "10px 18px 14px" }}>
+            {data.unseenPositions.map(p => (
+              <div key={p.symbol} style={{
+                display: "flex", justifyContent: "space-between", gap: 12,
+                padding: "7px 0", borderBottom: `1px solid ${t.borderSubtle}`,
+              }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11.5, color: t.textSecondary }}>{p.name ?? p.symbol}</div>
+                  <div style={{ fontSize: 10, color: t.textFaint, marginTop: 2 }}>{p.note}</div>
+                </div>
+                <div style={{ fontSize: 11.5, fontFamily: "monospace", color: t.warning, whiteSpace: "nowrap" }}>
+                  {p.weight == null ? <NoData compact /> : `${(p.weight * 100).toFixed(1)}%`}
+                </div>
+              </div>
+            ))}
+          </div>
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+function RiskPage() {
+  const [risk, setRisk] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function load() {
+      try {
+        const res = await fetch(`${API}/risk`, { signal: AbortSignal.timeout(8000) });
+        const data = await res.json();
+        if (!cancelled) {
+          if (data.error) setError(data.error);
+          else { setRisk(data); setError(null); }
+        }
+      } catch (e) {
+        if (!cancelled) setError("Could not reach the risk engine at localhost:4001. Is npm start running?");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+    load();
+    const t = setInterval(load, 60000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  if (loading) {
+    return (
+      <div style={{ padding: 40, textAlign: "center", color: "#4a6080", fontSize: 12 }}>
+        Loading risk profile…
+      </div>
+    );
+  }
+
+  // The risk scorecard needs live prices to value the book. Correlation does
+  // not — it reads stored bars — so it is rendered alongside the failure rather
+  // than hidden behind it. Gating one engine's output on another engine's data
+  // requirements is how a page ends up blank while half of it had an answer.
+  if (error) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <Panel style={{ padding: 20 }}>
+          <div style={{ color: "#ff4757", fontSize: 12, marginBottom: 8 }}>⚠ {error}</div>
+          <div style={{ color: "#4a6080", fontSize: 11 }}>
+            The risk scorecard needs priced holdings. Correlation below reads stored price
+            history instead, so it still works.
+          </div>
+        </Panel>
+        <CorrelationReportPanel />
+      </div>
+    );
+  }
+
+  const varColor = risk.varInPounds.daily95 > risk.totalValue * 0.03 ? "#ff4757" : "#c8d6e8";
+  const ddColor = risk.drawdown?.stillUnderwater ? "#ffa502" : "#7a8ba0";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <div style={{ fontSize: 16, fontWeight: 700, color: "#e8f0fe", fontFamily: "monospace" }}>RISK</div>
+        <div style={{ fontSize: 11, color: "#4a6080", marginTop: 2 }}>
+          Computed from {risk.observations} trading days of stored history · {risk.coverage.analysed}/{risk.coverage.total} holdings analysed
+        </div>
+      </div>
+
+      {/* Top metrics strip */}
+      <Panel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)" }}>
+          <RiskMetric label="ANNUALISED VOL" value={`${risk.volatility.toFixed(1)}%`} />
+          <RiskMetric label="BETA VS S&P 500" value={risk.beta.toFixed(2)} sub={`α ${risk.alpha >= 0 ? "+" : ""}${risk.alpha.toFixed(1)}%`} />
+          <RiskMetric label="SHARPE" value={risk.sharpe.toFixed(2)} sub={`Sortino ${risk.sortino.toFixed(2)}`} />
+          <RiskMetric
+            label="VAR (95%, 1-DAY)"
+            value={`£${risk.varInPounds.daily95.toLocaleString()}`}
+            sub={`CVaR £${risk.varInPounds.cvarDaily.toLocaleString()}`}
+            color={varColor}
+          />
+          <RiskMetric
+            label="DRAWDOWN"
+            value={`${risk.drawdown?.max.toFixed(1)}%`}
+            sub={risk.drawdown?.stillUnderwater ? `still underwater (now ${risk.drawdown.current.toFixed(1)}%)` : "recovered"}
+            color={ddColor}
+          />
+        </div>
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16 }}>
+
+        {/* Risk contribution vs weight */}
+        <Panel>
+          <SectionHeader title="RISK CONTRIBUTION vs WEIGHT" subtitle="where risk actually comes from" />
+          {risk.riskContributions.map(r => <RiskContributionRow key={r.symbol} row={r} />)}
+        </Panel>
+
+        {/* Diversification + concentration */}
+        <Panel>
+          <SectionHeader title="DIVERSIFICATION" />
+          <div style={{ padding: 16 }}>
+            <GaugeBar label="Average pairwise correlation" value={risk.diversification.averageCorrelation * 100} max={100} color="#3d8bff" format={v => (v / 100).toFixed(2)} />
+            <GaugeBar label="Diversification ratio" value={Math.min(risk.diversification.diversificationRatio * 50, 100)} max={100} color="#00d4aa" format={() => risk.diversification.diversificationRatio.toFixed(2)} />
+            <GaugeBar label="Effective holdings" value={Math.min(risk.diversification.effectiveHoldings * 20, 100)} max={100} color="#ffa502" format={() => risk.diversification.effectiveHoldings.toFixed(2)} />
+          </div>
+          <div style={{ borderTop: "1px solid #1a1f2e", padding: 16 }}>
+            <div style={{ fontSize: 10, color: "#4a6080", marginBottom: 10, letterSpacing: 1 }}>CONCENTRATION</div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6 }}>
+              <span style={{ color: "#7a8ba0" }}>Largest position</span>
+              <span style={{ fontFamily: "monospace", color: "#c8d6e8" }}>{risk.concentration.largestPosition.toFixed(1)}%</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 6 }}>
+              <span style={{ color: "#7a8ba0" }}>Top 3 positions</span>
+              <span style={{ fontFamily: "monospace", color: "#c8d6e8" }}>{risk.concentration.top3.toFixed(1)}%</span>
+            </div>
+            {/* Null when nothing could be looked through, which is a different
+                finding from zero exposure and must not render as one. */}
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
+              <span style={{ color: "#7a8ba0" }} title={risk.concentration.lookThrough?.basis}>
+                North America, looked through
+              </span>
+              {risk.concentration.lookThroughUS == null ? (
+                <NoData reason={risk.concentration.lookThrough?.reason ?? "Nothing could be looked through"} />
+              ) : (
+                <span style={{ fontFamily: "monospace", color: risk.concentration.lookThroughUS > 50 ? "#ffa502" : "#c8d6e8" }}>
+                  {risk.concentration.lookThroughUS.toFixed(1)}%
+                </span>
+              )}
+            </div>
+            {risk.concentration.lookThrough?.available && (
+              <div style={{ fontSize: 9.5, color: "#5a6b80", lineHeight: 1.5 }}>
+                of the {risk.concentration.lookThrough.coveragePct}% of the portfolio that could be seen
+                through. Listing venue, not revenue.
+              </div>
+            )}
+          </div>
+        </Panel>
+      </div>
+
+      {/* Correlation. Replaces the old matrix panel, which rendered
+          analytics.correlationMatrix — a grid built by slicing the last N bars
+          of each symbol and correlating them index-for-index. Two London
+          listings with different suspension histories do not line up that way,
+          so some of those cells compared different days to each other. The
+          engine behind this panel joins on date. */}
+      <CorrelationReportPanel />
+    </div>
+  );
+}
+
+// ============================================================
+// PORTFOLIO PAGE (v2) — live, editable, no PowerShell required
+// Reads and writes the real holdings table at :4001.
+// Adding a holding auto-syncs its price history server-side, so it becomes
+// visible to Risk / Optimiser / Backtest immediately rather than silently
+// being excluded until a manual sync is run.
+// ============================================================
+
+const API = API_BASE;
+
+const WRAPPERS = ["ISA", "SIPP", "GIA"];
+const SECTORS = ["Broad", "Tech", "Defence", "Gold", "EM", "Energy", "Financials", "Healthcare", "Property", "Other"];
+const GEOGRAPHIES = ["US", "UK", "Europe", "Global", "Japan", "Asia-Pacific", "India", "EM", "Other"];
+
+// `t` (a theme from useTheme()) is optional so pages not yet migrated to the
+// theme system keep the original dark input styling; migrated callers pass it.
+function fieldStyle(width, t) {
+  return {
+    width,
+    background: t ? t.surfaceInset : "#0d1220",
+    border: `1px solid ${t ? t.borderStrong : "#1e2940"}`,
+    color: t ? t.text : "#c8d6e8",
+    padding: "7px 9px", fontSize: 11, fontFamily: "monospace", borderRadius: 3, outline: "none",
+  };
+}
+
+function AddHoldingForm({ onAdded }) {
+  const t = useTheme();
+  const [form, setForm] = useState({
+    symbol: "", qty: "", avgPrice: "",
+    sector: "", geography: "", account: "Main", targetPct: "", isin: "",
+  });
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [detectedCcy, setDetectedCcy] = useState(null);
+  const [checkingCcy, setCheckingCcy] = useState(false);
+  const [livePrice, setLivePrice] = useState(null);
+
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+async function detectCurrency(symbol) {
+  if (!symbol.trim()) { setDetectedCcy(null); return; }
+  setCheckingCcy(true);
+  try {
+    const res = await fetch(`${API}/quote?symbol=${encodeURIComponent(symbol.trim().toUpperCase())}`);
+    const data = await res.json();
+    const raw = data.rawCurrency;
+    setDetectedCcy(raw === "GBp" ? "GBP" : raw ?? null);
+    setLivePrice(typeof data.price === "number" ? data.price : null);
+  } catch {
+    setDetectedCcy(null);
+    setLivePrice(null);
+  } finally {
+    setCheckingCcy(false);
+  }
+}
+
+  async function submit() {
+    if (!form.symbol.trim()) { setMsg({ type: "error", text: "Symbol is required." }); return; }
+    if (!form.qty || Number(form.qty) <= 0) { setMsg({ type: "error", text: "Quantity must be greater than zero." }); return; }
+    if (!form.sector) { setMsg({ type: "error", text: "Please select a sector." }); return; }
+    if (!form.geography) { setMsg({ type: "error", text: "Please select a geography." }); return; }
+    if (form.isin.trim() && !/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(form.isin.trim().toUpperCase())) {
+      setMsg({ type: "error", text: `"${form.isin}" is not a valid ISIN — expected exactly 12 characters (e.g. GB00BN08ZR66), no Yahoo-style ".L" suffix.` });
+      return;
+    }
+
+    setBusy(true);
+    setMsg({ type: "info", text: "Adding and fetching price history…" });
+    try {
+      const res = await fetch(`${API}/holdings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: form.symbol.trim().toUpperCase(),
+          qty: Number(form.qty),
+          avgPrice: Number(form.avgPrice) || 0,
+          sector: form.sector,
+          geography: form.geography,
+          account: form.account,
+          targetPct: form.targetPct === "" ? null : Number(form.targetPct),
+          isin: form.isin.trim() || null,
+        }),
+      });
+      const data = await res.json();
+
+      if (data.error) {
+        setMsg({ type: "error", text: data.error });
+      } else if (data.action === "updated") {
+        setMsg({ type: "warn", text: data.message });
+        setForm(f => ({ ...f, symbol: "", qty: "", avgPrice: "", targetPct: "", isin: "" }));
+        onAdded();
+      } else {
+        const h = data.historySynced;
+        let detail;
+        if (data.ftFallback && !data.ftFallback.error) {
+          detail = ` — no Yahoo history, but priced via FT fallback at £${data.ftFallback.price} (${data.ftFallback.asOf ?? "no date"}). No chart history for this holding.`;
+        } else if (data.ftFallback?.error) {
+          detail = ` — no Yahoo history, and FT fallback failed (${data.ftFallback.error}). Excluded from valuation until resolved.`;
+        } else if (typeof h === "object" && h.error) {
+          detail = ` — history unavailable (${h.error}); excluded from risk until resolved`;
+        } else if (typeof h === "object") {
+          detail = ` — ${h.bars} bars of history stored${h.rejected ? `, ${h.rejected} corrupt bars rejected` : ""}`;
+        } else {
+          detail = "";
+        }
+        setMsg({ type: "ok", text: `Added ${form.symbol.toUpperCase()}${detail}` });
+        setForm(f => ({ ...f, symbol: "", qty: "", avgPrice: "", targetPct: "", isin: "" }));
+        onAdded();
+      }
+    } catch (e) {
+      setMsg({ type: "error", text: "Could not reach the server. Is npm start running?" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const msgColor = msg?.type === "error" ? t.negative : msg?.type === "warn" ? t.warning
+    : msg?.type === "ok" ? t.accent : t.textMuted;
+
+  return (
+    <Panel>
+      <SectionHeader title="ADD HOLDING" subtitle="history syncs automatically" />
+      <div style={{ padding: 16, display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-end" }}>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>SYMBOL</div>
+          <input style={fieldStyle(100, t)} value={form.symbol} placeholder="VUSA.L"
+            onChange={e => set("symbol", e.target.value)}
+            onBlur={e => detectCurrency(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>PRICE</div>
+          <div style={{ ...fieldStyle(90, t), display: "flex", alignItems: "center", color: t.textSecondary }}>
+            {checkingCcy ? "…" : livePrice != null ? `${ccySymbol(detectedCcy)}${livePrice.toFixed(2)}` : "—"}
+          </div>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>QUANTITY</div>
+          <input style={fieldStyle(90, t)} value={form.qty} placeholder="100" type="number"
+            onChange={e => set("qty", e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>
+            AVG PRICE {checkingCcy ? "(checking…)" : detectedCcy ? `(${ccySymbol(detectedCcy)})` : ""}
+          </div>
+          <input style={fieldStyle(100, t)} value={form.avgPrice} placeholder="79.39" type="number"
+            onChange={e => set("avgPrice", e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>SECTOR</div>
+          <select style={fieldStyle(110, t)} value={form.sector} onChange={e => set("sector", e.target.value)}>
+            <option value="">Select…</option>
+            {SECTORS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>GEOGRAPHY</div>
+          <select style={fieldStyle(120, t)} value={form.geography} onChange={e => set("geography", e.target.value)}>
+            <option value="">Select…</option>
+            {GEOGRAPHIES.map(g => <option key={g} value={g}>{g}</option>)}
+          </select>
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }}>TARGET %</div>
+          <input style={fieldStyle(80, t)} value={form.targetPct} placeholder="optional" type="number"
+            onChange={e => set("targetPct", e.target.value)}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </div>
+        <div>
+          <div style={{ fontSize: 9, color: t.textMuted, marginBottom: 4, letterSpacing: 1 }} title="Only needed if Yahoo has no data for this fund — used as a fallback price source via FT">
+            ISIN (if not on Yahoo)
+          </div>
+          <input style={fieldStyle(140, t)} value={form.isin} placeholder="GB00BN08ZR66"
+            onChange={e => set("isin", e.target.value.toUpperCase())}
+            onKeyDown={e => e.key === "Enter" && submit()} />
+        </div>
+        <button onClick={submit} disabled={busy}
+          style={{
+            background: busy ? t.surfaceInset : t.accent, color: busy ? t.textMuted : t.appBg,
+            border: "none", padding: "8px 20px", fontSize: 11, fontWeight: 700,
+            fontFamily: "monospace", borderRadius: 3, cursor: busy ? "default" : "pointer",
+            letterSpacing: 1,
+          }}>
+          {busy ? "WORKING…" : "ADD"}
+        </button>
+      </div>
+      {msg && (
+        <div style={{ padding: "0 16px 14px", fontSize: 11, color: msgColor }}>
+          {msg.text}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// Shared by the header row and every HoldingRow so the columns always line
+// up. NAME/SYMBOL gets the lion's share since a fund's full name ("Fidelity
+// Index World Fund") plus ticker and market otherwise wraps to two lines;
+// the numeric columns are right-aligned and only as wide as their content
+// needs, which is what removes the dead space that used to sit in front of
+// the "···" menu.
+const HOLDINGS_GRID_COLUMNS = "22px minmax(280px, 2.6fr) 0.5fr 0.65fr 0.65fr 0.85fr 0.95fr 0.6fr 0.5fr 44px";
+const numCell = { textAlign: "right" };
+
+function HoldingRow({ p, coverage, onChanged, onOpen, active = false }) {
+  const t = useTheme();
+  const [editing, setEditing] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [qty, setQty] = useState(p.qty);
+  const [avg, setAvg] = useState(p.avgPrice);
+  const [target, setTarget] = useState(p.targetPct ?? "");
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [menuOpen]);
+
+  async function save() {
+    await fetch(`${API}/holdings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: p.id, qty: Number(qty), avgPrice: Number(avg),
+        targetPct: target === "" ? null : Number(target),
+      }),
+    });
+    setEditing(false);
+    onChanged();
+  }
+
+  async function remove() {
+    if (!window.confirm(`Delete ${p.symbol} (${p.qty} units in ${p.wrapper})?`)) return;
+    await fetch(`${API}/holdings?id=${p.id}`, { method: "DELETE" });
+    onChanged();
+  }
+
+  const pnlColor = p.pnl >= 0 ? t.positive : t.negative;
+  const dayColor = (p.dayChangePct ?? 0) >= 0 ? t.positive : t.negative;
+  const cov = coverage?.find(c => c.symbol === p.symbol);
+  const thinHistory = cov && !cov.analysable;
+
+  return (
+    <div style={{ borderBottom: `1px solid ${t.borderSubtle}` }}>
+      <div onClick={() => onOpen?.()} title="Open detail panel" style={{
+        display: "grid",
+        gridTemplateColumns: HOLDINGS_GRID_COLUMNS,
+        alignItems: "center", padding: "14px 20px", gap: 8,
+        fontSize: 14, fontFamily: "monospace", cursor: "pointer",
+        background: active ? t.surfaceInset : "transparent",
+        // The active row keeps a visible marker while the panel is open, so it
+        // stays obvious which holding the panel is describing.
+        boxShadow: active ? `inset 3px 0 0 ${t.accent}` : "none",
+      }}>
+        <span style={{ color: active ? t.accent : t.textMuted, fontSize: 11 }}>▶</span>
+
+        <div style={{ minWidth: 0, overflow: "hidden" }}>
+          <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            <span style={{ color: t.text, fontWeight: 700, fontSize: 15 }}>{p.name || p.symbol}</span>
+            <a href={`https://finance.yahoo.com/quote/${encodeURIComponent(p.symbol)}`}
+              target="_blank" rel="noopener noreferrer"
+              title="View on Yahoo Finance"
+              onClick={e => e.stopPropagation()}
+              style={{ marginLeft: 6, color: t.textMuted, fontSize: 12, textDecoration: "none" }}>
+              ↗
+            </a>
+            {thinHistory && (
+              <span title="Not enough stored history for risk analysis"
+                style={{ color: t.warning, marginLeft: 6, fontSize: 12 }}>⚠</span>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: t.textMuted, marginTop: 2, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {p.symbol}{p.exchange ? ` | ${p.exchange}` : ""}
+          </div>
+        </div>
+
+        {editing ? (
+          <input style={{ ...fieldStyle("100%", t), padding: "5px 7px" }} value={qty} onClick={e => e.stopPropagation()} onChange={e => setQty(e.target.value)} />
+        ) : (
+          <div style={{ ...numCell, color: t.textSecondary }}>{p.qty}</div>
+        )}
+
+        {editing ? (
+          <input style={{ ...fieldStyle("100%", t), padding: "5px 7px" }} value={avg} onClick={e => e.stopPropagation()} onChange={e => setAvg(e.target.value)} />
+        ) : (
+          <div style={{ ...numCell, color: t.textSecondary }}>{ccySymbol(p.currency)}{p.avgPrice?.toFixed(2)}</div>
+        )}
+
+        <div style={{ ...numCell, color: t.text }}>
+          {ccySymbol(p.currency)}{p.price != null ? p.price.toFixed(2) : "—"}
+          {p.priceSource === "ft" && (
+            <span title={`Yahoo has no data for this fund — priced via FT fallback${p.priceAsOf ? `, as of ${p.priceAsOf}` : ""}`}
+              style={{ marginLeft: 4, fontSize: 9, color: t.info, border: `1px solid ${t.info}55`, borderRadius: 2, padding: "0 3px" }}>FT</span>
+          )}
+        </div>
+        <div style={{ ...numCell, color: t.text }}>£{p.value?.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+        <div style={{ ...numCell, color: pnlColor }}>
+          {p.pnl >= 0 ? "+" : ""}£{Math.abs(p.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          <div style={{ fontSize: 11, marginTop: 2 }}>{p.pnlPct >= 0 ? "+" : ""}{p.pnlPct?.toFixed(1)}%</div>
+        </div>
+        <div style={{ ...numCell, color: dayColor }}>{(p.dayChangePct ?? 0) >= 0 ? "+" : ""}{p.dayChangePct?.toFixed(2)}%</div>
+        <div style={{ ...numCell, color: t.textSecondary }}>{p.weight?.toFixed(1)}%</div>
+
+        <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", position: "relative" }} onClick={e => e.stopPropagation()}>
+          {editing ? (
+            <>
+              <button onClick={save} style={btn(t.accent)}>SAVE</button>
+              <button onClick={() => setEditing(false)} style={btn(t.textMuted)}>×</button>
+            </>
+          ) : (
+            <>
+              <button onClick={() => setMenuOpen(o => !o)} style={{
+                background: menuOpen ? t.surfaceInset : "transparent", border: `1px solid ${t.borderStrong}`, color: t.textSecondary,
+                borderRadius: 3, fontSize: 14, fontWeight: 700, cursor: "pointer",
+                width: 32, height: 27, lineHeight: "20px", letterSpacing: 1,
+              }}>···</button>
+              {menuOpen && (
+                <div style={{
+                  position: "absolute", top: "100%", right: 0, marginTop: 4, zIndex: 10,
+                  background: t.surface, border: `1px solid ${t.borderStrong}`, borderRadius: 4,
+                  minWidth: 100, overflow: "hidden", boxShadow: "0 8px 24px rgba(0,0,0,0.25)",
+                }}>
+                  <button onClick={() => { setEditing(true); setMenuOpen(false); }} style={{
+                    display: "block", width: "100%", textAlign: "left", background: "transparent",
+                    border: "none", color: t.info, fontSize: 11, fontFamily: "monospace",
+                    padding: "8px 12px", cursor: "pointer",
+                  }}>Edit</button>
+                  <button onClick={() => { setMenuOpen(false); remove(); }} style={{
+                    display: "block", width: "100%", textAlign: "left", background: "transparent",
+                    border: "none", color: t.negative, fontSize: 11, fontFamily: "monospace",
+                    padding: "8px 12px", cursor: "pointer", borderTop: `1px solid ${t.border}`,
+                  }}>Delete</button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+function formatBigNumber(n) {
+  if (n == null) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1e12) return `${(n / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return n.toLocaleString();
+}
+
+// Segmented-control button styles, shared by the portfolio charts. `active`
+// picks the filled state; the neutral (blue) variant is the default, the
+// mint variant is used for the price-range selector.
+function toggleBtn(t, active) {
+  return {
+    background: active ? t.surfaceInset : "transparent",
+    border: `1px solid ${active ? t.info : t.borderStrong}`,
+    color: active ? t.text : t.textMuted,
+    fontSize: 11, fontWeight: 700, padding: "5px 11px", borderRadius: 3,
+    cursor: "pointer", fontFamily: "monospace", letterSpacing: 0.5,
+  };
+}
+function rangeBtn(t, active) {
+  return {
+    background: active ? t.accentSoft : "transparent",
+    border: `1px solid ${active ? t.accent : t.borderStrong}`,
+    color: active ? t.accent : t.textMuted,
+    fontSize: 11, padding: "4px 9px", borderRadius: 3,
+    cursor: "pointer", fontFamily: "monospace",
+  };
+}
+function ccySymbol(ccy) {
+  return { GBP: "£", USD: "$", EUR: "€", JPY: "¥" }[ccy] ?? ccy + " ";
+}
+
+function btn(color) {
+  return {
+    background: "transparent", border: `1px solid ${color}`, color,
+    fontSize: 11, padding: "5px 10px", borderRadius: 3, cursor: "pointer",
+    fontFamily: "monospace", letterSpacing: 0.5,
+  };
+}
+
+const PORTFOLIO_CHART_RANGES = [
+  { key: "1M", label: "1M", lookback: 21 },
+  { key: "3M", label: "3M", lookback: 63 },
+  { key: "6M", label: "6M", lookback: 126 },
+  { key: "YTD", label: "YTD", lookback: 280 },
+  { key: "1Y", label: "1Y", lookback: 252 },
+  { key: "3Y", label: "3Y", lookback: 756 },
+  { key: "5Y", label: "5Y", lookback: 1260 },
+  { key: "MAX", label: "MAX", lookback: 8000 },
+];
+
+const PORTFOLIO_CHART_VIEWS = [
+  { key: "combined", label: "COMBINED" },
+  { key: "percent", label: "% RETURN" },
+  { key: "value", label: "£ VALUE" },
+];
+
+const HOLDING_LINE_COLORS = ["#00d4aa", "#3d8bff", "#ffa502", "#ff4757", "#a78bfa", "#38bdf8", "#f472b6", "#facc15"];
+
+function PortfolioValueChart() {
+  const t = useTheme();
+  const [range, setRange] = useState("3M");
+  const [view, setView] = useState("combined");
+  const [hist, setHist] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const lookback = PORTFOLIO_CHART_RANGES.find(r => r.key === range).lookback;
+    fetch(`${API}/portfolio/history/holdings?lookback=${lookback}`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) setHist(d); })
+      .catch(() => { if (!cancelled) setHist({ series: [], normalized: [], symbols: [], note: "Could not load portfolio history." }); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [range]);
+
+  const symbols = hist?.symbols ?? [];
+  const rawSeries = hist?.series ?? [];
+  const normSeries = hist?.normalized ?? [];
+
+  // YTD is a calendar concept, not a fixed bar count — trim client-side to
+  // this calendar year once the (slightly oversized) lookback comes back.
+  const trimYTD = arr => range === "YTD"
+    ? arr.filter(r => r.date >= `${new Date().getFullYear()}-01-01`)
+    : arr;
+
+  const combinedSeries = trimYTD(rawSeries).map(r => ({
+    date: r.date,
+    value: +symbols.reduce((a, s) => a + (r[s] ?? 0), 0).toFixed(2),
+  }));
+  const valueSeries = trimYTD(rawSeries);
+  const percentSeries = trimYTD(normSeries);
+
+  const activeSeries = view === "combined" ? combinedSeries : view === "value" ? valueSeries : percentSeries;
+  const up = combinedSeries.length >= 2 && combinedSeries[combinedSeries.length - 1].value >= combinedSeries[0].value;
+  const lineColor = up ? t.positive : t.negative;
+
+  const axisTick = { fill: t.chartAxis, fontSize: 11, fontFamily: "monospace" };
+  const tooltipStyle = {
+    contentStyle: { background: t.tooltipBg, border: `1px solid ${t.border}`, borderRadius: 4, fontFamily: "monospace", fontSize: 13 },
+    labelStyle: { color: t.textSecondary },
+  };
+
+  return (
+    <Panel>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 20px 11px", borderBottom: `1px solid ${t.border}`, flexWrap: "wrap", gap: 8 }}>
+        <div style={{ display: "flex", gap: 4 }}>
+          {PORTFOLIO_CHART_VIEWS.map(v => (
+            <button key={v.key} onClick={() => setView(v.key)} style={{ ...toggleBtn(t, view === v.key), fontSize: 12, padding: "6px 13px" }}>{v.label}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {PORTFOLIO_CHART_RANGES.map(r => (
+            <button key={r.key} onClick={() => setRange(r.key)} style={{ ...rangeBtn(t, range === r.key), fontSize: 12, padding: "5px 12px" }}>{r.label}</button>
+          ))}
+        </div>
+      </div>
+      <div style={{ padding: "12px 16px 16px" }}>
+        {loading ? (
+          <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 12 }}>
+            Loading…
+          </div>
+        ) : activeSeries.length < 2 ? (
+          <div style={{ height: 240, display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 12, textAlign: "center", padding: "0 20px" }}>
+            {hist?.note ?? "Not enough overlapping price history yet to chart portfolio value."}
+          </div>
+        ) : view === "combined" ? (
+          <>
+            <ResponsiveContainer width="100%" height={320}>
+              <AreaChart data={activeSeries} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="portfolioValueFill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={lineColor} stopOpacity={0.25} />
+                    <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke={t.chartGrid} vertical={false} />
+                <XAxis dataKey="date" tick={axisTick} axisLine={{ stroke: t.border }} tickLine={false} minTickGap={40} />
+                <YAxis tick={axisTick} axisLine={false} tickLine={false} width={60}
+                  domain={["auto", "auto"]}
+                  tickFormatter={v => `£${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`} />
+                <Tooltip {...tooltipStyle} formatter={v => [`£${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, "Value"]} />
+                <Area type="monotone" dataKey="value" stroke={lineColor} strokeWidth={1.5}
+                  fill="url(#portfolioValueFill)" isAnimationActive={false} />
+              </AreaChart>
+            </ResponsiveContainer>
+            <ChartCaption hist={hist} />
+          </>
+        ) : (
+          <>
+            <ResponsiveContainer width="100%" height={320}>
+              <LineChart data={activeSeries} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
+                <CartesianGrid stroke={t.chartGrid} vertical={false} />
+                <XAxis dataKey="date" tick={axisTick} axisLine={{ stroke: t.border }} tickLine={false} minTickGap={40} />
+                <YAxis tick={axisTick} axisLine={false} tickLine={false} width={60}
+                  domain={["auto", "auto"]}
+                  tickFormatter={v => view === "percent" ? `${v.toFixed(0)}%` : `£${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`} />
+                <Tooltip {...tooltipStyle}
+                  formatter={(v, name) => [view === "percent" ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}%` : `£${v.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, name]} />
+                <Legend wrapperStyle={{ fontSize: 12, fontFamily: "monospace" }} />
+                {symbols.map((s, i) => (
+                  <Line key={s} type="monotone" dataKey={s} name={s}
+                    stroke={HOLDING_LINE_COLORS[i % HOLDING_LINE_COLORS.length]}
+                    strokeWidth={1.5} dot={false} isAnimationActive={false} />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+            <ChartCaption hist={hist} />
+          </>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+function ChartCaption({ hist }) {
+  const t = useTheme();
+  return (
+    <div style={{ fontSize: 11, color: t.textFaint, marginTop: 10 }}>
+      Reconstructed at current holdings weights — excludes cash{hist?.excluded?.length ? ` and ${hist.excluded.join(", ")} (insufficient history)` : ""}.
+    </div>
+  );
+}
+
+function Modal({ onClose, children }) {
+  const t = useTheme();
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, background: t.name === "light" ? "rgba(40,50,65,0.45)" : "rgba(3,5,10,0.7)",
+      display: "flex", alignItems: "flex-start", justifyContent: "center",
+      paddingTop: "8vh", zIndex: 1000,
+    }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "min(720px, 92vw)", position: "relative" }}>
+        <button onClick={onClose} style={{
+          position: "absolute", top: -32, right: 0, background: "transparent", border: "none",
+          color: t.textSecondary, fontSize: 22, cursor: "pointer", lineHeight: 1,
+        }}>×</button>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function CashTile({ cashAccounts, cash, onChanged, centered = false, onDeploy = null }) {
+  const t = useTheme();
+  const [editing, setEditing] = useState(false);
+  const [amount, setAmount] = useState(cash);
+
+  async function save() {
+    const value = Number(amount) || 0;
+    if (cashAccounts.length >= 1) {
+      await fetch(`${API}/cash`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: cashAccounts[0].id, amount: value }),
+      });
+    } else {
+      await fetch(`${API}/cash`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account: "Main", wrapper: "ISA", currency: "GBP", amount: value }),
+      });
+    }
+    setEditing(false);
+    onChanged();
+  }
+
+  return (
+    <div style={{ padding: "10px 22px 13px", textAlign: centered ? "center" : "left" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: centered ? "center" : "space-between", gap: 6 }}>
+        <div style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1 }}>CASH</div>
+        {!editing && (
+          <button onClick={() => { setAmount(cash); setEditing(true); }} title="Edit cash balance"
+            style={{ background: "transparent", border: "none", color: t.textMuted, fontSize: 13, cursor: "pointer", padding: 0 }}>✎</button>
+        )}
+      </div>
+      {editing ? (
+        <div style={{ display: "flex", gap: 6, marginTop: 5, alignItems: "center", justifyContent: centered ? "center" : "flex-start" }}>
+          <input autoFocus type="number" value={amount} onChange={e => setAmount(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && save()}
+            style={{ ...fieldStyle(110, t), padding: "4px 7px", fontSize: 16 }} />
+          <button onClick={save} style={btn(t.accent)}>SAVE</button>
+          <button onClick={() => setEditing(false)} style={btn(t.textMuted)}>×</button>
+        </div>
+      ) : (
+        <div style={{ fontSize: 23, fontWeight: 700, color: t.text, fontFamily: "monospace", marginTop: 5 }}>
+          £{cash.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </div>
+      )}
+      {!editing && onDeploy && cash > 0 && (
+        <button onClick={onDeploy} style={{
+          background: "transparent", border: "none", color: t.accent, fontSize: 10.5,
+          fontFamily: "monospace", cursor: "pointer", padding: 0, marginTop: 5, letterSpacing: 0.5,
+        }}>DEPLOY THIS CASH →</button>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// PORTFOLIO ANALYSIS
+//
+// Everything below reads /portfolio/types, /portfolio/scorecard,
+// /portfolio/correlations and /portfolio/holding. None of it holds its own
+// copy of a figure: weights, scores and correlations are recomputed server-
+// side on every poll from stored bars and live prices, so what is on screen is
+// what the engines currently say, not a snapshot taken when the page loaded.
+// ============================================================
+
+/**
+ * Slice colours for the composition charts.
+ *
+ * Cash is pulled out of the rotation deliberately: the palette's fourth entry
+ * is the same red this app uses for losses everywhere else, and a cash balance
+ * rendered in loss-red reads as a warning about money that is simply sitting
+ * there. It gets a neutral grey, which is also the honest signal — cash is the
+ * one slice that is not an exposure to anything.
+ */
+function sliceColor(i, label, t) {
+  if (label === "Cash") return t.textFaint;
+  return HOLDING_LINE_COLORS[i % HOLDING_LINE_COLORS.length];
+}
+
+/** The donut and the table are two readings of one breakdown, so they share a
+ *  box and a fixed content height — switching view changes what you are
+ *  looking at, never where anything else on the page sits. */
+const COMPOSITION_BOX_HEIGHT = 268;
+
+function CompositionDonut({ rows, total, valueKey = "value", labelKey = "label", pctKey = "pct", onHover }) {
+  const t = useTheme();
+  const data = rows.filter(r => (r[valueKey] ?? 0) > 0);
+  if (!data.length) {
+    return (
+      <div style={{ height: COMPOSITION_BOX_HEIGHT, display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 12 }}>
+        Nothing priced to chart yet.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 12, height: COMPOSITION_BOX_HEIGHT }}>
+      <div style={{ width: 220, height: COMPOSITION_BOX_HEIGHT, flexShrink: 0 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie data={data} dataKey={valueKey} nameKey={labelKey} innerRadius={52} outerRadius={88}
+              paddingAngle={1.5} stroke={t.surface} strokeWidth={2} isAnimationActive={false}
+              onMouseEnter={(_, i) => onHover?.(data[i]?.[labelKey] ?? null)}
+              onMouseLeave={() => onHover?.(null)}>
+              {data.map((r, i) => <Cell key={r[labelKey]} fill={sliceColor(i, r[labelKey], t)} />)}
+            </Pie>
+            <Tooltip
+              contentStyle={{ background: t.tooltipBg, border: `1px solid ${t.borderStrong}`, borderRadius: 4, fontFamily: "monospace", fontSize: 12 }}
+              labelStyle={{ color: t.textSecondary }}
+              formatter={(v, name, entry) => [
+                `£${Math.round(v).toLocaleString()} · ${(entry?.payload?.[pctKey] ?? 0).toFixed(1)}%`,
+                name,
+              ]} />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div style={{ flex: 1, minWidth: 0, maxHeight: COMPOSITION_BOX_HEIGHT, overflowY: "auto", paddingRight: 4 }}>
+        {data.map((r, i) => (
+          <div key={r[labelKey]}
+            onMouseEnter={() => onHover?.(r[labelKey])}
+            onMouseLeave={() => onHover?.(null)}
+            style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", fontSize: 12 }}>
+            <span style={{ width: 9, height: 9, borderRadius: 2, background: sliceColor(i, r[labelKey], t), flexShrink: 0 }} />
+            <span style={{ color: t.textSecondary, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {r[labelKey]}
+            </span>
+            <span style={{ color: t.text, fontFamily: "monospace", fontSize: 11.5 }}>
+              {(r[pctKey] ?? 0).toFixed(1)}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Holdings grouped by what kind of instrument they are, typed from the
+ *  symbol rather than from whatever was typed into the asset-class field. */
+function PortfolioTypeBox() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [view, setView] = useState("donut");
+  const [error, setError] = useState(false);
+
+  const load = useCallback(() => {
+    fetch(`${API}/portfolio/types`).then(r => r.json())
+      .then(d => { setData(d); setError(false); })
+      .catch(() => setError(true));
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const rows = data?.rows ?? [];
+
+  return (
+    <Panel>
+      <SectionHeader title="BY TYPE"
+        subtitle={rows.length ? `${rows.length} ${rows.length === 1 ? "type" : "types"}` : null}
+        extra={
+          <div style={{ display: "flex", gap: 3 }}>
+            {[["donut", "◕"], ["table", "▤"]].map(([key, glyph]) => (
+              <button key={key} onClick={() => setView(key)} title={key === "donut" ? "Donut" : "Table"}
+                style={{
+                  background: view === key ? t.accentSoft : "transparent",
+                  border: `1px solid ${view === key ? t.accent : t.borderStrong}`,
+                  color: view === key ? t.accent : t.textMuted,
+                  width: 30, height: 26, borderRadius: 3, cursor: "pointer", fontSize: 13, lineHeight: 1,
+                }}>{glyph}</button>
+            ))}
+          </div>
+        } />
+
+      <div style={{ padding: "12px 16px" }}>
+        {error ? (
+          <div style={{ height: COMPOSITION_BOX_HEIGHT, display: "flex", alignItems: "center", justifyContent: "center", color: t.negative, fontSize: 12 }}>
+            Could not reach the server.
+          </div>
+        ) : !data ? (
+          <div style={{ height: COMPOSITION_BOX_HEIGHT, display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 12 }}>
+            Loading…
+          </div>
+        ) : view === "donut" ? (
+          <CompositionDonut rows={rows} total={data.total} />
+        ) : (
+          <div style={{ height: COMPOSITION_BOX_HEIGHT, overflowY: "auto" }}>
+            <div style={{
+              display: "grid", gridTemplateColumns: "1.5fr 0.6fr 1fr 1fr 0.8fr", gap: 8,
+              fontSize: 10, color: t.textMuted, letterSpacing: 0.8, paddingBottom: 7,
+              borderBottom: `1px solid ${t.border}`, position: "sticky", top: 0, background: t.surface,
+            }}>
+              <div>TYPE</div><div style={numCell}>ITEMS</div>
+              <div style={numCell}>VALUE</div><div style={numCell}>GAIN</div><div style={numCell}>ALLOC</div>
+            </div>
+            {rows.map((r, i) => (
+              <div key={r.label} style={{
+                display: "grid", gridTemplateColumns: "1.5fr 0.6fr 1fr 1fr 0.8fr", gap: 8,
+                alignItems: "center", padding: "9px 0", borderBottom: `1px solid ${t.borderSubtle}`, fontSize: 12,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 2, background: sliceColor(i, r.label, t), flexShrink: 0 }} />
+                  <span style={{ color: t.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</span>
+                </div>
+                <div style={{ ...numCell, color: t.textMuted, fontFamily: "monospace" }}>{r.items}</div>
+                <div style={{ ...numCell, color: t.text, fontFamily: "monospace" }}>
+                  {gbp0(r.value)}
+                  <div style={{ fontSize: 10, color: t.textFaint }}>{r.cost ? gbp0(r.cost) : ""}</div>
+                </div>
+                <div style={{ ...numCell, fontFamily: "monospace", color: r.gainPct == null ? t.textFaint : r.gain >= 0 ? t.positive : t.negative }}>
+                  {r.gainPct == null ? <NoData reason="Cash has no cost basis to gain against" compact /> : (
+                    <>
+                      {r.gain >= 0 ? "+" : "−"}{gbp0(Math.abs(r.gain))}
+                      <div style={{ fontSize: 10 }}>{r.gainPct >= 0 ? "+" : ""}{r.gainPct.toFixed(1)}%</div>
+                    </>
+                  )}
+                </div>
+                <div style={{ ...numCell, color: t.textSecondary, fontFamily: "monospace" }}>{r.pct.toFixed(1)}%</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+// ── Holding side panel ────────────────────────────────────────
+
+const AXIS_ORDER = ["quality", "trend", "technical", "precedent", "cost"];
+
+function MeterBar({ value, color, height = 6 }) {
+  const t = useTheme();
+  return (
+    <div style={{ flex: 1, height, background: t.surfaceInset, borderRadius: height / 2, overflow: "hidden" }}>
+      <div style={{ width: `${Math.max(0, Math.min(100, value))}%`, height: "100%", background: color, borderRadius: height / 2 }} />
+    </div>
+  );
+}
+
+/** The five diligence axes for one instrument. An axis that could not be
+ *  measured says why instead of rendering an empty or zeroed bar — a zero and
+ *  an unknown are different claims. */
+function AxisList({ components }) {
+  const t = useTheme();
+  if (!components) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {AXIS_ORDER.map(key => {
+        const c = components[key];
+        const available = c?.available && c.value != null;
+        const pct = available ? Math.round(c.value * 100) : null;
+        return (
+          <div key={key}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 11.5 }}>
+              <span style={{ color: t.textSecondary, width: 76, textTransform: "capitalize" }}>{key}</span>
+              {available ? (
+                <>
+                  <MeterBar value={pct} color={pct >= 60 ? t.positive : pct >= 40 ? t.warning : t.negative} />
+                  <span style={{ color: t.text, fontFamily: "monospace", width: 30, textAlign: "right" }}>{pct}</span>
+                </>
+              ) : (
+                <span style={{ color: t.textFaint, fontSize: 11, flex: 1, lineHeight: 1.4 }}>
+                  not measured — {c?.reason ?? "no reading"}
+                </span>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Where the current price sits in its stored 52-week range. A price outside
+ *  the range is said to be outside it rather than pinned to the end and left
+ *  looking like it merely reached the edge. */
+function RangeMeter({ range52, price, currency }) {
+  const t = useTheme();
+  if (!range52?.available) {
+    return <div style={{ fontSize: 11, color: t.textFaint }}>52-week range — {range52?.reason ?? "unavailable"}</div>;
+  }
+  const outside = range52.aboveRange || range52.belowRange;
+  const pos = Math.max(0, Math.min(100, range52.positionPct ?? 0));
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, color: t.textMuted, marginBottom: 5 }}>
+        <span>52W LOW {ccySymbol(currency)}{range52.low.toFixed(2)}</span>
+        <span>{ccySymbol(currency)}{range52.high.toFixed(2)} HIGH</span>
+      </div>
+      <div style={{ position: "relative", height: 6, background: t.surfaceInset, borderRadius: 3 }}>
+        <div style={{
+          position: "absolute", left: `${pos}%`, top: -3, width: 3, height: 12,
+          background: outside ? t.warning : t.accent, borderRadius: 2, transform: "translateX(-1.5px)",
+        }} />
+      </div>
+      <div style={{ fontSize: 10.5, color: outside ? t.warning : t.textFaint, marginTop: 5 }}>
+        {range52.aboveRange ? "Trading above its stored 52-week high."
+          : range52.belowRange ? "Trading below its stored 52-week low."
+          : `${pos.toFixed(0)}% of the way up its 52-week range, over ${range52.observations} stored closes.`}
+      </div>
+    </div>
+  );
+}
+
+function PanelSection({ label, children, note }) {
+  const t = useTheme();
+  return (
+    <div style={{ padding: "14px 16px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+      <div style={{ fontSize: 10, letterSpacing: 1.2, color: t.textMuted, marginBottom: 10 }}>{label}</div>
+      {children}
+      {note && <div style={{ fontSize: 10, color: t.textFaint, marginTop: 8, lineHeight: 1.5 }}>{note}</div>}
+    </div>
+  );
+}
+
+function HoldingSidePanel({ symbol, onClose, onChanged }) {
+  const t = useTheme();
+  const [tab, setTab] = useState("overview");
+  const [d, setD] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [bars, setBars] = useState(null);
+  const [range, setRange] = useState("1Y");
+  const [quote, setQuote] = useState(null);
+  const [noteText, setNoteText] = useState("");
+  const [noteDate, setNoteDate] = useState(() => new Date().toISOString().slice(0, 10));
+
+  const load = useCallback(() => {
+    if (!symbol) return;
+    setLoading(true);
+    fetch(`${API}/portfolio/holding?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(j => { setD(j); setError(j?.error ?? null); })
+      .catch(() => setError("Could not reach the server."))
+      .finally(() => setLoading(false));
+  }, [symbol]);
+
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!symbol) return;
+    let cancelled = false;
+    setBars(null);
+    fetch(`${API}/history?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(j => { if (!cancelled) setBars(j?.data ?? []); })
+      .catch(() => { if (!cancelled) setBars([]); });
+    fetch(`${API}/quote?symbol=${encodeURIComponent(symbol)}`).then(r => r.json())
+      .then(j => { if (!cancelled) setQuote(j); })
+      .catch(() => { if (!cancelled) setQuote(null); });
+    return () => { cancelled = true; };
+  }, [symbol]);
+
+  // Escape closes, matching every other dismissible surface in the app.
+  useEffect(() => {
+    const onKey = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  async function addNote() {
+    if (!noteText.trim()) return;
+    await fetch(`${API}/research/notes`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbol, date: noteDate, text: noteText.trim() }),
+    });
+    setNoteText("");
+    load();
+  }
+
+  const p = d?.position ?? null;
+  const ccy = p?.currency ?? "GBP";
+  const dayColor = (p?.dayChangePct ?? 0) >= 0 ? t.positive : t.negative;
+
+  const lookback = PORTFOLIO_CHART_RANGES.find(r => r.key === range)?.lookback ?? 252;
+  const sliced = (bars ?? []).slice(-lookback);
+  const series = sliced.map(b => ({ date: b.date, value: b.adj_close ?? b.close })).filter(b => b.value != null);
+  const up = series.length >= 2 && series[series.length - 1].value >= series[0].value;
+  const chartColor = up ? t.positive : t.negative;
+
+  return (
+    <>
+      <div onClick={onClose} style={{
+        position: "fixed", inset: 0, background: t.name === "light" ? "rgba(40,50,65,0.28)" : "rgba(3,5,10,0.55)", zIndex: 400,
+      }} />
+      <div style={{
+        position: "fixed", top: 0, right: 0, bottom: 0, width: "min(420px, 94vw)", zIndex: 401,
+        background: t.surface, borderLeft: `1px solid ${t.borderStrong}`,
+        display: "flex", flexDirection: "column", boxShadow: "-18px 0 44px rgba(0,0,0,0.28)",
+      }}>
+        {/* Header */}
+        <div style={{ padding: "14px 16px 0", borderBottom: `1px solid ${t.border}`, background: t.surfaceAlt }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                <span style={{ fontSize: 15, fontWeight: 700, color: t.accent, fontFamily: "monospace" }}>{symbol}</span>
+                {p?.price != null && (
+                  <span style={{ fontSize: 15, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>
+                    {ccySymbol(ccy)}{p.price.toFixed(p.price < 10 ? 4 : 2)}
+                  </span>
+                )}
+                {p?.dayChangePct != null && (
+                  <span style={{ fontSize: 11.5, color: dayColor, fontFamily: "monospace" }}>
+                    {p.dayChangePct >= 0 ? "▲" : "▼"} {Math.abs(p.dayChangePct).toFixed(2)}%
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {d?.name ?? ""}{d?.instrument?.label ? ` · ${d.instrument.label}` : ""}
+              </div>
+            </div>
+            <button onClick={onClose} title="Close (Esc)" style={{
+              background: "transparent", border: "none", color: t.textMuted, fontSize: 20, cursor: "pointer", lineHeight: 1, padding: 0,
+            }}>×</button>
+          </div>
+
+          <div style={{ display: "flex", gap: 2, marginTop: 12 }}>
+            {[["overview", "Overview"], ["holding", "Holding"], ["updates", "Updates"], ["notes", "Notes"]].map(([id, label]) => (
+              <button key={id} onClick={() => setTab(id)} style={{
+                background: "transparent", border: "none",
+                borderBottom: tab === id ? `2px solid ${t.accent}` : "2px solid transparent",
+                color: tab === id ? t.accent : t.textMuted,
+                padding: "8px 11px", cursor: "pointer", fontSize: 11.5, letterSpacing: 0.4,
+              }}>{label}</button>
+            ))}
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {loading && <div style={{ padding: 26, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Loading…</div>}
+          {error && <div style={{ padding: 18, color: t.negative, fontSize: 12 }}>⚠ {error}</div>}
+
+          {!loading && !error && d && tab === "overview" && (
+            <>
+              <PanelSection label="PRICE">
+                <div style={{ display: "flex", gap: 3, marginBottom: 8, flexWrap: "wrap" }}>
+                  {["3M", "1Y", "3Y", "MAX"].map(r => (
+                    <button key={r} onClick={() => setRange(r)} style={rangeBtn(t, range === r)}>{r}</button>
+                  ))}
+                </div>
+                {bars == null ? (
+                  <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", color: t.textMuted, fontSize: 11 }}>Loading…</div>
+                ) : series.length < 2 ? (
+                  <div style={{ height: 120, display: "flex", alignItems: "center", justifyContent: "center", color: t.textFaint, fontSize: 11, textAlign: "center" }}>
+                    {d.barCount ? `Only ${d.barCount} stored bars — not enough to chart this range.` : "No stored price history for this holding."}
+                  </div>
+                ) : (
+                  <ResponsiveContainer width="100%" height={120}>
+                    <AreaChart data={series} margin={{ top: 2, right: 2, left: 0, bottom: 0 }}>
+                      <defs>
+                        <linearGradient id={`sideFill-${symbol}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor={chartColor} stopOpacity={0.3} />
+                          <stop offset="100%" stopColor={chartColor} stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="date" hide />
+                      <YAxis domain={["auto", "auto"]} hide />
+                      <Tooltip
+                        contentStyle={{ background: t.tooltipBg, border: `1px solid ${t.borderStrong}`, borderRadius: 4, fontFamily: "monospace", fontSize: 11.5 }}
+                        labelStyle={{ color: t.textSecondary }}
+                        formatter={v => [`${ccySymbol(ccy)}${v.toFixed(2)}`, "Close"]} />
+                      <Area type="monotone" dataKey="value" stroke={chartColor} strokeWidth={1.5}
+                        fill={`url(#sideFill-${symbol})`} isAnimationActive={false} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                )}
+                <div style={{ marginTop: 12 }}>
+                  <RangeMeter range52={d.range52} price={p?.price} currency={ccy} />
+                </div>
+              </PanelSection>
+
+              <PanelSection label="CONVICTION"
+                note={d.scores.evidence != null
+                  ? `Built on ${(d.scores.evidence * 100).toFixed(0)}% of the intended evidence. Same five axes, same code, as a rebuild run.`
+                  : "No component could be measured for this instrument."}>
+                {d.scores.conviction != null ? (
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 12 }}>
+                    <span style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: t.text }}>
+                      {Math.round(d.scores.conviction * 100)}
+                    </span>
+                    <span style={{ fontSize: 11, color: t.textMuted }}>/ 100</span>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11.5, color: t.textFaint, marginBottom: 10 }}>Not scoreable.</div>
+                )}
+                <AxisList components={d.scores.components} />
+              </PanelSection>
+
+              {d.composition?.expenseRatio != null || d.composition?.topHoldings?.length ? (
+                <PanelSection label="WHAT IT HOLDS"
+                  note={d.composition.asOf ? `Published composition, stored ${d.composition.ageDays ?? 0} days ago. Yahoo publishes the top ten only.` : null}>
+                  {d.composition.expenseRatio != null && (
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 10 }}>
+                      <span style={{ color: t.textSecondary }}>Expense ratio</span>
+                      <span style={{ color: t.text, fontFamily: "monospace" }}>{d.composition.expenseRatio.toFixed(2)}%</span>
+                    </div>
+                  )}
+                  {(d.composition.topHoldings ?? []).slice(0, 6).map(h => (
+                    <div key={h.name} style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 11.5, padding: "3px 0" }}>
+                      <span style={{ color: t.textSecondary, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.name}</span>
+                      <span style={{ color: t.textMuted, fontFamily: "monospace", flexShrink: 0 }}>{h.weight.toFixed(1)}%</span>
+                    </div>
+                  ))}
+                </PanelSection>
+              ) : (
+                <PanelSection label="WHAT IT HOLDS">
+                  <div style={{ fontSize: 11.5, color: t.textFaint, lineHeight: 1.5 }}>
+                    {d.composition?.reason ?? "No stored composition for this instrument."}
+                  </div>
+                </PanelSection>
+              )}
+
+              {d.correlatedWith?.length > 0 && (
+                <PanelSection label="MOVES WITH"
+                  note="Daily return correlation against your other holdings, joined on date.">
+                  {d.correlatedWith.map(c => (
+                    <div key={c.symbol} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, padding: "4px 0" }}>
+                      <span style={{ color: t.text, fontFamily: "monospace", width: 72 }}>{c.symbol}</span>
+                      <MeterBar value={Math.abs(c.correlation) * 100} color={c.correlation >= 0.8 ? t.negative : c.correlation >= 0.5 ? t.warning : t.positive} />
+                      <span style={{ color: t.textSecondary, fontFamily: "monospace", width: 40, textAlign: "right" }}>
+                        {c.correlation.toFixed(2)}
+                      </span>
+                    </div>
+                  ))}
+                </PanelSection>
+              )}
+
+              {d.bullbear?.tally && (
+                <PanelSection label="BULL / BEAR">
+                  <div style={{ display: "flex", gap: 14, fontSize: 12 }}>
+                    <span style={{ color: t.positive }}>{d.bullbear.tally.bull} bullish</span>
+                    <span style={{ color: t.negative }}>{d.bullbear.tally.bear} bearish</span>
+                    <span style={{ color: t.textMuted }}>{d.bullbear.tally.neutral} neutral</span>
+                  </div>
+                </PanelSection>
+              )}
+
+              <PanelSection label="PRECEDENT">
+                {d.precedent?.matches ? (
+                  <div style={{ display: "flex", gap: 18, fontSize: 12 }}>
+                    <div>
+                      <div style={{ color: t.text, fontFamily: "monospace", fontSize: 16 }}>{d.precedent.matches}</div>
+                      <div style={{ color: t.textMuted, fontSize: 10 }}>MATCHES</div>
+                    </div>
+                    <div>
+                      <div style={{ color: t.text, fontFamily: "monospace", fontSize: 16 }}>{d.precedent.positiveRatePct}%</div>
+                      <div style={{ color: t.textMuted, fontSize: 10 }}>WENT UP AFTER</div>
+                    </div>
+                    {d.precedent.medianForward63Pct != null && (
+                      <div>
+                        <div style={{ color: d.precedent.medianForward63Pct >= 0 ? t.positive : t.negative, fontFamily: "monospace", fontSize: 16 }}>
+                          {d.precedent.medianForward63Pct >= 0 ? "+" : ""}{d.precedent.medianForward63Pct.toFixed(1)}%
+                        </div>
+                        <div style={{ color: t.textMuted, fontSize: 10 }}>TYPICAL 3M</div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11.5, color: t.textFaint }}>{d.precedent?.reason ?? "No precedent study available."}</div>
+                )}
+              </PanelSection>
+            </>
+          )}
+
+          {!loading && !error && d && tab === "holding" && (
+            <>
+              <PanelSection label="POSITION">
+                {p ? (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    {[
+                      ["Units", p.qty],
+                      ["Avg price", `${ccySymbol(ccy)}${p.avgPrice?.toFixed(2)}`],
+                      ["Value", gbp0(p.value)],
+                      ["Cost", gbp0(p.cost)],
+                      ["P&L", `${p.pnl >= 0 ? "+" : "−"}${gbp0(Math.abs(p.pnl))}`],
+                      ["Return", `${p.pnlPct >= 0 ? "+" : ""}${p.pnlPct?.toFixed(1)}%`],
+                      ["Weight", `${p.weight?.toFixed(1)}%`],
+                      ["Target", p.targetPct != null ? `${p.targetPct}%` : "—"],
+                    ].map(([label, val]) => (
+                      <div key={label} style={{ background: t.surfaceInset, border: `1px solid ${t.border}`, borderRadius: 4, padding: "8px 10px" }}>
+                        <div style={{ fontSize: 9.5, color: t.textMuted, letterSpacing: 0.5 }}>{label.toUpperCase()}</div>
+                        <div style={{ fontSize: 13.5, color: t.text, fontFamily: "monospace", marginTop: 3 }}>{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 11.5, color: t.textFaint }}>Not currently held.</div>
+                )}
+              </PanelSection>
+
+              <PanelSection label="KEY STATS" note="Live from the quote feed. Fields a fund or index structurally lacks are shown as unavailable rather than blank.">
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  {[
+                    ["Market cap", quote?.marketCap != null ? formatBigNumber(quote.marketCap) : null],
+                    ["Beta", quote?.beta != null ? quote.beta.toFixed(2) : null],
+                    ["Expense ratio", d.composition?.expenseRatio != null ? `${d.composition.expenseRatio.toFixed(2)}%` : null],
+                    ["Stored bars", d.barCount || null],
+                  ].map(([label, val]) => (
+                    <div key={label} style={{ background: t.surfaceInset, border: `1px solid ${t.border}`, borderRadius: 4, padding: "8px 10px" }}>
+                      <div style={{ fontSize: 9.5, color: t.textMuted, letterSpacing: 0.5 }}>{label.toUpperCase()}</div>
+                      <div style={{ fontSize: 13.5, color: t.text, fontFamily: "monospace", marginTop: 3 }}>
+                        {val ?? <NoData reason={`No ${label.toLowerCase()} published for this instrument`} compact />}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </PanelSection>
+
+              {d.scores.components?.quality?.available && (
+                <PanelSection label="LONG-RUN DELIVERY" note={d.scores.components.quality.source}>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    {[
+                      ["CAGR", `${d.scores.components.quality.detail.cagrPct}%`],
+                      ["Sharpe", d.scores.components.quality.detail.sharpe],
+                      ["Volatility", `${d.scores.components.quality.detail.annualVolPct}%`],
+                      ["Max drawdown", `−${d.scores.components.quality.detail.maxDrawdownPct}%`],
+                    ].map(([label, val]) => (
+                      <div key={label} style={{ background: t.surfaceInset, border: `1px solid ${t.border}`, borderRadius: 4, padding: "8px 10px" }}>
+                        <div style={{ fontSize: 9.5, color: t.textMuted, letterSpacing: 0.5 }}>{label.toUpperCase()}</div>
+                        <div style={{ fontSize: 13.5, color: t.text, fontFamily: "monospace", marginTop: 3 }}>{val}</div>
+                      </div>
+                    ))}
+                  </div>
+                </PanelSection>
+              )}
+
+              {d.thesis && (
+                <PanelSection label="YOUR THESIS">
+                  <div style={{ fontSize: 12, color: t.textSecondary, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{d.thesis}</div>
+                </PanelSection>
+              )}
+            </>
+          )}
+
+          {!loading && !error && d && tab === "updates" && (
+            <div style={{ padding: "4px 0" }}>
+              {d.news?.length ? d.news.map((n, i) => (
+                <a key={i} href={n.url} target="_blank" rel="noopener noreferrer" style={{
+                  display: "block", padding: "12px 16px", borderBottom: `1px solid ${t.borderSubtle}`, textDecoration: "none",
+                }}>
+                  <div style={{ fontSize: 10, color: t.textMuted, marginBottom: 4 }}>
+                    {n.source}{n.published ? ` · ${new Date(n.published).toLocaleDateString("en-GB")}` : ""}
+                  </div>
+                  <div style={{ fontSize: 12.5, color: t.text, lineHeight: 1.45 }}>{n.title}</div>
+                </a>
+              )) : (
+                <div style={{ padding: "20px 16px", fontSize: 11.5, color: t.textFaint, lineHeight: 1.6 }}>
+                  No stored stories mention {symbol} in the last 60 days. The news feed tags stories by
+                  symbol — an instrument the feeds do not name individually stays empty here rather than
+                  showing unrelated market coverage.
+                </div>
+              )}
+            </div>
+          )}
+
+          {!loading && !error && d && tab === "notes" && (
+            <>
+              <PanelSection label="ADD A NOTE">
+                <div style={{ display: "flex", gap: 6, marginBottom: 7 }}>
+                  <input type="date" value={noteDate} onChange={e => setNoteDate(e.target.value)}
+                    style={{ ...fieldStyle(130, t), padding: "5px 7px", fontSize: 11 }} />
+                  <button onClick={addNote} disabled={!noteText.trim()} style={btn(t.accent)}>SAVE</button>
+                </div>
+                <textarea value={noteText} onChange={e => setNoteText(e.target.value)} rows={3}
+                  placeholder="What happened, and why it matters."
+                  style={{ ...fieldStyle("100%", t), padding: "7px 9px", fontSize: 12, resize: "vertical", fontFamily: "inherit" }} />
+              </PanelSection>
+              {d.notes?.length ? d.notes.map(n => (
+                <div key={n.id} style={{ padding: "11px 16px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+                  <div style={{ fontSize: 10, color: t.textMuted, fontFamily: "monospace", marginBottom: 4 }}>{n.date}</div>
+                  <div style={{ fontSize: 12, color: t.textSecondary, lineHeight: 1.55 }}>{n.text}</div>
+                </div>
+              )) : (
+                <div style={{ padding: "16px", fontSize: 11.5, color: t.textFaint }}>No notes on {symbol} yet.</div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ── Summary tiles ─────────────────────────────────────────────
+
+/** Total profit with today's move folded in underneath. Two readings of the
+ *  same thing at different time scales, so one box rather than two. */
+function ProfitTile({ data }) {
+  const t = useTheme();
+  const up = data.pnl >= 0;
+  const dayUp = data.dayChange >= 0;
+  return (
+    <div style={{
+      padding: "16px 20px", borderRight: `1px solid ${t.border}`,
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center",
+    }}>
+      <div style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1, marginBottom: 7 }}>TOTAL PROFIT</div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 9, flexWrap: "wrap", justifyContent: "center" }}>
+        <span style={{ fontSize: 28, fontWeight: 700, fontFamily: "monospace", color: up ? t.positive : t.negative }}>
+          {up ? "+" : "−"}£{Math.abs(data.pnl).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </span>
+        <span style={{ fontSize: 13, fontFamily: "monospace", color: up ? t.positive : t.negative }}>
+          {up ? "▲" : "▼"} {Math.abs(data.pnlPct).toFixed(1)}%
+        </span>
+      </div>
+      <div style={{
+        marginTop: 9, paddingTop: 8, borderTop: `1px solid ${t.borderSubtle}`, width: "100%",
+        display: "flex", alignItems: "baseline", gap: 7, justifyContent: "center", fontSize: 12, fontFamily: "monospace",
+      }}>
+        <span style={{ color: dayUp ? t.positive : t.negative }}>
+          {dayUp ? "+" : "−"}£{Math.abs(data.dayChange).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+        </span>
+        <span style={{ color: dayUp ? t.positive : t.negative }}>
+          {dayUp ? "▲" : "▼"} {Math.abs(data.dayChangePct).toFixed(2)}%
+        </span>
+        <span style={{ color: t.textFaint, fontFamily: "inherit", fontSize: 11 }}>today</span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What the portfolio has compounded at.
+ *
+ * Deliberately the reconstructed figure rather than an IRR: a money-weighted
+ * return needs dated cash flows, and this project stores holdings rather than
+ * a trade-by-trade record. Showing an "IRR" derived from holdings alone would
+ * mean inventing the contribution dates it depends on, so this states plainly
+ * what it is instead.
+ */
+function ReturnTile() {
+  const t = useTheme();
+  const [r, setR] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const load = () => fetch(`${API}/portfolio/return`).then(x => x.json())
+      .then(j => { setR(j); setFailed(false); })
+      .catch(() => setFailed(true));
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  const body = () => {
+    if (failed) return <NoData reason="Could not reach the server" />;
+    if (!r) return <span style={{ fontSize: 13, color: t.textMuted }}>…</span>;
+    if (!r.available) return <NoData reason={r.reason ?? "Not enough overlapping stored history"} />;
+    return (
+      <span style={{ fontSize: 28, fontWeight: 700, fontFamily: "monospace", color: r.annualisedPct >= 0 ? t.positive : t.negative }}>
+        {r.annualisedPct >= 0 ? "+" : "−"}{Math.abs(r.annualisedPct).toFixed(1)}%
+      </span>
+    );
+  };
+
+  return (
+    <div style={{
+      padding: "16px 20px", display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", textAlign: "center",
+    }}>
+      <div style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1, marginBottom: 7 }}>ANNUALISED</div>
+      {body()}
+      <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 7, lineHeight: 1.45 }}>
+        {r?.available
+          ? `${r.totalPct >= 0 ? "+" : ""}${r.totalPct.toFixed(0)}% over ${r.years}y · fixed-weight reconstruction`
+          : "Reconstructed from stored bars at current weights"}
+      </div>
+    </div>
+  );
+}
+
+// ── Analysis sub-page ─────────────────────────────────────────
+
+function ScorecardPanel() {
+  const t = useTheme();
+  const [d, setD] = useState(null);
+  const [axis, setAxis] = useState("quality");
+  const [error, setError] = useState(null);
+
+  const load = useCallback(() => {
+    fetch(`${API}/portfolio/scorecard`).then(r => r.json())
+      .then(j => { setD(j); setError(null); })
+      .catch(() => setError("Could not reach the server."));
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  if (error) return <Panel><div style={{ padding: 18, color: t.negative, fontSize: 12 }}>⚠ {error}</div></Panel>;
+  if (!d) return <Panel><div style={{ padding: 26, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Scoring holdings…</div></Panel>;
+
+  if (!d.available) {
+    return (
+      <Panel>
+        <SectionHeader title="PORTFOLIO SCORECARD" />
+        <div style={{ padding: 18, fontSize: 12, color: t.textMuted, lineHeight: 1.6 }}>{d.reason}</div>
+      </Panel>
+    );
+  }
+
+  const selected = d.axes.find(a => a.key === axis) ?? d.axes[0];
+  const radarData = d.axes.map(a => ({ axis: a.label, score: a.scoreOutOf100 ?? 0, measured: a.score != null }));
+
+  return (
+    <Panel>
+      <SectionHeader title="PORTFOLIO SCORECARD"
+        subtitle={d.mandate ? `${d.mandate.riskLabel} · ${d.mandate.horizonLabel}` : null} />
+
+      <div style={{ padding: "14px 18px", display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ width: 260, flexShrink: 0 }}>
+          <ResponsiveContainer width="100%" height={230}>
+            <RadarChart data={radarData} outerRadius={82}>
+              <PolarGrid stroke={t.chartGrid} />
+              <PolarAngleAxis dataKey="axis" tick={{ fill: t.textMuted, fontSize: 10.5 }} />
+              <PolarRadiusAxis domain={[0, 100]} tick={false} axisLine={false} />
+              <Radar dataKey="score" stroke={t.accent} fill={t.accent} fillOpacity={0.28} isAnimationActive={false} />
+              <Tooltip
+                contentStyle={{ background: t.tooltipBg, border: `1px solid ${t.borderStrong}`, borderRadius: 4, fontFamily: "monospace", fontSize: 12 }}
+                formatter={(v, n, e) => [e?.payload?.measured ? `${v} / 100` : "not measured", e?.payload?.axis]} />
+            </RadarChart>
+          </ResponsiveContainer>
+          <div style={{ textAlign: "center", marginTop: -4 }}>
+            <div style={{ fontSize: 26, fontWeight: 700, fontFamily: "monospace", color: t.text }}>
+              {d.overall != null ? Math.round(d.overall * 100) : "—"}
+            </div>
+            <div style={{ fontSize: 10, color: t.textMuted, letterSpacing: 0.8 }}>OVERALL / 100</div>
+            {d.overallBasis && <div style={{ fontSize: 9.5, color: t.textFaint, marginTop: 4 }}>{d.overallBasis}</div>}
+          </div>
+        </div>
+
+        <div style={{ flex: 1, minWidth: 300 }}>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 12 }}>
+            {d.axes.map(a => (
+              <button key={a.key} onClick={() => setAxis(a.key)} style={{
+                background: axis === a.key ? t.accentSoft : "transparent",
+                border: `1px solid ${axis === a.key ? t.accent : t.borderStrong}`,
+                color: a.score == null ? t.textFaint : axis === a.key ? t.accent : t.textSecondary,
+                padding: "5px 11px", borderRadius: 3, cursor: "pointer", fontSize: 11, fontFamily: "monospace",
+              }}>
+                {a.label}{a.score != null ? ` ${a.scoreOutOf100}` : " —"}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 12, color: t.textSecondary, lineHeight: 1.6, marginBottom: 6 }}>
+            {selected.description}
+          </div>
+          <div style={{ fontSize: 10.5, color: t.textFaint, marginBottom: 14 }}>
+            Covers {selected.coverage}% of invested value{selected.note ? ` · ${selected.note}` : ""}
+          </div>
+
+          {selected.score == null ? (
+            <div style={{ fontSize: 12, color: t.textFaint }}>{selected.note}</div>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+              <div>
+                <div style={{ fontSize: 10, color: t.positive, letterSpacing: 1, marginBottom: 8 }}>LIFTING THE SCORE</div>
+                {selected.lifting.length ? selected.lifting.map(c => (
+                  <ContributionRow key={c.symbol} c={c} positive />
+                )) : <div style={{ fontSize: 11, color: t.textFaint }}>Nothing above the portfolio average.</div>}
+              </div>
+              <div>
+                <div style={{ fontSize: 10, color: t.negative, letterSpacing: 1, marginBottom: 8 }}>HOLDING IT BACK</div>
+                {selected.holdingBack.length ? selected.holdingBack.map(c => (
+                  <ContributionRow key={c.symbol} c={c} />
+                )) : <div style={{ fontSize: 11, color: t.textFaint }}>Nothing below the portfolio average.</div>}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ padding: "10px 18px 14px", borderTop: `1px solid ${t.borderSubtle}`, fontSize: 10, color: t.textFaint, lineHeight: 1.55 }}>
+        Lifting and holding back are measured by each holding's actual pull on the weighted average —
+        position size times its distance from the mean — not by which scored highest. A large holding
+        scoring slightly below average drags the portfolio more than a small one scoring zero.
+        Cash is excluded; axes are weighted as this mandate weights them.
+      </div>
+    </Panel>
+  );
+}
+
+function ContributionRow({ c, positive = false }) {
+  const t = useTheme();
+  return (
+    <div style={{ marginBottom: 9 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, marginBottom: 3 }}>
+        <span style={{ color: t.text, fontFamily: "monospace" }}>{c.symbol}</span>
+        <span style={{ color: t.textMuted, fontFamily: "monospace" }}>{c.scoreOutOf100}/100</span>
+      </div>
+      <MeterBar value={c.scoreOutOf100} color={positive ? t.positive : t.negative} height={4} />
+      <div style={{ fontSize: 9.5, color: t.textFaint, marginTop: 3 }}>
+        {c.weight.toFixed(1)}% of invested · pulls the axis {c.pull >= 0 ? "+" : ""}{c.pull.toFixed(1)} pts
+      </div>
+    </div>
+  );
+}
+
+function CorrelationPanel() {
+  const t = useTheme();
+  const [d, setD] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const load = () => fetch(`${API}/portfolio/correlations?limit=5`).then(r => r.json())
+      .then(j => { setD(j); setError(null); })
+      .catch(() => setError("Could not reach the server."));
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (error) return <Panel><div style={{ padding: 18, color: t.negative, fontSize: 12 }}>⚠ {error}</div></Panel>;
+  if (!d) return <Panel><div style={{ padding: 26, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Correlating holdings…</div></Panel>;
+
+  const Pair = ({ p, tone }) => (
+    <div style={{ padding: "9px 0", borderBottom: `1px solid ${t.borderSubtle}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 12 }}>
+        <span style={{ color: t.text, fontFamily: "monospace", flex: 1, minWidth: 0 }}>
+          {p.symbols[0]} <span style={{ color: t.textFaint }}>/</span> {p.symbols[1]}
+        </span>
+        <MeterBar value={Math.abs(p.correlation) * 100} color={tone} height={5} />
+        <span style={{ color: t.text, fontFamily: "monospace", width: 42, textAlign: "right" }}>
+          {p.correlation >= 0 ? "" : "−"}{Math.abs(p.correlation).toFixed(2)}
+        </span>
+      </div>
+      <div style={{ fontSize: 9.5, color: t.textFaint, marginTop: 3 }}>
+        {p.combinedWeight.toFixed(1)}% of the portfolio combined · {p.observations} overlapping days
+      </div>
+    </div>
+  );
+
+  return (
+    <Panel>
+      <SectionHeader title="CORRELATION"
+        subtitle={d.averageCorrelation != null ? `average pair ${d.averageCorrelation.toFixed(2)}` : null} />
+      {!d.available ? (
+        <div style={{ padding: 18, fontSize: 12, color: t.textMuted, lineHeight: 1.6 }}>{d.note}</div>
+      ) : (
+        <>
+          <div style={{ padding: "12px 18px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 22 }}>
+            <div>
+              <div style={{ fontSize: 10, color: t.negative, letterSpacing: 1 }}>MOVES TOGETHER</div>
+              <div style={{ fontSize: 10.5, color: t.textFaint, margin: "3px 0 6px" }}>The pairings doing least to spread your risk.</div>
+              {d.movesTogether.map(p => <Pair key={p.symbols.join()} p={p} tone={t.negative} />)}
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: t.positive, letterSpacing: 1 }}>MOVES LEAST TOGETHER</div>
+              <div style={{ fontSize: 10.5, color: t.textFaint, margin: "3px 0 6px" }}>The pairings doing most to spread it.</div>
+              {d.movesLeastTogether.map(p => <Pair key={p.symbols.join()} p={p} tone={t.positive} />)}
+            </div>
+          </div>
+          <div style={{ padding: "8px 18px 14px", fontSize: 10, color: t.textFaint, lineHeight: 1.55 }}>
+            {d.note}
+            {d.unassessable.length > 0 && ` Not measurable: ${d.unassessable.map(u => u.symbols.join("/")).join(", ")}.`}
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function PortfolioAnalysisPage({ onOpenHolding }) {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const load = () => fetch(`${API}/portfolio`).then(r => r.json())
+      .then(d => { setData(d); setError(null); })
+      .catch(() => setError("Could not reach the server."));
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (error) return <Panel style={{ padding: 20 }}><div style={{ color: t.negative, fontSize: 12 }}>⚠ {error}</div></Panel>;
+  if (!data) return <div style={{ padding: 40, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Loading…</div>;
+
+  const holdingRows = (data.positions ?? [])
+    .filter(p => (p.value ?? 0) > 0)
+    .map(p => ({ label: p.symbol, name: p.name, value: p.value, pct: p.weight }));
+  const withCash = data.cash > 0
+    ? [...holdingRows, { label: "Cash", name: "Cash", value: data.cash, pct: +(data.cash / data.total * 100).toFixed(2) }]
+    : holdingRows;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Panel>
+          <SectionHeader title="ALL HOLDINGS" subtitle={`${holdingRows.length} priced`} />
+          <div style={{ padding: "12px 16px" }}>
+            <CompositionDonut rows={withCash} total={data.total} />
+          </div>
+        </Panel>
+        <PortfolioTypeBox />
+      </div>
+
+      <ScorecardPanel />
+      <CorrelationPanel />
+
+      <div style={{ fontSize: 10.5, color: t.textFaint, lineHeight: 1.6, padding: "0 4px 8px" }}>
+        Every figure on this page is computed server-side from stored daily bars, published fund
+        composition and live prices at the moment of the request. Nothing here is cached in the browser
+        or carried over from a previous session.
+      </div>
+    </div>
+  );
+}
+
+/* ─── Performance ───────────────────────────────────────────────
+ *
+ * Two returns, side by side, because they answer different questions and
+ * disagree whenever contribution timing mattered:
+ *
+ *   Money-weighted — what your money earned, timing included.
+ *   Time-weighted  — what the strategy earned, timing removed. The one
+ *                    comparable to an index.
+ *
+ * Neither is inferred from holdings. Where the ledger or the snapshot history
+ * cannot support a figure, the card says so and says what would fix it, rather
+ * than showing a number built on an assumed contribution schedule.
+ */
+
+function ReturnCard({ title, meaning, value, suffix = "% a year", detail, unavailable, children }) {
+  const t = useTheme();
+  const colour = unavailable ? t.textFaint : value >= 0 ? t.positive : t.negative;
+  return (
+    <div style={{
+      background: t.surface, border: `1px solid ${t.border}`, borderRadius: 8,
+      padding: 18, flex: 1, minWidth: 250,
+    }}>
+      <div style={{ fontSize: 10, color: t.textFaint, letterSpacing: 1.2, fontFamily: "monospace" }}>
+        {title.toUpperCase()}
+      </div>
+      {unavailable ? (
+        <>
+          <div style={{ fontSize: 22, color: t.textFaint, fontFamily: "monospace", marginTop: 8 }}>
+            <NoData reason={unavailable} />
+          </div>
+          <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 8, lineHeight: 1.55 }}>{unavailable}</div>
+        </>
+      ) : (
+        <>
+          <div style={{ fontSize: 30, color: colour, fontFamily: "monospace", marginTop: 6, fontWeight: 600 }}>
+            {value >= 0 ? "+" : ""}{value.toFixed(2)}<span style={{ fontSize: 14 }}>{suffix}</span>
+          </div>
+          {detail && <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 4 }}>{detail}</div>}
+        </>
+      )}
+      <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 10, lineHeight: 1.5 }}>{meaning}</div>
+      {children}
+    </div>
+  );
+}
+
+function PerformanceTab() {
+  const t = useTheme();
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
+  const [amount, setAmount] = useState("");
+  const [kind, setKind] = useState("deposit");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [formErr, setFormErr] = useState(null);
+
+  const load = useCallback(async () => {
+    try { setData(await (await fetch(`${API}/performance`)).json()); setErr(null); }
+    catch { setErr("Could not reach the Meridian API."); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function addFlow() {
+    setSaving(true); setFormErr(null);
+    try {
+      const res = await fetch(`${API}/performance/flows`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date, amount: Number(amount), kind, note: note || null }),
+      });
+      const out = await res.json();
+      if (out?.error) { setFormErr(out.error); return; }
+      setAmount(""); setNote("");
+      await load();
+    } catch (e) { setFormErr(String(e.message ?? e)); }
+    finally { setSaving(false); }
+  }
+
+  async function removeFlow(id) {
+    await fetch(`${API}/performance/flows?id=${id}`, { method: "DELETE" });
+    await load();
+  }
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Measuring…</div>;
+  if (err) return <Panel style={{ padding: 20 }}><div style={{ color: t.negative, fontSize: 12 }}>⚠ {err}</div></Panel>;
+  if (!data) return null;
+
+  const mwr = data.moneyWeighted, twr = data.timeWeighted;
+  const inputStyle = {
+    background: t.surface, border: `1px solid ${t.border}`, color: t.text,
+    fontSize: 12, padding: "6px 8px", borderRadius: 3, fontFamily: "monospace",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+        <ReturnCard
+          title="Money-weighted (your return)"
+          meaning="What your money actually earned, including the effect of when you added or removed it."
+          value={mwr.available ? mwr.annualisedPct : 0}
+          unavailable={mwr.available ? null : mwr.reason}
+          detail={mwr.available
+            ? `${gbp0(mwr.netContributed)} in · worth ${gbp0(mwr.currentValue)} · ${mwr.years}y`
+            : null}
+        />
+        <ReturnCard
+          title="Time-weighted (the strategy)"
+          meaning="What the strategy earned with contribution timing stripped out — the figure comparable to an index."
+          value={twr.available && twr.annualisedPct != null ? twr.annualisedPct : 0}
+          unavailable={twr.available
+            ? (twr.annualisedPct == null ? twr.annualisedNote : null)
+            : twr.reason}
+          detail={twr.available
+            ? `${twr.cumulativePct >= 0 ? "+" : ""}${twr.cumulativePct}% cumulative · ${twr.from} to ${twr.to}`
+            : null}
+        />
+      </div>
+
+      {data.timing && (
+        <Panel>
+          <SectionHeader title="TIMING" subtitle={`${data.timing.gapPct >= 0 ? "+" : ""}${data.timing.gapPct}pp`} />
+          <div style={{ padding: "14px 20px" }}>
+            <div style={{
+              fontSize: 14, lineHeight: 1.5,
+              color: data.timing.gapPct >= 0 ? t.positive : t.negative,
+            }}>{data.timing.verdict}</div>
+            <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 8, lineHeight: 1.6 }}>
+              {data.timing.explain}
+            </div>
+          </div>
+        </Panel>
+      )}
+
+      {data.versusBenchmark && (
+        <Panel>
+          <SectionHeader title="VERSUS BENCHMARK" subtitle={data.versusBenchmark.symbol} />
+          <div style={{ padding: "14px 20px", display: "flex", gap: 30, flexWrap: "wrap", alignItems: "baseline" }}>
+            <div>
+              <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>PORTFOLIO</div>
+              <div style={{ fontSize: 20, fontFamily: "monospace", color: t.text }}>
+                {data.versusBenchmark.portfolioPct >= 0 ? "+" : ""}{data.versusBenchmark.portfolioPct}%
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>BENCHMARK</div>
+              <div style={{ fontSize: 20, fontFamily: "monospace", color: t.textMuted }}>
+                {data.versusBenchmark.benchmarkPct >= 0 ? "+" : ""}{data.versusBenchmark.benchmarkPct}%
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>DIFFERENCE</div>
+              <div style={{
+                fontSize: 20, fontFamily: "monospace",
+                color: data.versusBenchmark.differencePct >= 0 ? t.positive : t.negative,
+              }}>
+                {data.versusBenchmark.differencePct >= 0 ? "+" : ""}{data.versusBenchmark.differencePct}pp
+              </div>
+            </div>
+          </div>
+          <div style={{ padding: "0 20px 14px", fontSize: 10.5, color: t.textFaint }}>
+            {data.versusBenchmark.note}
+          </div>
+        </Panel>
+      )}
+
+      <Panel>
+        <SectionHeader
+          title="CASH FLOW LEDGER"
+          subtitle={`${data.flowSummary.count} recorded`}
+          extra={
+            <span style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace" }}>
+              {gbp0(data.flowSummary.deposited)} in · {gbp0(data.flowSummary.withdrawn)} out
+            </span>
+          }
+        />
+        <div style={{ padding: "14px 20px", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>DATE</label>
+            <input id="flow-date" type="date" value={date} onChange={e => setDate(e.target.value)} style={inputStyle} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>KIND</label>
+            <select id="flow-kind" value={kind} onChange={e => setKind(e.target.value)} style={inputStyle}>
+              <option value="deposit">Paid in</option>
+              <option value="withdrawal">Took out</option>
+            </select>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>AMOUNT</label>
+            <input id="flow-amount" value={amount} onChange={e => setAmount(e.target.value)}
+                   placeholder="1000" style={{ ...inputStyle, width: 110 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, minWidth: 120 }}>
+            <label style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1, fontFamily: "monospace" }}>NOTE</label>
+            <input id="flow-note" value={note} onChange={e => setNote(e.target.value)}
+                   placeholder="optional" style={inputStyle} />
+          </div>
+          <button id="flow-add" onClick={addFlow} disabled={saving} style={{
+            background: t.accent, border: "none", color: "#04121a", fontSize: 12, fontWeight: 700,
+            padding: "8px 16px", borderRadius: 3, cursor: saving ? "default" : "pointer", fontFamily: "monospace",
+          }}>{saving ? "SAVING…" : "RECORD"}</button>
+        </div>
+        {formErr && <div style={{ padding: "0 20px 10px", fontSize: 12, color: t.negative }}>{formErr}</div>}
+
+        {/* Said here rather than in a footnote: this ledger is the only reason
+            the money-weighted figure above can exist at all. */}
+        <div style={{ padding: "0 20px 12px", fontSize: 10.5, color: t.textFaint, lineHeight: 1.6 }}>
+          Record money entering or leaving the portfolio as a whole — not buys and sells, which move value
+          between cash and a holding without changing what the portfolio is worth. Without these dates there
+          is no money-weighted return to compute.
+        </div>
+
+        {data.flows.length === 0 ? (
+          <div style={{ padding: "0 20px 18px", fontSize: 12, color: t.textFaint }}>
+            Nothing recorded yet.
+          </div>
+        ) : (
+          <div style={{ padding: "0 20px 16px" }}>
+            {data.flows.map(f => (
+              <div key={f.id} style={{
+                display: "flex", alignItems: "center", gap: 12, padding: "8px 0",
+                borderBottom: `1px solid ${t.border}`,
+              }}>
+                <span style={{ fontSize: 11.5, color: t.textMuted, fontFamily: "monospace", width: 92 }}>{f.date}</span>
+                <span style={{
+                  fontSize: 13, fontFamily: "monospace", width: 110,
+                  color: f.amount >= 0 ? t.positive : t.negative,
+                }}>{f.amount >= 0 ? "+" : ""}{gbp0(f.amount)}</span>
+                <span style={{ fontSize: 11.5, color: t.textFaint, flex: 1 }}>
+                  {f.kind}{f.note ? ` · ${f.note}` : ""}
+                </span>
+                <AlertButton danger onClick={() => removeFlow(f.id)}>DELETE</AlertButton>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <div style={{ fontSize: 10.5, color: t.textFaint, lineHeight: 1.6, padding: "0 2px" }}>
+        {data.coverage}
+        {twr.available && twr.coverageNote && <> {twr.coverageNote}</>}
+      </div>
+
+      {/* Attribution sits under the return figures because it answers the
+          question those figures raise. It fetches separately and fails
+          separately: it reads reconstructed bar history rather than the
+          cash-flow ledger, so it can work when the ledger is empty. */}
+      <AttributionPanel />
+    </div>
+  );
+}
+
+const PORTFOLIO_TABS = [["overview", "Overview"], ["holdings", "Holdings"], ["performance", "Performance"], ["analysis", "Analysis"], ["xray", "X-Ray"], ["allocate", "Allocate"], ["rebuild", "Rebuild"]];
+const PORTFOLIO_TAB_IDS = PORTFOLIO_TABS.map(x => x[0]);
+
+/** Initial Portfolio tab: the URL hash (#/portfolio/<tab>) wins, then the last tab this viewer used. */
+function initialPortfolioTab() {
+  try {
+    const m = /^#\/portfolio\/([a-z]+)/.exec(window.location.hash || "");
+    if (m && PORTFOLIO_TAB_IDS.includes(m[1])) return m[1];
+    const last = localStorage.getItem("meridian_portfolio_tab");
+    if (last && PORTFOLIO_TAB_IDS.includes(last)) return last;
+  } catch { /* private mode */ }
+  return "overview";
+}
+
+function PortfolioPageV2({ tabJump, onTabChange, onPage } = {}) {
+  const t = useTheme();
+  const [tab, setTab] = useState(initialPortfolioTab);
+  const [classicOpen, setClassicOpen] = useState(false);
+  // Deep-linkable and remembered per viewer: the hash reflects the tab, and
+  // coming back to the page lands where it was left.
+  useEffect(() => {
+    try {
+      localStorage.setItem("meridian_portfolio_tab", tab);
+      if (!window.location.hash.startsWith(`#/portfolio/${tab}`)) window.history.replaceState(null, "", `#/portfolio/${tab}`);
+    } catch { /* ignore */ }
+  }, [tab]);
+  // Links from the new sub-pages: a Portfolio tab id switches tab; anything
+  // else is a page in the sidebar (e.g. What Changed).
+  const navigate = useCallback((dest, opts) => {
+    if (PORTFOLIO_TAB_IDS.includes(dest)) {
+      // A filter travels in the hash (#/portfolio/holdings?account=ISA) so the
+      // destination page can read it and the view stays linkable.
+      if (opts?.query) try { window.history.replaceState(null, "", `#/portfolio/${dest}?${new URLSearchParams(opts.query)}`); } catch { /* ignore */ }
+      setTab(dest);
+    } else onPage?.(dest, opts);
+  }, [onPage]);
+
+  // Arriving via a sidebar sub-item (e.g. Portfolio > Allocate).
+  useEffect(() => {
+    if (!tabJump?.tab) return;
+    setTab(tabJump.tab);
+  }, [tabJump?.ts]);
+
+  useEffect(() => { onTabChange?.(tab); }, [tab]);
+  const [data, setData] = useState(null);
+  const [coverage, setCoverage] = useState([]);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [addOpen, setAddOpen] = useState(false);
+  const [namesBusy, setNamesBusy] = useState(false);
+  const [namesMsg, setNamesMsg] = useState(null);
+  // Which holding the side panel is showing. Held here rather than per row so
+  // clicking a second holding swaps the panel's contents instead of opening a
+  // second panel on top of the first.
+  const [openSymbol, setOpenSymbol] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const [pRes, hRes] = await Promise.all([
+        fetch(`${API}/portfolio`),
+        fetch(`${API}/holdings`),
+      ]);
+      const p = await pRes.json();
+      const h = await hRes.json();
+      setData(p);
+      setCoverage(h.coverage ?? []);
+      setError(null);
+    } catch {
+      setError("Could not reach the server at localhost:4001. Is npm start running?");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  async function refreshNames() {
+    setNamesBusy(true);
+    setNamesMsg(null);
+    try {
+      const res = await fetch(`${API}/holdings/refresh-names`, { method: "POST" });
+      const d = await res.json();
+      // d.message only comes back when there was nothing to target at all —
+      // otherwise always report what happened, even a 0-resolved run with
+      // failures (checking `d.resolved` truthily would wrongly show the
+      // "nothing to target" message here since 0 is falsy).
+      setNamesMsg(d.message ?? `Resolved ${d.resolved} name${d.resolved === 1 ? "" : "s"}${d.failed?.length ? ` — couldn't resolve ${d.failed.join(", ")}` : ""}.`);
+      await load();
+    } catch {
+      setNamesMsg("Could not reach the server.");
+    } finally {
+      setNamesBusy(false);
+    }
+  }
+
+  if (loading) return <div style={{ padding: 40, textAlign: "center", color: t.textMuted, fontSize: 12 }}>Loading portfolio…</div>;
+  if (error) return <Panel style={{ padding: 20 }}><div style={{ color: t.negative, fontSize: 12 }}>⚠ {error}</div></Panel>;
+
+  const thin = coverage.filter(c => !c.analysable);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div>
+        <div style={{ fontSize: 40, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>PORTFOLIO</div>
+        <div style={{ fontSize: 13, color: t.textMuted, marginTop: 3 }}>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 2, borderBottom: `1px solid ${t.border}` }}>
+        {PORTFOLIO_TABS.map(([id, label]) => (
+          <button key={id} onClick={() => setTab(id)} aria-current={tab === id ? "page" : undefined} style={{
+            background: "transparent", border: "none",
+            borderBottom: tab === id ? `2px solid ${t.accent}` : "2px solid transparent",
+            color: tab === id ? t.accent : t.textMuted,
+            padding: "8px 14px", cursor: "pointer", fontFamily: "monospace",
+            fontSize: 11, letterSpacing: 1, textTransform: "uppercase",
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {tab === "overview" && <SubPages.OverviewPage theme={t} onOpenHolding={setOpenSymbol} onNavigate={navigate} />}
+      {tab === "xray" && <XRayTab />}
+      {tab === "performance" && <SubPages.PerformancePage theme={t} onOpenHolding={setOpenSymbol} onNavigate={navigate} />}
+      {tab === "performance" && (
+        <div style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace", letterSpacing: 1, marginTop: 10 }}>
+          MONEY- AND TIME-WEIGHTED RETURNS · CASH-FLOW LEDGER · ATTRIBUTION DETAIL
+        </div>
+      )}
+      {tab === "performance" && <PerformanceTab />}
+      {tab === "analysis" && <SubPages.AnalysisPage theme={t} onOpenHolding={setOpenSymbol} onNavigate={navigate} />}
+      {tab === "analysis" && (
+        <div style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace", letterSpacing: 1, marginTop: 10 }}>
+          ALL HOLDINGS · BY TYPE · SCORECARD · CORRELATION PAIRS (EXISTING VIEWS)
+        </div>
+      )}
+      {tab === "analysis" && <PortfolioAnalysisPage />}
+      {tab === "allocate" && <AllocatePage />}
+      {tab === "rebuild" && <RebuildErrorBoundary><RebuildPage /></RebuildErrorBoundary>}
+
+      {tab === "holdings" && <SubPages.HoldingsPage theme={t} onOpenHolding={setOpenSymbol} onNavigate={navigate} />}
+      {tab === "holdings" && (
+        <button onClick={() => setClassicOpen(o => !o)} aria-expanded={classicOpen}
+          style={{ alignSelf: "flex-start", background: "transparent", border: `1px solid ${t.borderStrong}`, color: t.textSecondary, borderRadius: 3, padding: "6px 12px", fontSize: 11, fontFamily: "monospace", cursor: "pointer", marginTop: 6 }}>
+          {classicOpen ? "▾" : "▸"} CLASSIC HOLDINGS TOOLS — add position, refresh names, summary, value chart, breakdowns
+        </button>
+      )}
+      {tab === "holdings" && classicOpen && <>
+      {/* Summary strip. Total profit and today's move are one box rather than
+          two: they answer the same question at two time scales, and splitting
+          them left the fourth slot spent on a figure that duplicates the
+          third. The freed slot carries what the portfolio has actually
+          compounded at. */}
+      <Panel>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)" }}>
+          <RiskMetric align="center" label="TOTAL VALUE" value={`£${data.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}`} />
+          <div style={{ borderRight: `1px solid ${t.border}`, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+            <div style={{ padding: "13px 22px 10px", borderBottom: `1px solid ${t.border}`, textAlign: "center" }}>
+              <div style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1, marginBottom: 5 }}>INVESTED</div>
+              <div style={{ fontSize: 23, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>
+                £{data.invested.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              </div>
+            </div>
+            <CashTile centered cashAccounts={data.cashAccounts} cash={data.cash} onChanged={load} onDeploy={() => setTab("allocate")} />
+          </div>
+          <ProfitTile data={data} />
+          <ReturnTile />
+        </div>
+      </Panel>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.35fr 1fr", gap: 12 }}>
+        <PortfolioValueChart />
+        <PortfolioTypeBox />
+      </div>
+
+      {addOpen && (
+        <Modal onClose={() => setAddOpen(false)}>
+          <AddHoldingForm onAdded={() => { load(); setAddOpen(false); }} />
+        </Modal>
+      )}
+
+      {thin.length > 0 && (
+        <Panel style={{ padding: 12 }}>
+          <div style={{ fontSize: 11, color: t.warning }}>
+            ⚠ {thin.map(s => s.symbol).join(", ")} {thin.length === 1 ? "has" : "have"} insufficient
+            price history and {thin.length === 1 ? "is" : "are"} excluded from risk analysis.
+          </div>
+        </Panel>
+      )}
+
+      {/* Holdings table */}
+      <Panel>
+        <SectionHeader title="HOLDINGS"
+          action="+ ADD POSITION" onAction={() => setAddOpen(true)}
+          extra={
+            <button onClick={refreshNames} disabled={namesBusy} title="Look up a proper name and listing venue for any holding that's still showing its raw ticker"
+              style={{
+                background: "transparent", border: `1px solid ${t.borderStrong}`,
+                color: namesBusy ? t.textFaint : t.textSecondary, fontSize: 12, padding: "5px 12px",
+                borderRadius: 3, cursor: namesBusy ? "default" : "pointer", fontFamily: "monospace",
+              }}>{namesBusy ? "RESOLVING…" : "↻ REFRESH NAMES"}</button>
+          } />
+        {namesMsg && (
+          <div style={{ padding: "0 20px 10px", fontSize: 11, color: t.textSecondary }}>{namesMsg}</div>
+        )}
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: HOLDINGS_GRID_COLUMNS,
+          padding: "11px 20px", borderBottom: `1px solid ${t.border}`, gap: 8,
+          fontSize: 11, color: t.textMuted, letterSpacing: 1,
+        }}>
+          <div /><div>NAME / SYMBOL</div>
+          <div style={numCell}>QTY</div><div style={numCell}>AVG</div><div style={numCell}>PRICE</div>
+          <div style={numCell}>VALUE</div><div style={numCell}>P&L</div><div style={numCell}>TODAY</div><div style={numCell}>WEIGHT</div><div />
+        </div>
+        {data.positions.length === 0 ? (
+          <div style={{ padding: 32, textAlign: "center", color: t.textMuted, fontSize: 14 }}>
+            No holdings yet — use "+ ADD POSITION" above to add one.
+          </div>
+        ) : (
+          data.positions.map(p => (
+            <HoldingRow key={p.id} p={p} coverage={coverage} onChanged={load}
+              onOpen={() => setOpenSymbol(p.symbol)} active={openSymbol === p.symbol} />
+          ))
+        )}
+      </Panel>
+
+      {/* Concentration flags — surfaced here, where trades get decided,
+          rather than only on the Risk page where they were easy to miss. */}
+      {data.concentration && (() => {
+        const c = data.concentration;
+        const flags = [
+          c.largestPosition > 25 && `Largest position is ${c.largestPosition.toFixed(1)}% of the portfolio`,
+          c.top3 > 60 && `Top three positions are ${c.top3.toFixed(1)}% combined`,
+          c.lookThroughUS != null && c.lookThroughUS > 65
+            && `North America is ~${c.lookThroughUS.toFixed(0)}% of what can be looked through — well above the headline geography split`,
+          c.effectiveHoldings < 4 && data.positions?.length >= 4 && `Effectively ${c.effectiveHoldings} holdings once weights are accounted for, despite ${data.positions.length} lines`,
+        ].filter(Boolean);
+        return flags.length > 0 && (
+          <Panel>
+            <div style={{ padding: "10px 16px", display: "flex", flexDirection: "column", gap: 5 }}>
+              {flags.map((f, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 11.5, color: t.warning }}>
+                  <span style={{ fontFamily: "monospace" }}>⚠</span>
+                  <span style={{ lineHeight: 1.5 }}>{f}</span>
+                </div>
+              ))}
+              <div style={{ fontSize: 9.5, color: t.textFaint, marginTop: 2 }}>
+                Thresholds are conventions (25% single, 60% top-three, 65% look-through US), not advice. Full diagnostics on the Risk page.
+              </div>
+            </div>
+          </Panel>
+        );
+      })()}
+
+      {/* Breakdowns */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <BreakdownPanel title="GEOGRAPHY" rows={data.breakdowns.geography} />
+        <BreakdownPanel title="SECTOR" rows={data.breakdowns.sector} />
+        <BreakdownPanel title="CURRENCY" rows={data.breakdowns.currency} />
+        <BreakdownPanel title="WRAPPER" rows={data.breakdowns.wrapper} />
+      </div>
+      </>}
+
+      {openSymbol && (
+        <HoldingSidePanel symbol={openSymbol} onClose={() => setOpenSymbol(null)} onChanged={load} />
+      )}
+    </div>
+  );
+}
+
+function BreakdownPanel({ title, rows }) {
+  const t = useTheme();
+  const [view, setView] = useState("bars");
+
+  return (
+    <Panel>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 20px 11px", borderBottom: `1px solid ${t.border}` }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: t.text, letterSpacing: 1.5, fontFamily: "monospace" }}>{title}</span>
+        <div style={{ display: "flex", gap: 4 }}>
+          {[{ key: "bars", label: "BARS" }, { key: "pie", label: "PIE" }].map(v => (
+            <button key={v.key} onClick={() => setView(v.key)} style={toggleBtn(t, view === v.key)}>{v.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {view === "bars" ? (
+        <div style={{ padding: "18px 22px", minHeight: 316, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+          {rows.map(b => (
+            <div key={b.label} style={{ marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, marginBottom: 6 }}>
+                <span style={{ color: t.textSecondary }}>{b.label}</span>
+                <span style={{ color: t.text, fontFamily: "monospace" }}>{b.pct.toFixed(1)}%</span>
+              </div>
+              <div style={{ height: 6, background: t.surfaceInset, borderRadius: 3 }}>
+                <div style={{ width: `${b.pct}%`, height: "100%", background: t.info, borderRadius: 3 }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ padding: "18px 22px", minHeight: 280 }}>
+          <ResponsiveContainer width="100%" height={280}>
+            <PieChart>
+              <Pie data={rows} dataKey="pct" nameKey="label" cx="50%" cy="50%"
+                innerRadius={62} outerRadius={110} paddingAngle={1} isAnimationActive={false}>
+                {rows.map((b, i) => (
+                  <Cell key={b.label} fill={HOLDING_LINE_COLORS[i % HOLDING_LINE_COLORS.length]} stroke={t.surface} strokeWidth={2} />
+                ))}
+              </Pie>
+              <Tooltip
+                contentStyle={{ background: t.tooltipBg, border: `1px solid ${t.border}`, borderRadius: 4, fontFamily: "monospace", fontSize: 13 }}
+                labelStyle={{ color: t.textSecondary }}
+                itemStyle={{ color: t.text }}
+                formatter={(v, name) => [`${v.toFixed(1)}%`, name]}
+              />
+              <Legend wrapperStyle={{ fontSize: 12, fontFamily: "monospace" }} />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ============================================================
+// ALLOCATE — "I have cash, what do I do with it?"
+//
+// Two modes. Manual reads the target_pct you've set on holdings (in Add/Edit
+// Position) and is a thin view onto the existing directContribution engine —
+// nothing here invents that logic. Auto needs no targets: every candidate
+// (your holdings, Screener matches, watchlist symbols) is scored from the
+// same engines that already power Research, Risk and the Screener, and cash
+// splits toward whatever clears the bar. Every line says why. Nothing here
+// ever proposes a sale — it only ever directs new money.
+// ============================================================
+
+function TiltBar({ tilt }) {
+  const t = useTheme();
+  if (tilt == null) return <span style={{ color: t.textMuted, fontSize: 10 }}>n/a</span>;
+  const pct = Math.round(((tilt + 1) / 2) * 100);
+  const color = tilt > 0.05 ? t.positive : tilt < -0.05 ? t.negative : t.textSecondary;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ width: 64, height: 5, background: t.surfaceInset, borderRadius: 3, position: "relative" }}>
+        <div style={{ position: "absolute", left: "50%", top: -2, bottom: -2, width: 1, background: t.borderStrong }} />
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3 }} />
+      </div>
+      <span style={{ fontSize: 10, color, fontFamily: "monospace", width: 34 }}>{tilt >= 0 ? "+" : ""}{tilt.toFixed(2)}</span>
+    </div>
+  );
+}
+
+function AllocationRow({ a }) {
+  const t = useTheme();
+  return (
+    <div style={{ padding: "12px 18px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>{a.symbol}</span>
+        <span style={{ fontSize: 15, fontWeight: 700, color: t.positive, fontFamily: "monospace" }}>
+          £{a.value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          <span style={{ fontSize: 11, color: t.textSecondary, fontWeight: 400, marginLeft: 8 }}>{a.pctOfContribution}%</span>
+        </span>
+      </div>
+      {(a.reasons ?? []).map((r, i) => (
+        <div key={i} style={{ fontSize: 11, color: t.textSecondary, marginTop: 4 }}>· {r}</div>
+      ))}
+    </div>
+  );
+}
+
+function AllocatePage() {
+  const t = useTheme();
+  const [mode, setMode] = useState("auto");
+  const [amount, setAmount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [candidates, setCandidates] = useState(null);
+  const [loadingCandidates, setLoadingCandidates] = useState(true);
+  const [cashHint, setCashHint] = useState(null);
+  const [includeScreener, setIncludeScreener] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API}/portfolio`).then(r => r.json()).then(d => {
+      if (!cancelled && typeof d.cash === "number") setCashHint(d.cash);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (cashHint != null && amount === "") setAmount(String(Math.max(0, Math.round(cashHint))));
+  }, [cashHint]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingCandidates(true);
+    fetch(`${API}/allocate/candidates?includeScreener=${includeScreener ? "1" : "0"}`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) setCandidates(d); })
+      .catch(() => { if (!cancelled) setCandidates(null); })
+      .finally(() => { if (!cancelled) setLoadingCandidates(false); });
+    return () => { cancelled = true; };
+  }, [includeScreener]);
+
+  async function generate() {
+    const amt = Number(amount);
+    if (!amt || amt <= 0) { setError("Enter an amount greater than zero."); return; }
+    setBusy(true); setError(null); setResult(null);
+    try {
+      const res = await fetch(`${API}/allocate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount: amt, mode, includeScreener }),
+      });
+      const d = await res.json();
+      if (d.error) setError(d.error); else setResult(d);
+    } catch {
+      setError("Could not reach the server.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const hasTargets = candidates?.scored?.some(s => s.weight > 0) ?? true; // best-effort hint only
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 860 }}>
+      <div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: t.text, fontFamily: "monospace" }}>ALLOCATE</div>
+        <div style={{ fontSize: 13, color: t.textMuted, marginTop: 3 }}>
+          {cashHint != null ? `£${cashHint.toLocaleString(undefined, { maximumFractionDigits: 0 })} cash available` : "New cash to deploy"}
+        </div>
+      </div>
+
+      <Panel style={{ padding: 18 }}>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: 10, color: t.textMuted, letterSpacing: 1, marginBottom: 6 }}>MODE</div>
+            <div style={{ display: "flex", gap: 4 }}>
+              {[{ key: "auto", label: "AUTO" }, { key: "manual", label: "MY TARGETS" }].map(m => (
+                <button key={m.key} onClick={() => { setMode(m.key); setResult(null); setError(null); }}
+                  style={{ ...rangeBtn(t, mode === m.key), padding: "7px 12px", fontWeight: 700 }}>{m.label}</button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: t.textMuted, letterSpacing: 1, marginBottom: 6 }}>AMOUNT (£)</div>
+            <input type="number" value={amount} onChange={e => setAmount(e.target.value)}
+              style={fieldStyle(140, t)} placeholder="5000" />
+          </div>
+          <button onClick={generate} disabled={busy} style={{ ...btn(t.accent), padding: "8px 18px", fontSize: 12, opacity: busy ? 0.6 : 1 }}>
+            {busy ? "WORKING…" : "GENERATE PLAN"}
+          </button>
+          {mode === "auto" && (
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: t.textSecondary, cursor: "pointer", paddingBottom: 8 }}>
+              <input type="checkbox" checked={includeScreener} onChange={e => setIncludeScreener(e.target.checked)} />
+              Also search the Screener for new ideas (slower — scans your whole tracked universe)
+            </label>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: t.textMuted, marginTop: 12, lineHeight: 1.5 }}>
+          {mode === "auto"
+            ? "Scores your holdings and watchlist against Bull/Bear, Precedents, the Screener and current risk contribution — cash splits toward whatever clears the bar, with reasons. Never proposes a sale."
+            : "Reads the target % you've set on each holding (Portfolio → Add/Edit Position) and splits this amount to move you toward those targets, same as the numbers already shown there."}
+        </div>
+        {mode === "manual" && !hasTargets && (
+          <div style={{ fontSize: 11, color: t.warning, marginTop: 8 }}>
+            ⚠ None of your holdings have a target % set yet — set one on each holding first, or use AUTO instead.
+          </div>
+        )}
+        {error && <div style={{ fontSize: 12, color: t.negative, marginTop: 10 }}>⚠ {error}</div>}
+      </Panel>
+
+      {result && (
+        <>
+          <Panel>
+            <SectionHeader title="ALLOCATION" subtitle={mode === "auto" ? "ranked by conviction" : "toward your targets"} />
+            {(result.allocations ?? []).length ? (
+              result.allocations.map(a => <AllocationRow key={a.symbol} a={a} />)
+            ) : (
+              <div style={{ padding: 18, fontSize: 12, color: t.textSecondary }}>
+                {(result.notes ?? []).join(" ") || "Nothing allocated."}
+              </div>
+            )}
+            {mode === "manual" && result.driftAfter != null && (
+              <div style={{ padding: "10px 18px", fontSize: 11, color: t.textMuted, borderTop: `1px solid ${t.borderSubtle}` }}>
+                Max drift from target: {result.driftBefore}% before → {result.driftAfter}% after.
+              </div>
+            )}
+          </Panel>
+
+          {result.rejected?.length > 0 && (
+            <Panel>
+              <SectionHeader title="CONSIDERED, NOT FUNDED" subtitle={`${result.rejected.length} candidate${result.rejected.length === 1 ? "" : "s"}`} />
+              {result.rejected.map(r => (
+                <div key={r.symbol} style={{ padding: "10px 18px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: t.textSecondary, fontFamily: "monospace" }}>{r.symbol}</span>
+                    <TiltBar tilt={r.tilt} />
+                  </div>
+                  {r.reasons?.[0] && <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 3 }}>{r.reasons[0]}</div>}
+                </div>
+              ))}
+            </Panel>
+          )}
+
+          {result.secondOpinion && (
+            <Panel style={{ padding: 18 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: t.textSecondary, letterSpacing: 1, marginBottom: 4 }}>
+                STATISTICAL ALTERNATIVE — {result.secondOpinion.method === "maxSharpe" ? "MAX SHARPE" : result.secondOpinion.method.toUpperCase()}
+              </div>
+              <div style={{ fontSize: 10.5, color: t.textMuted, marginBottom: 10 }}>
+                Mean-variance optimisation over the same symbols, for comparison — not the recommendation above.
+                A handful of overlapping index trackers can produce brittle, corner-heavy weights here, so treat this as a second opinion, not an answer.
+              </div>
+              {Object.entries(result.secondOpinion.weights).map(([sym, w]) => (
+                <div key={sym} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", fontFamily: "monospace" }}>
+                  <span style={{ color: t.text }}>{sym}</span>
+                  <span style={{ color: t.accent }}>{(w * 100).toFixed(1)}%</span>
+                </div>
+              ))}
+            </Panel>
+          )}
+        </>
+      )}
+
+      {!result && (
+        <Panel>
+          <SectionHeader title="CANDIDATES" subtitle={loadingCandidates ? "loading…" : `${candidates?.scored?.length ?? 0} in view`} />
+          {loadingCandidates ? (
+            <div style={{ padding: 18, fontSize: 12, color: t.textSecondary }}>Loading…</div>
+          ) : !candidates?.scored?.length ? (
+            <div style={{ padding: 18, fontSize: 12, color: t.textSecondary }}>No candidates yet — add a holding or watchlist symbol first.</div>
+          ) : (
+            candidates.scored.map(s => (
+              <div key={s.symbol} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 18px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+                <span style={{ fontSize: 12, color: t.text, fontFamily: "monospace" }}>{s.symbol}</span>
+                <TiltBar tilt={s.tilt} />
+              </div>
+            ))
+          )}
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+
+// ============================================================
+// SETTINGS PAGE
+// ============================================================
+
+/**
+ * Per-symbol data freshness in one table, with resync on the spot.
+ *
+ * "Is my data current?" was previously answerable only by curl or by noticing
+ * a chart looked wrong. Staleness is calendar days since the last stored bar
+ * — weekends legitimately show 1-2 days everywhere, so the flag threshold is
+ * 4, past any normal market closure.
+ */
+function DataHealthPanel() {
+  const t = useTheme();
+  const [health, setHealth] = useState(null);
+  const [syncing, setSyncing] = useState(null); // symbol being synced, or "*"
+  const [showAll, setShowAll] = useState(false);
+
+  const load = useCallback(() => {
+    fetch(`${API}/system/health`).then(r => r.json()).then(setHealth).catch(() => setHealth(null));
+  }, []);
+  useEffect(load, [load]);
+
+  const resync = async symbols => {
+    setSyncing(symbols ? symbols[0] : "*");
+    try {
+      await fetch(`${API}/sync`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(symbols ? { symbols } : {}),
+      });
+      load();
+    } finally { setSyncing(null); }
+  };
+
+  if (!health) {
+    return <Panel><SectionHeader title="DATA HEALTH" subtitle="Loading…" /><div style={{ padding: 14, fontSize: 11, color: t.textMuted }}>Reading the store…</div></Panel>;
+  }
+
+  const stale = health.coverage.filter(c => c.stale);
+  const rows = showAll ? health.coverage : health.coverage.filter(c => c.stale).concat(health.coverage.filter(c => !c.stale).slice(0, 6));
+  const newsAge = health.news.latestPublished ? Math.round((Date.now() - health.news.latestPublished) / 3_600_000) : null;
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="DATA HEALTH"
+        subtitle={`${health.symbols.stored} symbols stored · ${health.totalBars.toLocaleString()} bars · memory to ${health.memory.latestDate ?? "never"}`}
+        action={syncing === "*" ? "SYNCING…" : "SYNC ALL"}
+        onAction={() => syncing || resync(null)}
+      />
+      <div style={{ padding: "10px 14px 4px", display: "flex", gap: 14, flexWrap: "wrap", fontSize: 10.5, fontFamily: "monospace" }}>
+        <span style={{ color: stale.length ? t.warning : t.accent }}>
+          {stale.length ? `${stale.length} symbol${stale.length === 1 ? "" : "s"} stale (>4 days)` : "All stored history current"}
+        </span>
+        {health.symbols.unstored.length > 0 && (
+          <span style={{ color: t.warning }} title={health.symbols.unstored.join(", ")}>
+            {health.symbols.unstored.length} tracked with no bars at all
+          </span>
+        )}
+        <span style={{ color: t.textMuted }}>
+          news feed: {health.news.stories} stories{newsAge != null ? `, newest ${newsAge}h old` : ""}
+        </span>
+        <span style={{ color: t.textMuted }}>
+          overnight sync: {health.lastOvernightSync ?? "not yet run — runs 5-8am while the app is up"}
+        </span>
+      </div>
+      <div style={{ padding: "6px 8px 6px", overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+          <thead>
+            <tr style={{ color: t.textMuted, fontFamily: "monospace", fontSize: 9 }}>
+              {["SYMBOL", "BARS", "FIRST", "LAST", "AGE", ""].map((h, i) => (
+                <th key={i} style={{ textAlign: i === 0 ? "left" : "right", padding: "5px 8px", fontWeight: 400, letterSpacing: 0.5 }}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(c => (
+              <tr key={c.symbol} style={{ borderTop: `1px solid ${t.borderSubtle}` }}>
+                <td style={{ padding: "5px 8px", fontFamily: "monospace", color: t.text }}>{c.symbol}</td>
+                <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: "monospace", color: t.textSecondary }}>{c.bars.toLocaleString()}</td>
+                <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: "monospace", color: t.textMuted }}>{c.first}</td>
+                <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: "monospace", color: t.textMuted }}>{c.last}</td>
+                <td style={{ padding: "5px 8px", textAlign: "right", fontFamily: "monospace", color: c.stale ? t.warning : t.accent }}>
+                  {c.staleDays}d
+                </td>
+                <td style={{ padding: "5px 8px", textAlign: "right" }}>
+                  <button onClick={() => syncing || resync([c.symbol])} style={{
+                    background: "transparent", border: `1px solid ${t.borderStrong}`, borderRadius: 3,
+                    color: syncing === c.symbol ? t.warning : t.info, padding: "1px 7px",
+                    cursor: "pointer", fontFamily: "monospace", fontSize: 9,
+                  }}>{syncing === c.symbol ? "…" : "SYNC"}</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {health.coverage.length > rows.length && (
+          <button onClick={() => setShowAll(true)} style={{
+            background: "none", border: "none", color: t.info, cursor: "pointer",
+            fontFamily: "monospace", fontSize: 10, padding: "8px",
+          }}>show all {health.coverage.length} symbols</button>
+        )}
+        {showAll && (
+          <button onClick={() => setShowAll(false)} style={{
+            background: "none", border: "none", color: t.textMuted, cursor: "pointer",
+            fontFamily: "monospace", fontSize: 10, padding: "8px",
+          }}>collapse</button>
+        )}
+      </div>
+    </Panel>
+  );
+}
+
+/**
+ * One-click export of everything that exists nowhere else.
+ *
+ * Prices, news and observations are all rebuildable from their sources. The
+ * holdings, cash and transaction rows are not — they live only in
+ * meridian.db, which is gitignored, excluded from auto-update's backups, and
+ * has no version history. This is the app's own answer to that gap.
+ */
+function BackupPanel() {
+  const t = useTheme();
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);
+
+  const download = (filename, text, type = "text/csv") => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type }));
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const toCsv = rows => {
+    if (!rows?.length) return "";
+    const cols = Object.keys(rows[0]);
+    const esc = v => v == null ? "" : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+    return [cols.join(","), ...rows.map(r => cols.map(c => esc(r[c])).join(","))].join("\n");
+  };
+
+  const exportAll = async () => {
+    setBusy(true); setDone(null);
+    try {
+      const stamp = new Date().toISOString().slice(0, 10);
+      const [holdings, portfolio, transactions] = await Promise.all([
+        fetch(`${API}/holdings`).then(r => r.json()),
+        fetch(`${API}/portfolio`).then(r => r.json()),
+        fetch(`${API}/transactions`).then(r => r.json()),
+      ]);
+      const h = holdings.holdings ?? [];
+      const cash = portfolio.cashAccounts ?? portfolio.cash ?? [];
+      const tx = transactions.transactions ?? [];
+      download(`meridian-backup-${stamp}.json`, JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        holdings: h, cash: Array.isArray(cash) ? cash : [], transactions: tx,
+      }, null, 2), "application/json");
+      if (h.length) download(`meridian-holdings-${stamp}.csv`, toCsv(h));
+      if (tx.length) download(`meridian-transactions-${stamp}.csv`, toCsv(tx));
+      setDone(`Exported ${h.length} holdings, ${tx.length} transactions.`);
+    } catch {
+      setDone("Export failed — is the API running?");
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Panel>
+      <SectionHeader
+        title="BACKUP"
+        subtitle="Holdings, cash and transactions — the only data with no other copy anywhere"
+        action={busy ? "EXPORTING…" : "EXPORT"}
+        onAction={() => busy || exportAll()}
+      />
+      <div style={{ padding: 14, fontSize: 11.5, color: t.textSecondary, lineHeight: 1.7 }}>
+        Everything else Meridian holds (prices, news, observations) can be re-fetched or recomputed.
+        These rows cannot: they exist only in <code style={{ color: t.accent, fontFamily: "monospace" }}>meridian.db</code>,
+        which is deliberately outside git and outside the auto-update backups. Export writes a dated
+        JSON bundle plus CSVs to your Downloads folder — keep one somewhere safe after any change to
+        your holdings.
+        {done && <div style={{ marginTop: 8, color: done.startsWith("Export failed") ? t.warning : t.accent, fontFamily: "monospace", fontSize: 11 }}>{done}</div>}
+      </div>
+    </Panel>
+  );
+}
+
+/** What changed in the app itself — git history, read from the local clone. */
+function ChangelogPanel() {
+  const t = useTheme();
+  const [log, setLog] = useState(null);
+  useEffect(() => {
+    fetch(`${API}/changelog?limit=20`).then(r => r.json()).then(setLog).catch(() => setLog({ commits: [], error: "Could not reach the API." }));
+  }, []);
+  if (!log) return null;
+  return (
+    <Panel>
+      <SectionHeader title="WHAT'S CHANGED IN MERIDIAN" subtitle="Recent updates, from this clone's git history" />
+      {log.error ? (
+        <div style={{ padding: 14, fontSize: 11.5, color: t.textMuted }}>{log.error}</div>
+      ) : (
+        <div style={{ padding: "6px 0", maxHeight: 300, overflowY: "auto" }}>
+          {log.commits.filter(c => !c.subject.startsWith("Merge pull request")).map(c => (
+            <div key={c.hash} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "5px 16px", borderBottom: `1px solid ${t.borderSubtle}` }}>
+              <span style={{ fontSize: 9.5, color: t.textFaint, fontFamily: "monospace", flexShrink: 0 }}>{c.date}</span>
+              <span style={{ fontSize: 11.5, color: t.textSecondary, lineHeight: 1.5 }}>{c.subject}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// A page-level error boundary. Nothing else in this file has one, which means
+// a single uncaught exception anywhere in a page's render tree currently
+// unmounts the entire app back to a blank screen — sidebar, header, all of
+// it. Rebuild is the first page assembling a large amount of real-money data
+// through code paths (fund composition parsing, per-candidate diligence)
+// that have not yet run against live data, so a containment boundary here is
+// not optional. Class component because React only supports error boundaries
+// as classes; nothing else in this file needs to be one.
+class RebuildErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) {
+    console.error("Rebuild page crashed:", error, info?.componentStack);
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <RebuildCrashPanel error={this.state.error} onReset={() => this.setState({ error: null })} />;
+  }
+}
+
+function RebuildCrashPanel({ error, onReset }) {
+  const t = useTheme();
+  return (
+    <Panel style={{ borderColor: t.negative }}>
+      <div style={{ padding: 20 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: t.negative, marginBottom: 8 }}>
+          ⚠ Rebuild hit an error rendering this report
+        </div>
+        <div style={{ fontSize: 12, color: t.textSecondary, lineHeight: 1.6, marginBottom: 10 }}>
+          Nothing was traded or changed — this is a display bug, not a data problem. The rest of the app is
+          unaffected. Please share this message so it can be fixed:
+        </div>
+        <div style={{
+          fontFamily: "monospace", fontSize: 11.5, color: t.text, background: t.surfaceInset,
+          border: `1px solid ${t.border}`, borderRadius: 4, padding: "10px 12px", marginBottom: 12,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+        }}>
+          {error?.message ?? String(error)}
+        </div>
+        <button onClick={onReset} style={toggleBtn(t, false)}>TRY AGAIN</button>
+      </div>
+    </Panel>
+  );
+}
+
+// ============================================================
+// REBUILD — "what portfolio should exist?"
+//
+// A report, not a control panel. It reads top to bottom as an argument:
+// what is actually owned, where it is owned twice, what was considered,
+// what would be built instead, what to trade, and — last and deliberately
+// not buried — everything the pipeline could not see.
+// ============================================================
+
+const pct1 = v => (v == null ? "—" : `${v >= 0 ? "" : ""}${v.toFixed(1)}%`);
+const gbp0 = v => (v == null ? "—" : `£${Math.round(v).toLocaleString()}`);
+
+function RebuildHead({ label, note, right }) {
+  const t = useTheme();
+  return (
+    <div style={{
+      display: "flex", alignItems: "baseline", justifyContent: "space-between",
+      gap: 12, padding: "11px 16px", borderBottom: `1px solid ${t.border}`, flexWrap: "wrap",
+    }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 12, fontWeight: 700, color: t.text, letterSpacing: 1.4, fontFamily: "monospace" }}>
+          {label}
+        </span>
+        {note && <span style={{ fontSize: 11, color: t.textMuted }}>{note}</span>}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function VerdictChip({ verdict }) {
+  const t = useTheme();
+  const map = {
+    duplicate: [t.negative, "DUPLICATE"],
+    "heavy-overlap": [t.warning, "HEAVY OVERLAP"],
+    related: [t.info, "RELATED"],
+    distinct: [t.textMuted, "DISTINCT"],
+    "cannot-assess": [t.textFaint, "CANNOT ASSESS"],
+    included: [t.positive, "INCLUDED"],
+    excluded: [t.textMuted, "EXCLUDED"],
+  };
+  const [color, text] = map[verdict] ?? [t.textMuted, String(verdict ?? "").toUpperCase()];
+  return (
+    <span style={{
+      fontSize: 9.5, fontFamily: "monospace", letterSpacing: 0.8, color,
+      border: `1px solid ${color}`, borderRadius: 3, padding: "1px 6px", whiteSpace: "nowrap",
+    }}>{text}</span>
+  );
+}
+
+function ConvictionBar({ value, bar = 0 }) {
+  const t = useTheme();
+  if (value == null) return <NoData reason="No component could be measured" compact />;
+  const color = value >= 0.6 ? t.positive : value >= bar ? t.info : t.textMuted;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <div style={{ width: 70, height: 5, background: t.surfaceInset, borderRadius: 3, position: "relative" }}>
+        <div style={{ width: `${Math.round(value * 100)}%`, height: "100%", background: color, borderRadius: 3 }} />
+        {bar > 0 && (
+          <div style={{
+            position: "absolute", left: `${Math.round(bar * 100)}%`, top: -2, bottom: -2,
+            width: 1, background: t.borderStrong,
+          }} title={`Mandate bar: ${bar.toFixed(2)}`} />
+        )}
+      </div>
+      <span style={{ fontSize: 10.5, color, fontFamily: "monospace", width: 30 }}>{value.toFixed(2)}</span>
+    </div>
+  );
+}
+
+/** Stage A on its own. Loads without running the full pipeline, because it is
+ *  useful even when nothing else can run. */
+function ExposureFindings({ teardown }) {
+  const t = useTheme();
+  if (!teardown) return null;
+  const clusters = teardown.redundancy?.clusters ?? [];
+
+  return (
+    <Panel>
+      <RebuildHead
+        label="WHAT YOU ACTUALLY OWN"
+        note={`${teardown.coverage.positions} holdings · ${teardown.coverage.withComposition} with published composition`}
+      />
+
+      <div style={{ padding: "12px 16px" }}>
+        {clusters.length === 0 ? (
+          <div style={{ fontSize: 12, color: t.textSecondary }}>
+            No duplicated exposure found between holdings.
+            {teardown.coverage.note && (
+              <span style={{ color: t.warning }}> {teardown.coverage.note}</span>
+            )}
+          </div>
+        ) : (
+          clusters.map(c => (
+            <div key={c.anchor} style={{
+              border: `1px solid ${t.negative}`, borderRadius: 6,
+              padding: "10px 12px", marginBottom: 10, background: t.surfaceAlt,
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
+                <VerdictChip verdict="duplicate" />
+                <span style={{ fontSize: 12.5, color: t.text, fontFamily: "monospace", fontWeight: 700 }}>
+                  {c.members.join("  +  ")}
+                </span>
+                <span style={{ fontSize: 11, color: t.negative }}>{c.combinedWeight}% of portfolio</span>
+              </div>
+              <div style={{ fontSize: 11.5, color: t.textSecondary, lineHeight: 1.55 }}>{c.explain}</div>
+              {c.pairs?.map((p, i) => (
+                <div key={i} style={{ fontSize: 10.5, color: t.textMuted, marginTop: 5, lineHeight: 1.5 }}>
+                  {p.basis.join(" · ")}
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+
+      {teardown.names?.duplicatedAcross?.length > 0 && (
+        <>
+          <RebuildHead
+            label="HELD THROUGH MORE THAN ONE FUND"
+            note={teardown.names.note ? "floors only — top-ten holdings are all that is published" : null}
+          />
+          <div style={{ padding: "8px 16px 12px" }}>
+            {teardown.names.duplicatedAcross.slice(0, 8).map(n => (
+              <div key={n.name} style={{
+                display: "flex", justifyContent: "space-between", gap: 10,
+                padding: "5px 0", borderBottom: `1px solid ${t.borderSubtle}`, fontSize: 11.5,
+              }}>
+                <span style={{ color: t.text }}>{n.name}</span>
+                <span style={{ color: t.textMuted, fontFamily: "monospace" }}>
+                  ≥{n.pctOfPortfolio}% · via {n.heldVia.join(", ")}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {teardown.sectors?.sectors?.length > 0 && (
+        <>
+          <RebuildHead label="SECTOR, SEEN THROUGH THE FUNDS" note={`${teardown.sectors.covered}% of the portfolio could be seen through`} />
+          <div style={{ padding: "8px 16px 14px" }}>
+            {teardown.sectors.sectors.slice(0, 8).map(s => (
+              <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 0" }}>
+                <span style={{ fontSize: 11.5, color: t.textSecondary, width: 150 }}>{s.label}</span>
+                <div style={{ flex: 1, height: 6, background: t.surfaceInset, borderRadius: 3 }}>
+                  <div style={{ width: `${s.pctOfSeen}%`, height: "100%", background: t.info, borderRadius: 3 }} />
+                </div>
+                <span style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace", width: 48, textAlign: "right" }}>
+                  {s.pctOfSeen}%
+                </span>
+              </div>
+            ))}
+            {teardown.sectors.note && (
+              <div style={{ fontSize: 10.5, color: t.warning, marginTop: 8, lineHeight: 1.5 }}>
+                {teardown.sectors.note}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function MandateBar({ mandate, onChange, busy }) {
+  const t = useTheme();
+  // A truthy-but-incomplete mandate (a server error body, an unexpected
+  // response shape) must render as "not loaded" rather than crash on the
+  // first missing field — riskLevel and horizon are on every real mandate.
+  if (!mandate || mandate.riskLevel == null || mandate.horizon == null) return null;
+
+  const numbers = [
+    ["Max position", `${mandate.maxPositionPct ?? "—"}%`],
+    ["Max sector", `${mandate.maxSectorPct ?? "—"}%`],
+    ["Min position", `${mandate.minPositionPct ?? "—"}%`],
+    ["Max holdings", mandate.maxPositions ?? "—"],
+    ["Cash buffer", `${mandate.cashBufferPct ?? "—"}%`],
+    ["Conviction bar", typeof mandate.minConviction === "number" ? mandate.minConviction.toFixed(2) : "—"],
+  ];
+
+  return (
+    <Panel>
+      <RebuildHead label="MANDATE" note="what “better” means here — everything downstream follows from these" />
+      <div style={{ padding: "12px 16px" }}>
+        <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 12 }}>
+          <div>
+            <div style={{ fontSize: 10, color: t.textMuted, letterSpacing: 1, marginBottom: 5 }}>RISK</div>
+            <div style={{ display: "flex", gap: 5 }}>
+              {["low", "balanced", "high"].map(id => (
+                <button key={id} disabled={busy} onClick={() => onChange({ riskLevel: id })}
+                  style={rangeBtn(t, mandate.riskLevel === id)}>
+                  {id}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: t.textMuted, letterSpacing: 1, marginBottom: 5 }}>HORIZON</div>
+            <div style={{ display: "flex", gap: 5 }}>
+              {["short", "medium", "long"].map(id => (
+                <button key={id} disabled={busy} onClick={() => onChange({ horizon: id })}
+                  style={rangeBtn(t, mandate.horizon === id)}>
+                  {id}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
+          {numbers.map(([label, value]) => (
+            <div key={label}>
+              <div style={{ fontSize: 9.5, color: t.textFaint, letterSpacing: 0.8 }}>{label.toUpperCase()}</div>
+              <div style={{ fontSize: 14, color: t.text, fontFamily: "monospace", fontWeight: 700 }}>{value}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 11, lineHeight: 1.55 }}>
+          Signal weights for this horizon —{" "}
+          {Object.entries(mandate.signalWeights ?? {})
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `${k} ${Math.round(v * 100)}%`)
+            .join(" · ")}
+        </div>
+
+        {mandate.conflicts?.length > 0 && mandate.conflicts.map((c, i) => (
+          <div key={i} style={{
+            marginTop: 9, fontSize: 11, color: t.warning,
+            border: `1px solid ${t.warning}`, borderRadius: 4, padding: "7px 10px", background: t.warningSoft,
+          }}>⚠ {c}</div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function FunnelTable({ diligence, mandate }) {
+  const t = useTheme();
+  const [open, setOpen] = useState(null);
+  if (!diligence?.candidates?.length) return null;
+
+  const rows = [...diligence.candidates].sort((a, b) => (b.conviction ?? -1) - (a.conviction ?? -1));
+
+  return (
+    <Panel>
+      <RebuildHead
+        label="EVERY CANDIDATE CONSIDERED"
+        note={`${diligence.assessed} assessed · ${diligence.included} cleared the bar · ${diligence.excluded} did not`}
+      />
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${t.border}` }}>
+              {["", "Symbol", "Conviction", "Evidence", "Verdict", "Why"].map(h => (
+                <th key={h} style={{
+                  textAlign: h === "Conviction" || h === "Evidence" ? "left" : "left",
+                  padding: "7px 10px", color: t.textMuted, fontSize: 10, letterSpacing: 1, fontWeight: 400,
+                }}>{h.toUpperCase()}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(c => (
+              <React.Fragment key={c.symbol}>
+                <tr
+                  onClick={() => setOpen(open === c.symbol ? null : c.symbol)}
+                  style={{ borderBottom: `1px solid ${t.borderSubtle}`, cursor: "pointer" }}
+                >
+                  <td style={{ padding: "7px 10px", color: t.textFaint, width: 16 }}>
+                    {open === c.symbol ? "▾" : "▸"}
+                  </td>
+                  <td style={{ padding: "7px 10px", fontFamily: "monospace", color: t.text }}>
+                    {c.symbol}
+                    {c.held && <span style={{ color: t.textFaint, marginLeft: 6, fontSize: 10 }}>held</span>}
+                  </td>
+                  <td style={{ padding: "7px 10px" }}>
+                    <ConvictionBar value={c.conviction} bar={mandate?.minConviction ?? 0} />
+                  </td>
+                  <td style={{ padding: "7px 10px", fontFamily: "monospace", color: c.evidence < 0.5 ? t.warning : t.textMuted }}>
+                    {c.evidence == null ? "—" : `${Math.round(c.evidence * 100)}%`}
+                  </td>
+                  <td style={{ padding: "7px 10px" }}><VerdictChip verdict={c.verdict} /></td>
+                  <td style={{ padding: "7px 10px", color: t.textSecondary, lineHeight: 1.45 }}>{c.reason}</td>
+                </tr>
+
+                {open === c.symbol && (
+                  <tr>
+                    <td colSpan={6} style={{ background: t.surfaceAlt, padding: "10px 16px 14px" }}>
+                      <div style={{ display: "flex", gap: 22, flexWrap: "wrap" }}>
+                        {Object.entries(c.components ?? {}).map(([name, comp]) => (
+                          <div key={name} style={{ minWidth: 150 }}>
+                            <div style={{ fontSize: 9.5, color: t.textFaint, letterSpacing: 0.8, marginBottom: 3 }}>
+                              {name.toUpperCase()}
+                            </div>
+                            {comp.available ? (
+                              <>
+                                <div style={{ fontSize: 13, color: t.text, fontFamily: "monospace" }}>
+                                  {comp.value.toFixed(2)}
+                                  <span style={{ fontSize: 10, color: t.textMuted, marginLeft: 6 }}>
+                                    conf {(comp.confidence ?? 1).toFixed(2)}
+                                  </span>
+                                </div>
+                                <div style={{ fontSize: 10, color: t.textMuted, marginTop: 2, lineHeight: 1.45 }}>
+                                  {comp.source}
+                                </div>
+                              </>
+                            ) : (
+                              <div style={{ fontSize: 10.5, color: t.textFaint, lineHeight: 1.45 }}>
+                                not measured — {comp.reason}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+
+                      {c.cautions?.length > 0 && (
+                        <div style={{ marginTop: 10 }}>
+                          {c.cautions.map((w, i) => (
+                            <div key={i} style={{ fontSize: 11, color: t.warning, lineHeight: 1.5 }}>⚠ {w}</div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div style={{ fontSize: 10.5, color: t.textMuted, marginTop: 10, lineHeight: 1.5 }}>
+                        News gate: {c.news?.reason ?? "not run"}
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  );
+}
+
+function ProposalPanel({ construction, redundancy, total }) {
+  const t = useTheme();
+  if (!construction?.ok) {
+    return (
+      <Panel>
+        <RebuildHead label="PROPOSED PORTFOLIO" />
+        <div style={{ padding: "16px", fontSize: 12, color: t.negative, lineHeight: 1.6 }}>
+          ⚠ {construction?.error ?? "No portfolio could be constructed."}
+        </div>
+      </Panel>
+    );
+  }
+
+  const weights = Object.entries(construction.targetWeights).sort((a, b) => b[1] - a[1]);
+  const invested = construction.constraints?.investedShare ?? weights.reduce((a, [, w]) => a + w, 0);
+
+  return (
+    <Panel>
+      <RebuildHead
+        label="PROPOSED PORTFOLIO"
+        note={`${construction.method} · ${weights.length} holdings · ${(invested * 100).toFixed(1)}% invested`}
+      />
+
+      <div style={{ padding: "12px 16px" }}>
+        {weights.map(([symbol, w]) => (
+          <div key={symbol} style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 0" }}>
+            <span style={{ fontSize: 12, fontFamily: "monospace", color: t.text, width: 90 }}>{symbol}</span>
+            <div style={{ flex: 1, height: 8, background: t.surfaceInset, borderRadius: 3 }}>
+              <div style={{ width: `${w * 100}%`, height: "100%", background: t.accent, borderRadius: 3 }} />
+            </div>
+            <span style={{ fontSize: 11.5, fontFamily: "monospace", color: t.text, width: 52, textAlign: "right" }}>
+              {(w * 100).toFixed(1)}%
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {redundancy?.dropped?.length > 0 && (
+        <>
+          <RebuildHead label="COLLAPSED AS DUPLICATES" note="resolved before optimising, not by it" />
+          <div style={{ padding: "8px 16px 12px" }}>
+            {redundancy.dropped.map(d => (
+              <div key={d.symbol} style={{ fontSize: 11.5, color: t.textSecondary, padding: "4px 0", lineHeight: 1.5 }}>
+                <span style={{ fontFamily: "monospace", color: t.negative }}>{d.symbol}</span>{" "}
+                {d.reason}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {construction.sectorExposure?.length > 0 && (
+        <>
+          <RebuildHead label="SECTOR EXPOSURE OF THE PROPOSAL" note="proportional look-through, not fund labels" />
+          <div style={{ padding: "8px 16px 12px" }}>
+            {construction.sectorExposure.slice(0, 8).map(s => (
+              <div key={s.label} style={{ display: "flex", alignItems: "center", gap: 10, padding: "3px 0" }}>
+                <span style={{ fontSize: 11.5, color: t.textSecondary, width: 150 }}>{s.label}</span>
+                <div style={{ flex: 1, height: 6, background: t.surfaceInset, borderRadius: 3 }}>
+                  <div style={{ width: `${s.pct}%`, height: "100%", background: t.info, borderRadius: 3 }} />
+                </div>
+                <span style={{ fontSize: 11, color: t.textMuted, fontFamily: "monospace", width: 48, textAlign: "right" }}>
+                  {s.pct}%
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {(construction.constraints?.adjustments?.length > 0 || construction.constraints?.note) && (
+        <div style={{ padding: "10px 16px 14px", borderTop: `1px solid ${t.borderSubtle}` }}>
+          {construction.constraints.adjustments.map((a, i) => (
+            <div key={i} style={{ fontSize: 10.5, color: t.textMuted, lineHeight: 1.55, marginBottom: 4 }}>
+              <span style={{ color: t.textFaint, fontFamily: "monospace" }}>{a.rule}</span> — {a.detail}
+            </div>
+          ))}
+          {construction.constraints.note && (
+            <div style={{ fontSize: 10.5, color: t.warning, lineHeight: 1.55, marginTop: 4 }}>
+              {construction.constraints.note}
+            </div>
+          )}
+          {construction.expectedReturns?.note && (
+            <div style={{ fontSize: 10.5, color: t.textMuted, lineHeight: 1.55, marginTop: 6 }}>
+              {construction.expectedReturns.note}
+            </div>
+          )}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function ActionTable({ construction }) {
+  const t = useTheme();
+  if (!construction?.ok) return null;
+  const { actions, summary } = construction;
+
+  const colorFor = a => ({
+    BUY: t.positive, ADD: t.positive, SELL: t.negative, TRIM: t.warning, HOLD: t.textMuted,
+  }[a] ?? t.textMuted);
+
+  return (
+    <Panel>
+      <RebuildHead
+        label="WHAT TO TRADE"
+        note={`${summary.sells} to sell · ${summary.buys} to buy · ${summary.turnoverPct}% turnover · ${gbp0(summary.cashAfter)} left in cash`}
+      />
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+          <thead>
+            <tr style={{ borderBottom: `1px solid ${t.border}` }}>
+              {["Action", "Symbol", "Now", "Target", "Change", "Units"].map(h => (
+                <th key={h} style={{
+                  textAlign: h === "Action" || h === "Symbol" ? "left" : "right",
+                  padding: "7px 10px", color: t.textMuted, fontSize: 10, letterSpacing: 1, fontWeight: 400,
+                }}>{h.toUpperCase()}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {actions.map(a => (
+              <tr key={a.symbol} style={{ borderBottom: `1px solid ${t.borderSubtle}` }}>
+                <td style={{ padding: "7px 10px" }}>
+                  <span style={{
+                    fontSize: 10, fontFamily: "monospace", letterSpacing: 0.8, color: colorFor(a.action),
+                    border: `1px solid ${colorFor(a.action)}`, borderRadius: 3, padding: "1px 6px",
+                  }}>{a.action}</span>
+                </td>
+                <td style={{ padding: "7px 10px", fontFamily: "monospace", color: t.text }}>{a.symbol}</td>
+                <td style={{ padding: "7px 10px", textAlign: "right", color: t.textMuted, fontFamily: "monospace" }}>
+                  {a.currentWeightPct.toFixed(1)}%
+                </td>
+                <td style={{ padding: "7px 10px", textAlign: "right", color: t.text, fontFamily: "monospace" }}>
+                  {a.targetWeightPct.toFixed(1)}%
+                </td>
+                <td style={{
+                  padding: "7px 10px", textAlign: "right", fontFamily: "monospace",
+                  color: a.deltaValue > 0 ? t.positive : a.deltaValue < 0 ? t.negative : t.textMuted,
+                }}>
+                  {a.deltaValue >= 0 ? "+" : "−"}{gbp0(Math.abs(a.deltaValue)).replace("£", "£")}
+                </td>
+                <td style={{ padding: "7px 10px", textAlign: "right", fontFamily: "monospace", color: t.textMuted }}>
+                  {a.units == null ? <NoData reason="No price known for this holding" compact /> : a.units.toFixed(2)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ padding: "9px 16px", fontSize: 10.5, color: t.textFaint, lineHeight: 1.55 }}>
+        Advisory only — nothing here is placed or recorded. Moves smaller than {gbp0(summary.minTradeValue)} are
+        shown as HOLD rather than proposed as trades.
+      </div>
+    </Panel>
+  );
+}
+
+function RiskComparePanel({ risk, stress }) {
+  const t = useTheme();
+  if (!risk?.current?.available || !risk?.proposed?.available) {
+    return (
+      <Panel>
+        <RebuildHead label="RISK: NOW vs PROPOSED" />
+        <div style={{ padding: 16, fontSize: 11.5, color: t.textMuted }}>
+          {risk?.current?.reason ?? risk?.proposed?.reason ?? "Not enough overlapping history to compare."}
+        </div>
+      </Panel>
+    );
+  }
+
+  const rows = [
+    ["Annual volatility", `${risk.current.annualVolPct}%`, `${risk.proposed.annualVolPct}%`, risk.changes?.annualVolPct, true],
+    ["Diversification ratio", risk.current.diversificationRatio, risk.proposed.diversificationRatio, risk.changes?.diversificationRatio, false],
+    ["Effective holdings", risk.current.effectiveHoldings, risk.proposed.effectiveHoldings, risk.changes?.effectiveHoldings, false],
+    ["Largest position", `${risk.current.largestWeightPct}%`, `${risk.proposed.largestWeightPct}%`, risk.changes?.largestWeightPct, true],
+  ];
+
+  return (
+    <Panel>
+      <RebuildHead label="RISK: NOW vs PROPOSED" note="same measure, computed identically for both" />
+      <div style={{ padding: "10px 16px" }}>
+        {rows.map(([label, now, next, delta, lowerIsBetter]) => (
+          <div key={label} style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "7px 0", borderBottom: `1px solid ${t.borderSubtle}`, fontSize: 11.5, gap: 10,
+          }}>
+            <span style={{ color: t.textSecondary, flex: 1 }}>{label}</span>
+            <span style={{ color: t.textMuted, fontFamily: "monospace", width: 70, textAlign: "right" }}>{now}</span>
+            <span style={{ color: t.textFaint, width: 18, textAlign: "center" }}>→</span>
+            <span style={{ color: t.text, fontFamily: "monospace", width: 70, textAlign: "right" }}>{next}</span>
+            <span style={{
+              width: 62, textAlign: "right", fontFamily: "monospace", fontSize: 11,
+              color: delta == null ? t.textFaint
+                : (lowerIsBetter ? delta < 0 : delta > 0) ? t.positive
+                : delta === 0 ? t.textMuted : t.negative,
+            }}>
+              {delta == null ? "—" : `${delta >= 0 ? "+" : ""}${delta}`}
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {stress?.comparison && (
+        <>
+          <RebuildHead label="WORST STORED SCENARIO" note={stress.comparison.scenario} />
+          <div style={{ padding: "10px 16px 12px", display: "flex", gap: 26, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: 9.5, color: t.textFaint, letterSpacing: 0.8 }}>CURRENT</div>
+              <div style={{ fontSize: 17, color: t.negative, fontFamily: "monospace", fontWeight: 700 }}>
+                {pct1(stress.comparison.worstCaseCurrentPct)}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9.5, color: t.textFaint, letterSpacing: 0.8 }}>PROPOSED</div>
+              <div style={{ fontSize: 17, color: t.negative, fontFamily: "monospace", fontWeight: 700 }}>
+                {pct1(stress.comparison.worstCaseProposedPct)}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 9.5, color: t.textFaint, letterSpacing: 0.8 }}>DIFFERENCE</div>
+              <div style={{
+                fontSize: 17, fontFamily: "monospace", fontWeight: 700,
+                color: stress.comparison.differencePct > 0 ? t.positive : t.negative,
+              }}>
+                {stress.comparison.differencePct >= 0 ? "+" : ""}{stress.comparison.differencePct}pp
+              </div>
+            </div>
+          </div>
+          {stress.note && (
+            <div style={{ padding: "0 16px 12px", fontSize: 10.5, color: t.textFaint, lineHeight: 1.55 }}>
+              {stress.note}
+            </div>
+          )}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function DataGapsPanel({ gaps }) {
+  const t = useTheme();
+  if (!gaps?.length) return null;
+  return (
+    <Panel style={{ borderColor: t.warning }}>
+      <RebuildHead label="WHAT THIS REPORT COULD NOT SEE" note={`${gaps.length} gaps`} />
+      <div style={{ padding: "10px 16px 14px" }}>
+        {gaps.map((g, i) => (
+          <div key={i} style={{ padding: "6px 0", borderBottom: i < gaps.length - 1 ? `1px solid ${t.borderSubtle}` : "none" }}>
+            <div style={{ fontSize: 11.5, color: t.textSecondary, lineHeight: 1.55 }}>
+              <span style={{ fontFamily: "monospace", color: t.warning, fontSize: 10, letterSpacing: 0.8 }}>
+                {g.stage.toUpperCase()}
+              </span>{" "}
+              {g.issue}
+            </div>
+            {g.detail && (
+              <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 3, fontFamily: "monospace" }}>
+                {Array.isArray(g.detail) ? g.detail.join(", ") : g.detail}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
+function VerdictPanel({ construction }) {
+  const t = useTheme();
+  if (!construction?.ok) return null;
+  const actions = construction.actions ?? [];
+  const sells = actions.filter(a => a.action === "SELL");
+  const trims = actions.filter(a => a.action === "TRIM");
+  const buys = actions.filter(a => a.action === "BUY" || a.action === "ADD");
+  const holds = actions.filter(a => a.action === "HOLD");
+  const moves = [...sells, ...trims, ...buys];
+
+  const parts = [];
+  if (sells.length) parts.push(`sell ${sells.length}`);
+  if (trims.length) parts.push(`trim ${trims.length}`);
+  if (buys.length) parts.push(`buy ${buys.length} new`);
+  const lead = parts.length
+    ? `${parts.join(", ")}${holds.length ? `, and hold ${holds.length} as-is` : ""}.`
+    : "hold everything as-is — nothing here clears the bar for a change under this mandate.";
+
+  const colorFor = a => ({ SELL: t.negative, TRIM: t.warning, BUY: t.positive, ADD: t.positive }[a] ?? t.textMuted);
+
+  return (
+    <Panel style={{ borderColor: t.accent }}>
+      <div style={{ padding: "18px 20px 6px" }}>
+        <div style={{ fontSize: 11, letterSpacing: 1, color: t.accent, fontWeight: 700, marginBottom: 8 }}>THE CALL</div>
+        <div style={{ fontSize: 16, color: t.text, lineHeight: 1.55, maxWidth: 680 }}>
+          This mandate would {lead}
+        </div>
+      </div>
+      {moves.length > 0 && (
+        <div style={{ padding: "8px 8px 14px" }}>
+          {moves.map(a => (
+            <div key={a.symbol} style={{ display: "flex", alignItems: "center", gap: 14, padding: "9px 12px", flexWrap: "wrap" }}>
+              <span style={{
+                fontSize: 10.5, fontFamily: "monospace", fontWeight: 700, letterSpacing: 0.6,
+                color: colorFor(a.action), border: `1px solid ${colorFor(a.action)}`,
+                borderRadius: 4, padding: "2px 8px", width: 46, textAlign: "center", flexShrink: 0,
+              }}>{a.action}</span>
+              <span style={{ fontFamily: "monospace", fontWeight: 600, color: t.text, width: 84, flexShrink: 0 }}>{a.symbol}</span>
+              <span style={{ fontSize: 12, color: t.textSecondary, flex: 1, minWidth: 160 }}>{a.reason ?? ""}</span>
+              <span style={{
+                fontFamily: "monospace", fontSize: 12, flexShrink: 0,
+                color: a.deltaValue > 0 ? t.positive : a.deltaValue < 0 ? t.negative : t.textMuted,
+              }}>{a.deltaValue >= 0 ? "+" : "−"}{gbp0(Math.abs(a.deltaValue))}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ padding: "0 20px 14px", fontSize: 10.5, color: t.textFaint }}>
+        Advisory only — nothing here is placed or recorded.
+      </div>
+    </Panel>
+  );
+}
+
+function RebuildPage() {
+  const t = useTheme();
+  const [mandate, setMandate] = useState(null);
+  const [exposure, setExposure] = useState(null);
+  const [report, setReport] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState(null);
+  const [includeTracked, setIncludeTracked] = useState(true);
+
+  useEffect(() => {
+    fetch(`${API}/rebuild/mandate`).then(r => r.json()).then(setMandate).catch(() => setMandate(null));
+    fetch(`${API}/rebuild/exposure`).then(r => r.json()).then(setExposure).catch(() => setExposure(null));
+  }, []);
+
+  async function saveMandate(patch) {
+    try {
+      const res = await fetch(`${API}/rebuild/mandate`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      setMandate(await res.json());
+    } catch { /* leave the current mandate showing rather than blanking it */ }
+  }
+
+  async function run() {
+    setRunning(true); setError(null);
+    try {
+      const res = await fetch(`${API}/rebuild`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ includeTracked }),
+      });
+      const data = await res.json();
+      if (data.error && !data.stages) setError(data.error);
+      else setReport(data);
+    } catch {
+      setError("Could not reach the server.");
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  async function syncCompositions() {
+    setSyncing(true); setSyncMsg(null);
+    try {
+      const res = await fetch(`${API}/rebuild/compositions/sync`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      const d = await res.json();
+      setSyncMsg(`${d.updated?.length ?? 0} updated, ${d.skipped?.length ?? 0} skipped, ${d.failed?.length ?? 0} failed.`);
+      const ex = await fetch(`${API}/rebuild/exposure`).then(r => r.json());
+      setExposure(ex);
+    } catch {
+      setSyncMsg("Composition sync could not reach Yahoo. The teardown is still running on stored data.");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div>
+        <div style={{ fontSize: 22, fontWeight: 700, color: t.text, fontFamily: "monospace", letterSpacing: 1 }}>
+          REBUILD
+        </div>
+        <div style={{ fontSize: 12, color: t.textMuted, marginTop: 4, lineHeight: 1.6, maxWidth: 780 }}>
+          Assesses every holding and every investable tracked symbol against the mandate below, then proposes the
+          portfolio it would build from scratch — including selling out of things entirely and buying things never
+          held. Advisory only: it produces a trade list and never touches your holdings.
+        </div>
+      </div>
+
+      <MandateBar mandate={mandate} onChange={saveMandate} busy={running} />
+
+      <Panel>
+        <div style={{ padding: "12px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+          <button onClick={run} disabled={running} style={{
+            background: running ? t.surfaceInset : t.accentSoft,
+            border: `1px solid ${t.accent}`, color: t.accent,
+            padding: "9px 20px", borderRadius: 4, cursor: running ? "default" : "pointer",
+            fontFamily: "monospace", fontSize: 12, fontWeight: 700, letterSpacing: 1,
+          }}>
+            {running ? "RUNNING…" : "RUN REBUILD"}
+          </button>
+
+          <label style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 11.5, color: t.textSecondary, cursor: "pointer" }}>
+            <input type="checkbox" checked={includeTracked} onChange={e => setIncludeTracked(e.target.checked)} />
+            Search the whole tracked universe, not just holdings and watchlist
+          </label>
+
+          <button onClick={syncCompositions} disabled={syncing} style={toggleBtn(t, false)}>
+            {syncing ? "SYNCING…" : "SYNC FUND COMPOSITION"}
+          </button>
+          {syncMsg && <span style={{ fontSize: 11, color: t.textMuted }}>{syncMsg}</span>}
+        </div>
+
+        {error && (
+          <div style={{ padding: "0 16px 12px", fontSize: 12, color: t.negative }}>⚠ {error}</div>
+        )}
+        {report && (
+          <div style={{ padding: "0 16px 12px", fontSize: 10.5, color: t.textFaint }}>
+            Generated {new Date(report.generatedAt).toLocaleString("en-GB")} in {report.elapsedMs}ms.
+          </div>
+        )}
+      </Panel>
+
+      {!report && <ExposureFindings teardown={exposure?.teardown} />}
+
+      {report && <VerdictPanel construction={report.stages.construction} />}
+      {report && <RiskComparePanel risk={report.stages.construction?.risk} stress={report.stress} />}
+
+      {report && (
+        <details>
+          <summary style={{
+            cursor: "pointer", fontSize: 11.5, color: t.textMuted, padding: "8px 4px",
+            fontFamily: "monospace", letterSpacing: 0.6, userSelect: "none",
+          }}>
+            SHOW FULL REASONING — exposure, market context, every candidate, the raw trade table
+          </summary>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 10 }}>
+            <ExposureFindings teardown={report.stages.exposure ?? exposure?.teardown} />
+
+            {report.stages.regime && (
+              <Panel>
+                <RebuildHead label="MARKET CONTEXT" note={report.stages.regime.label} />
+                <div style={{ padding: "11px 16px" }}>
+                  <div style={{ fontSize: 11.5, color: t.textSecondary, lineHeight: 1.6 }}>
+                    {report.stages.regime.explain}
+                  </div>
+                  <div style={{ fontSize: 10.5, color: t.textFaint, marginTop: 7, lineHeight: 1.55 }}>
+                    {report.stages.regime.role}
+                  </div>
+                </div>
+              </Panel>
+            )}
+
+            <FunnelTable diligence={report.stages.diligence} mandate={report.mandate} />
+            <ProposalPanel
+              construction={report.stages.construction}
+              redundancy={report.stages.redundancy}
+              total={report.portfolio.total}
+            />
+            <ActionTable construction={report.stages.construction} />
+            <DataGapsPanel gaps={report.dataGaps} />
+          </div>
+        </details>
+      )}
+
+      {!report && !running && (
+        <Panel>
+          <div style={{ padding: "22px 16px", textAlign: "center", fontSize: 12, color: t.textMuted, lineHeight: 1.6 }}>
+            Nothing run yet. The exposure teardown above works from stored data;
+            press <span style={{ color: t.accent, fontFamily: "monospace" }}>RUN REBUILD</span> for the full assessment.
+          </div>
+        </Panel>
+      )}
+    </div>
+  );
+}
+
+function SettingsPage({ onApiKeySet }) {
+  const t = useTheme();
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("meridian_gemini_key") || "");
+  const [saved, setSaved] = useState(false);
+  const [priceLinks, setPriceLinks] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("meridian_price_links") || "[]"); } catch { return []; }
+  });
+  const [newSymbol, setNewSymbol] = useState("");
+  const [newUrl, setNewUrl] = useState("");
+
+  const saveApiKey = () => {
+    localStorage.setItem("meridian_gemini_key", apiKey);
+    onApiKeySet(apiKey);
+    // Also hand the key to the backend: news relevance scoring runs on the
+    // 10-minute refresh loop, when no browser is necessarily open, so it
+    // can't read localStorage. Stays on your machine either way.
+    pushKeyToServer(apiKey);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const addPriceLink = () => {
+    if (!newSymbol || !newUrl) return;
+    const updated = [...priceLinks, { symbol: newSymbol.toUpperCase(), url: newUrl }];
+    setPriceLinks(updated);
+    localStorage.setItem("meridian_price_links", JSON.stringify(updated));
+    setNewSymbol(""); setNewUrl("");
+  };
+
+  const removePriceLink = (i) => {
+    const updated = priceLinks.filter((_, idx) => idx !== i);
+    setPriceLinks(updated);
+    localStorage.setItem("meridian_price_links", JSON.stringify(updated));
+  };
+
+  const inputStyle = {
+    background: t.surfaceInset, border: `1px solid ${t.borderStrong}`, borderRadius: 4,
+    color: t.text, fontFamily: "monospace", fontSize: 12, padding: "8px 10px", width: "100%",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 700 }}>
+
+      {/* Import sits at the top of Settings because it is the one thing here
+          that writes to holdings, and it is what someone setting the app up on
+          a new machine needs first. */}
+      <ImportPanel />
+
+      {/* Appearance */}
+      <Panel>
+        <SectionHeader title="APPEARANCE" subtitle="Rolling out page by page — Portfolio is done; other pages follow once this looks right" />
+        <div style={{ padding: 14, display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 11, color: t.textMuted, letterSpacing: 1 }}>THEME</span>
+          {[{ id: "dark", label: "Dark" }, { id: "light", label: "Light" }].map(opt => {
+            const active = t.name === opt.id;
+            return (
+              <button key={opt.id} onClick={() => t.setTheme(opt.id)} style={{
+                background: active ? t.accentSoft : "transparent",
+                border: `1px solid ${active ? t.accent : t.borderStrong}`,
+                color: active ? t.accent : t.textMuted,
+                fontSize: 12, fontWeight: 700, padding: "6px 16px", borderRadius: 3,
+                cursor: "pointer", fontFamily: "monospace", letterSpacing: 0.5,
+              }}>{opt.label}</button>
+            );
+          })}
+        </div>
+      </Panel>
+
+      {/* API Key */}
+      <Panel>
+        <SectionHeader title="GOOGLE GEMINI API KEY" subtitle="Required for all AI features (Daily Brief, Portfolio Health, etc.)" />
+        <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 11, color: t.textSecondary }}>
+            Get a free API key at <span style={{ color: t.info }}>aistudio.google.com</span> → Get API Key. Paste it below. It is stored only on your machine.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={e => setApiKey(e.target.value)}
+              placeholder="AIza..."
+              style={{ ...inputStyle, flex: 1 }}
+            />
+            <button onClick={saveApiKey} style={{
+              background: saved ? t.accentSoft : t.infoSoft, border: `1px solid ${saved ? t.accent : t.info}`,
+              color: saved ? t.accent : t.info, padding: "8px 16px", borderRadius: 4,
+              cursor: "pointer", fontFamily: "monospace", fontSize: 11, whiteSpace: "nowrap",
+            }}>{saved ? "✓ SAVED" : "SAVE KEY"}</button>
+          </div>
+          {apiKey && <div style={{ fontSize: 10, color: t.accent, fontFamily: "monospace" }}>✓ API key configured — AI features enabled</div>}
+          {!apiKey && <div style={{ fontSize: 10, color: t.negative, fontFamily: "monospace" }}>✗ No API key — AI features disabled</div>}
+        </div>
+      </Panel>
+
+      {/* Price Links */}
+      <Panel>
+        <SectionHeader title="LIVE PRICE LINKS" subtitle="Link any stock/asset to a URL for manual price reference" />
+        <div style={{ padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ fontSize: 11, color: t.textSecondary }}>
+            Add a URL for any symbol (e.g. a Yahoo Finance or broker page). These open directly from the dashboard so you can quickly check current prices.
+          </div>
+
+          {/* Existing links */}
+          {priceLinks.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {priceLinks.map((link, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: t.surfaceInset, borderRadius: 4, border: `1px solid ${t.border}` }}>
+                  <span style={{ fontFamily: "monospace", fontWeight: 700, color: t.accent, fontSize: 12, minWidth: 60 }}>{link.symbol}</span>
+                  <a href={link.url} target="_blank" rel="noreferrer" style={{ flex: 1, color: t.info, fontSize: 11, textDecoration: "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{link.url}</a>
+                  <button onClick={() => removePriceLink(i)} style={{ background: "transparent", border: "none", color: t.negative, cursor: "pointer", fontSize: 14 }}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Add new link */}
+          <div style={{ display: "flex", gap: 8 }}>
+            <input value={newSymbol} onChange={e => setNewSymbol(e.target.value)} placeholder="Symbol (e.g. AAPL)" style={{ ...inputStyle, width: 140 }} />
+            <input value={newUrl} onChange={e => setNewUrl(e.target.value)} placeholder="https://finance.yahoo.com/quote/AAPL" style={{ ...inputStyle, flex: 1 }} />
+            <button onClick={addPriceLink} style={{
+              background: t.accentSoft, border: `1px solid ${t.accent}`, color: t.accent,
+              padding: "8px 14px", borderRadius: 4, cursor: "pointer", fontFamily: "monospace", fontSize: 11, whiteSpace: "nowrap",
+            }}>+ ADD</button>
+          </div>
+        </div>
+      </Panel>
+
+      <DataHealthPanel />
+      <BackupPanel />
+      <ChangelogPanel />
+
+      {/* This text predated the auto-update system and described manual
+          startup in a folder that no longer exists — replaced with what the
+          machine actually does now. */}
+      <Panel>
+        <SectionHeader title="HOW MERIDIAN RUNS" subtitle="Nothing to start by hand" />
+        <div style={{ padding: 14, fontSize: 11.5, color: t.textSecondary, lineHeight: 1.8 }}>
+          Meridian starts itself at login and checks GitHub for updates every 5 minutes, applying them
+          automatically with a backup of every changed file in <code style={{ color: t.accent, fontFamily: "monospace" }}>_archive\</code>.
+          Closing it keeps it closed until the next login. The UI lives at{" "}
+          <code style={{ color: t.accent, fontFamily: "monospace" }}>http://localhost:5173</code>.
+          To stop the automation entirely: <code style={{ color: t.accent, fontFamily: "monospace" }}>scripts\windows\stop-auto-update.ps1</code>.
+        </div>
+      </Panel>
+
+    </div>
+  );
+}
+
+/**
+ * Ctrl/Cmd+K jump box: pages first, then live symbol search once the query
+ * stops looking like a page name. One list, arrow keys + Enter, Escape out.
+ */
+function CommandPalette({ onClose, onPage, onSymbol }) {
+  const [query, setQuery] = useState("");
+  const [symbolResults, setSymbolResults] = useState([]);
+  const [sel, setSel] = useState(0);
+  const inputRef = useRef(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const q = query.trim().toLowerCase();
+  const pageHits = NAV_ITEMS.filter(p => !q || p.label.toLowerCase().includes(q) || p.id.includes(q));
+
+  // Symbol search kicks in from two characters — same debounce discipline as
+  // the Research box, and skipped entirely while the query is empty.
+  useEffect(() => {
+    if (q.length < 2) { setSymbolResults([]); return; }
+    const t = setTimeout(() => {
+      fetch(`${API}/search?q=${encodeURIComponent(query.trim())}`).then(r => r.json())
+        .then(d => setSymbolResults((d.results ?? []).slice(0, 6)))
+        .catch(() => setSymbolResults([]));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [q, query]);
+
+  const items = [
+    ...pageHits.map(p => ({ kind: "page", id: p.id, label: p.label, icon: p.icon })),
+    ...symbolResults.map(r => ({ kind: "symbol", id: r.symbol, label: r.name, sub: `${r.symbol}${r.exchange ? ` · ${r.exchange}` : ""}` })),
+  ];
+  const clampedSel = Math.min(sel, Math.max(items.length - 1, 0));
+
+  const activate = item => {
+    if (!item) return;
+    if (item.kind === "page") onPage(item.id);
+    else onSymbol(item.id, item.label);
+  };
+
+  const onKey = e => {
+    if (e.key === "ArrowDown") { e.preventDefault(); setSel(s => Math.min(s + 1, items.length - 1)); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); setSel(s => Math.max(s - 1, 0)); }
+    else if (e.key === "Enter") { e.preventDefault(); activate(items[clampedSel]); }
+  };
+
+  return (
+    <div onMouseDown={onClose} style={{
+      position: "fixed", inset: 0, background: "#04060acc", zIndex: 300,
+      display: "flex", justifyContent: "center", paddingTop: "14vh",
+    }}>
+      <div onMouseDown={e => e.stopPropagation()} style={{
+        width: "min(560px, 92vw)", height: "fit-content",
+        background: "#0b0f16", border: "1px solid #1a2535", borderRadius: 8,
+        boxShadow: "0 18px 60px #000c", overflow: "hidden",
+      }}>
+        <input
+          ref={inputRef} value={query}
+          onChange={e => { setQuery(e.target.value); setSel(0); }}
+          onKeyDown={onKey}
+          placeholder="Jump to a page, or search any ticker or company…"
+          style={{
+            width: "100%", background: "transparent", border: "none", outline: "none",
+            borderBottom: "1px solid #141b28", color: "#e8f0fc",
+            fontFamily: "monospace", fontSize: 14, padding: "14px 18px",
+          }}
+        />
+        <div style={{ maxHeight: 320, overflowY: "auto", padding: "6px 0" }}>
+          {items.length === 0 && (
+            <div style={{ padding: "14px 18px", fontSize: 12, color: "#4a6080" }}>
+              {q.length >= 2 ? "Nothing matches." : "Type to filter pages, or a ticker/company name."}
+            </div>
+          )}
+          {items.map((item, i) => (
+            <div
+              key={`${item.kind}-${item.id}`}
+              onMouseEnter={() => setSel(i)}
+              onMouseDown={() => activate(item)}
+              style={{
+                display: "flex", alignItems: "center", gap: 10, padding: "8px 18px",
+                cursor: "pointer", background: i === clampedSel ? "#111726" : "transparent",
+                borderLeft: i === clampedSel ? "2px solid #00d4aa" : "2px solid transparent",
+              }}
+            >
+              {item.kind === "page"
+                ? <span style={{ fontSize: 13, width: 18, textAlign: "center" }}>{item.icon}</span>
+                : <span style={{ fontSize: 8.5, width: 18, textAlign: "center", color: "#3d8bff", fontFamily: "monospace" }}>◎</span>}
+              <span style={{ fontSize: 12.5, color: "#c8d6e8", flex: 1 }}>{item.label}</span>
+              <span style={{ fontSize: 10, color: "#4a6080", fontFamily: "monospace" }}>
+                {item.kind === "page" ? "page" : item.sub}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding: "7px 18px", borderTop: "1px solid #141b28", fontSize: 9, color: "#3a4558", fontFamily: "monospace", display: "flex", gap: 14 }}>
+          <span>↑↓ move</span><span>↵ open</span><span>esc close</span>
+          <span style={{ marginLeft: "auto" }}>tickers open in Research</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function TradingTerminal() {
+  return (
+    <ThemeProvider>
+      <TradingTerminalInner />
+    </ThemeProvider>
+  );
+}
+
+function TradingTerminalInner() {
+  const t = useTheme();
+  // #/portfolio/<tab> opens the Portfolio page directly; #/gallery is the
+  // dev-only component gallery.
+  const [activePage, setActivePage] = useState(() => {
+    try { return /^#\/portfolio\//.test(window.location.hash || "") ? "portfolio" : "changed"; } catch { return "changed"; }
+  });
+  const [hash, setHash] = useState(() => { try { return window.location.hash || ""; } catch { return ""; } });
+  useEffect(() => {
+    const on = () => setHash(window.location.hash || "");
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  const { prices, feed, pulseCount, poll } = useMarketData();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("meridian_gemini_key") || GEMINI_API_KEY);
+
+  // A key saved before news scoring existed lives only in the browser — hand
+  // it to the backend once on load so ranking works without re-saving it.
+  useEffect(() => { syncKeyToServerIfNeeded(); }, []);
+
+  // Command palette (Ctrl/Cmd+K): jump to any page, or straight to a symbol
+  // on the Research page. researchJump carries a timestamp so selecting the
+  // same symbol twice still re-triggers the effect listening to it.
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [researchJump, setResearchJump] = useState(null);
+
+  // Sidebar sub-items (Research/Portfolio/Markets tabs). subNav carries a
+  // timestamp so clicking the same sub-item twice still re-fires the target
+  // page's effect. activeTabs mirrors each page's current tab back up so the
+  // sidebar can highlight whichever sub-item is actually showing.
+  const [subNav, setSubNav] = useState(null);
+  const [activeTabs, setActiveTabs] = useState({ research: "overview", portfolio: "holdings", markets: "overview" });
+  const goToSubItem = (page, tabId) => {
+    setActivePage(page);
+    setSubNav({ page, tab: tabId, ts: Date.now() });
+  };
+
+  useEffect(() => {
+    const onKey = e => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen(o => !o);
+      }
+      if (e.key === "Escape") setPaletteOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  if (hash.startsWith("#/gallery")) {
+    return (
+      <React.Suspense fallback={<div style={{ padding: 40, color: t.textMuted, background: t.appBg, minHeight: "100vh" }}>Loading gallery…</div>}>
+        <Gallery theme={t} themes={THEMES} setTheme={t.setTheme} />
+      </React.Suspense>
+    );
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: t.appBg,
+      color: t.textSecondary,
+      fontFamily: "'Courier New', monospace",
+      display: "flex",
+      flexDirection: "column",
+    }}>
+      <style>{`
+        @keyframes tape { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+        * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: ${t.scrollThumb} ${t.appBg}; }
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: ${t.appBg}; }
+        ::-webkit-scrollbar-thumb { background: ${t.scrollThumb}; border-radius: 3px; }
+        /* Research overview: chart and analysis left, the street's view in a
+           right rail. Below ~1150px the rail has nowhere useful to sit, so it
+           drops underneath rather than squeezing the chart into a column too
+           narrow to read a year of daily closes in. */
+        @media (max-width: 1150px) {
+          .research-grid { grid-template-columns: minmax(0, 1fr) !important; }
+        }
+      `}</style>
+
+      {paletteOpen && (
+        <CommandPalette
+          onClose={() => setPaletteOpen(false)}
+          onPage={id => { setActivePage(id); setPaletteOpen(false); }}
+          onSymbol={(sym, nm) => {
+            setResearchJump({ symbol: sym, name: nm, ts: Date.now() });
+            setActivePage("research");
+            setPaletteOpen(false);
+          }}
+        />
+      )}
+
+      {/* Top bar */}
+      <div style={{
+        background: t.chromeBg,
+        borderBottom: `1px solid ${t.border}`,
+        padding: "0 20px",
+        height: 48,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        position: "sticky",
+        top: 0,
+        zIndex: 100,
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+          <button onClick={() => setSidebarCollapsed(c => !c)} style={{
+            background: "transparent", border: "none", color: t.textMuted,
+            fontSize: 16, cursor: "pointer", padding: "4px 8px",
+          }}>☰</button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{
+              width: 28, height: 28, background: `linear-gradient(135deg, ${t.accent}, ${t.info})`,
+              borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 14, fontWeight: 900,
+            }}>⬡</div>
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: t.text, letterSpacing: 2, fontFamily: "monospace" }}>
+                MERIDIAN
+              </div>
+              <div style={{ fontSize: 9, color: t.textFaint, letterSpacing: 1 }}>TRADING INTELLIGENCE</div>
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
+          <PulseIndicator pulseCount={pulseCount} feed={feed} />
+          <div style={{ fontSize: 11, color: t.textFaint, fontFamily: "monospace" }}>
+            {new Date().toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}
+          </div>
+        </div>
+      </div>
+
+      {/* Ticker tape */}
+      <TickerTape prices={prices} feed={feed} />
+
+      {/* Body */}
+      <div style={{ display: "flex", flex: 1 }}>
+
+        {/* Sidebar */}
+        <div style={{
+          width: sidebarCollapsed ? 48 : 180,
+          background: t.chromeBg,
+          borderRight: `1px solid ${t.border}`,
+          transition: "width 0.2s ease",
+          overflow: "hidden",
+          position: "sticky",
+          top: 80,
+          alignSelf: "flex-start",
+          height: "calc(100vh - 80px)",
+        }}>
+          <div style={{ padding: "12px 0" }}>
+            {NAV_ITEMS.map(item => {
+              const active = activePage === item.id;
+              const expanded = active && !sidebarCollapsed && item.subItems?.length;
+              return (
+                <div key={item.id}>
+                  <button onClick={() => { setActivePage(item.id); setSubNav(null); }} style={{
+                    width: "100%",
+                    background: active ? t.surfaceInset : "transparent",
+                    border: "none",
+                    borderLeft: active ? `2px solid ${t.accent}` : "2px solid transparent",
+                    color: active ? t.accent : t.textMuted,
+                    padding: sidebarCollapsed ? "10px 0" : "10px 16px",
+                    textAlign: sidebarCollapsed ? "center" : "left",
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    fontSize: 12,
+                    fontFamily: "monospace",
+                    letterSpacing: 0.5,
+                    transition: "all 0.15s",
+                    whiteSpace: "nowrap",
+                  }}>
+                    <span style={{ fontSize: 14, minWidth: 16 }}>{item.icon}</span>
+                    {!sidebarCollapsed && item.label}
+                  </button>
+                  {expanded && (
+                    <div style={{
+                      borderLeft: `2px solid ${t.borderSubtle}`,
+                      marginLeft: 20,
+                      display: "flex",
+                      flexDirection: "column",
+                    }}>
+                      {item.subItems.map(sub => {
+                        const subActive = activeTabs[item.id] === sub.tab;
+                        return (
+                          <button key={sub.tab} onClick={() => goToSubItem(item.id, sub.tab)} style={{
+                            background: "transparent",
+                            border: "none",
+                            color: subActive ? t.accent : t.textFaint,
+                            padding: "6px 0 6px 14px",
+                            textAlign: "left",
+                            cursor: "pointer",
+                            fontSize: 11,
+                            fontFamily: "monospace",
+                            letterSpacing: 0.3,
+                            whiteSpace: "nowrap",
+                          }}>
+                            {sub.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Main content */}
+        <div style={{ flex: 1, padding: 20, overflowY: "auto", animation: "fadeIn 0.3s ease", minWidth: 0 }}>
+          {activePage === "briefing" && (
+            <BriefingPage onOpenSymbol={sym => { setResearchJump({ symbol: sym, ts: Date.now() }); setActivePage("research"); }} />
+          )}
+          {activePage === "changed" && (
+            <WhatChangedPage prices={prices} pulseCount={pulseCount} poll={poll} feed={feed} />
+          )}
+          {activePage === "alerts" && (
+            <AlertsPage />
+          )}
+          {activePage === "risk" && (
+            <RiskPage />
+          )}
+          {activePage === "research" && (
+            <ResearchPage
+              prices={prices}
+              jumpTo={researchJump}
+              tabJump={subNav?.page === "research" ? subNav : null}
+              onTabChange={tab => setActiveTabs(a => (a.research === tab ? a : { ...a, research: tab }))}
+            />
+          )}
+          {activePage === "portfolio2" && (
+            <iframe
+              title="Portfolio 2 (design preview, sample data)"
+              src="/portfolio-2/index.html"
+              style={{ flex: 1, width: "100%", minHeight: "calc(100vh - 60px)", border: 0, background: "#fff" }}
+            />
+          )}
+          {activePage === "portfolio" && (
+            <PortfolioPageV2
+              onPage={(p, opts) => { if (opts?.symbol) setResearchJump({ symbol: opts.symbol, ts: Date.now() }); setActivePage(p); }}
+              tabJump={subNav?.page === "portfolio" ? subNav : null}
+              onTabChange={tab => setActiveTabs(a => (a.portfolio === tab ? a : { ...a, portfolio: tab }))}
+            />
+          )}
+          {activePage === "watchlist" && (
+            <WatchlistPage />
+          )}
+          {activePage === "screener" && (
+            <ScreenerPage />
+          )}
+          {activePage === "markets" && (
+            <MarketsPage
+              prices={prices}
+              tabJump={subNav?.page === "markets" ? subNav : null}
+              onTabChange={tab => setActiveTabs(a => (a.markets === tab ? a : { ...a, markets: tab }))}
+            />
+          )}
+          {activePage === "news" && (
+            <NewsPage />
+          )}
+          {activePage === "reports" && (
+            <ReportsPage />
+          )}
+          {activePage === "settings" && (
+            <SettingsPage onApiKeySet={setApiKey} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

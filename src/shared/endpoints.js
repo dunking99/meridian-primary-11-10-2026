@@ -1,0 +1,52 @@
+// Every API path the Portfolio pages read, in one plain module so the gallery
+// fixture recorder (a Node script) can import the same list the hooks use.
+
+export const EP = {
+  portfolio: "/portfolio",
+  overview: "/overview",
+  ovBlock: b => `/overview?blocks=${b}`,
+  series: (range = "1Y", benchmark = "^FTSE", basis = "reconstructed") => `/performance/series?range=${range}&benchmark=${encodeURIComponent(benchmark)}&basis=${basis}`,
+  periods: (benchmark = "^FTSE") => `/performance/periods?benchmark=${encodeURIComponent(benchmark)}`,
+  calendarReturns: (benchmark = "^FTSE") => `/performance/calendar?benchmark=${encodeURIComponent(benchmark)}`,
+  drawdowns: (benchmark = "^FTSE") => `/performance/drawdowns?benchmark=${encodeURIComponent(benchmark)}`,
+  risk: (window = "1Y", benchmark = "^FTSE") => `/performance/risk?window=${window}&benchmark=${encodeURIComponent(benchmark)}`,
+  capture: (benchmark = "^GSPC", window = "max") => `/performance/capture?benchmark=${encodeURIComponent(benchmark)}&window=${window}`,
+  bridge: "/performance/bridge",
+  contribution: (months = 12) => `/performance/contribution?months=${months}`,
+  seriesCustom: (from, to, benchmark = "^FTSE") => `/performance/series?range=CUSTOM&from=${from}&to=${to}&benchmark=${encodeURIComponent(benchmark)}`,
+  benchmarks: "/performance/benchmarks",
+  attribution: (grouping = "sector", lookback = 750) => `/attribution?grouping=${grouping}&lookback=${lookback}`,
+  returns: (benchmark = "^FTSE") => `/portfolio/returns?benchmark=${encodeURIComponent(benchmark)}`,
+  composition: (lens = "class", includeCash = true) => `/portfolio/composition?lens=${lens}&includeCash=${includeCash ? 1 : 0}`,
+  enriched: "/portfolio/holdings/enriched",
+  targets: "/portfolio/targets",
+  cash: "/portfolio/cash",
+  accounts: "/portfolio/accounts",
+  concentration: "/portfolio/concentration",
+  labels: "/portfolio/labels/check",
+  watchlist: "/watchlist/strip",
+  calendar: (days = 30) => `/calendar/book?days=${days}`,
+  news: (hours = 72) => `/news/book?hours=${hours}`,
+  briefing: (top = 5) => `/briefing/digest?top=${top}`,
+  goal: "/goal",
+  scenarios: "/analysis/scenarios",
+  correlation: (window = "1y") => `/analysis/correlation?window=${window}`,
+  overlap: "/analysis/overlap",
+  scorecard: "/analysis/scorecard",
+  rebalance: (mode = "full", contribution = 0) => `/analysis/rebalance?mode=${mode}&contribution=${contribution}`,
+  montecarlo: (years = 10, monthly = 0) => `/analysis/montecarlo?years=${years}&monthly=${monthly}`,
+  riskProfile: "/analysis/risk",
+  lookthrough: "/portfolio/composition?lens=region&includeCash=0",
+};
+
+/** The default paths each gallery fixture is recorded from. */
+export const FIXTURE_PATHS = [
+  EP.overview, EP.series("1Y"), EP.series("3M"), EP.series("MAX"), EP.series("1Y", "^FTSE", "recorded"), EP.series("5Y"), EP.periods(), EP.calendarReturns(), EP.drawdowns(),
+  EP.risk("1Y"), EP.risk("3Y"), EP.capture(), EP.bridge, EP.benchmarks, EP.attribution("sector"), EP.attribution("assetClass"), EP.returns(),
+  EP.composition("class"), EP.composition("sector"), EP.composition("region"), EP.composition("wrapper"), EP.composition("currency"), EP.composition("account"),
+  EP.composition("typed"), EP.composition("region", false), EP.enriched, EP.targets, EP.cash, EP.accounts, EP.concentration, EP.watchlist, EP.calendar(30), EP.news(72),
+  EP.briefing(5), EP.goal, EP.scenarios, EP.correlation("1y"), EP.overlap, EP.scorecard, EP.rebalance("full"), EP.rebalance("newmoney", 5000), EP.montecarlo(10, 0),
+  EP.riskProfile, EP.portfolio, EP.contribution(12), EP.periods("SWDA.L"), EP.periods("VUSA.L"), EP.periods("^GSPC"),
+  EP.series("1Y", "SWDA.L"), EP.series("1Y", "VUSA.L"), EP.series("1Y", "^GSPC"), EP.risk("MAX"), EP.capture("^FTSE"),
+  ...["hero", "stats", "series", "periods", "health", "leaders", "day", "composition", "top", "calendar", "news", "briefing", "concentration", "watchlist", "accounts", "cash", "goal"].map(b => `/overview?blocks=${b}`),
+];
