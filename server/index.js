@@ -1,0 +1,1726 @@
+// Meridian v2 — server
+// Zero-dependency HTTP layer (Node's own http module) routing to the engines.
+// Run: node server/index.js
+
+import http from 'http';
+import { execSync } from 'child_process';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { PORT, CADENCE, CORE_SYMBOLS, SYMBOLS, SCENARIOS, WRAPPERS } from './config.js';
+
+const __dirnameSafe = path.dirname(fileURLToPath(import.meta.url));
+import { db, all, one, run, getBars, healthCheck, getSetting, setSetting, recordTicks, getSnapshots, purgeBars, allStoredSymbols } from './db.js';
+import { auditStored } from './engines/integrity.js';
+
+import * as yahoo from './sources/yahoo.js';
+import { fetchFearAndGreed } from './sources/feargreed.js';
+import { refreshNews, getNews, searchLiveNews, titleSignature, jaccard } from './sources/news.js';
+import { scoreNewStories, scoringStats, CATEGORIES } from './engines/newsscore.js';
+import { hasGeminiKey } from './sources/ai.js';
+import * as edgar from './sources/edgar.js';
+import { fetchFTFundNav, getCachedFTNav, isValidISIN } from './sources/ft.js';
+
+import * as A from './engines/analytics.js';
+import * as opt from './engines/optimiser.js';
+import { rebalance, directContribution } from './engines/rebalance.js';
+import { simulate, goalProbability } from './engines/montecarlo.js';
+import { runAllScenarios, runScenario, shockTest } from './engines/stress.js';
+import * as pf from './engines/portfolio.js';
+import * as pfa from './engines/portfolio-analysis.js';
+import { screen, scoreSymbol, STRATEGIES as SCREEN_STRATEGIES } from './engines/screener.js';
+import { backtest, walkForward, STRATEGIES as BT_STRATEGIES } from './engines/backtest.js';
+import * as paper from './engines/paper.js';
+import * as alerts from './engines/alerts.js';
+import * as signals from './engines/signals.js';
+import * as performance from './engines/performance.js';
+import * as lookthrough from './engines/lookthrough.js';
+import * as correlation from './engines/correlation.js';
+import * as xray from './engines/xray.js';
+import * as attribution from './engines/attribution.js';
+import * as importer from './engines/importer.js';
+import * as reports from './engines/reports.js';
+import * as exposure from './engines/rebuild/exposure.js';
+import * as analyst from './engines/analyst.js';
+import * as memory from './engines/memory.js';
+import * as calendar from './engines/calendar.js';
+import * as briefing from './engines/briefing.js';
+import * as bullbear from './engines/bullbear.js';
+import * as research from './engines/research.js';
+import * as allocate from './engines/allocate.js';
+import * as rebuild from './engines/rebuild/index.js';
+import { overnightRoutes, versionPartFor } from './routes-overnight.js';
+import { readFileSync } from 'fs';
+
+// ─── Shared state ─────────────────────────────────────────────
+
+const state = {
+  prices: {},
+  fearGreed: null,
+  lastFetch: 0,
+  lastNews: 0,
+  lastNewsFailed: [],
+  fired: [],
+  status: 'starting',
+  errors: [],
+};
+
+// Data versions, one counter per kind of change. The page's panels declare
+// which parts they depend on and refetch only when one of those moves, so a
+// price tick redraws price-dependent figures and leaves news and the calendar
+// alone. The combined string is what `dataVersion` means in responses.
+const versions = { prices: 0, book: 0, bars: 0, news: 0, calendar: 0, flows: 0, goal: 0, watch: 0, briefing: 0 };
+const bumpVersion = part => { if (part && part in versions) versions[part]++; };
+const dataVersion = () => Object.values(versions).join('.');
+
+// Test fixtures. MERIDIAN_PRICE_FIXTURE points at a JSON file of quotes shaped
+// exactly like fetchQuotes' output; when set, it replaces the Yahoo poll so a
+// seeded test instance has deterministic prices a test can change on purpose.
+// MERIDIAN_OFFLINE skips the loops that only exist to reach the network.
+const PRICE_FIXTURE = process.env.MERIDIAN_PRICE_FIXTURE || null;
+const OFFLINE = process.env.MERIDIAN_OFFLINE === '1';
+
+function trackedSymbols() {
+  const held = all('SELECT DISTINCT symbol FROM holdings').map(r => r.symbol);
+  const watched = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+  return [...new Set([...CORE_SYMBOLS, ...held, ...watched])];
+}
+
+// ─── Refresh loops ────────────────────────────────────────────
+
+async function refreshPrices() {
+  const symbols = trackedSymbols();
+  const t0 = Date.now();
+  let fresh;
+  if (PRICE_FIXTURE) {
+    try { fresh = JSON.parse(readFileSync(PRICE_FIXTURE, 'utf8')); }
+    catch (e) { console.log(`  price fixture unreadable: ${e.message}`); fresh = {}; }
+  } else {
+    fresh = await yahoo.fetchQuotes(symbols);
+  }
+  const n = Object.keys(fresh).length;
+
+  if (n > 0) {
+    const before = JSON.stringify(state.prices);
+    state.prices = PRICE_FIXTURE ? { ...fresh } : { ...state.prices, ...fresh };
+    state.lastFetch = Date.now();
+    if (JSON.stringify(state.prices) !== before) bumpVersion('prices');
+    recordTicks(fresh);
+
+    const portfolio = pf.valuePortfolio(state.prices);
+    const fired = alerts.evaluate(state.prices, portfolio);
+    if (fired.length) {
+      state.fired = [...fired, ...state.fired].slice(0, 50);
+      for (const f of fired) console.log(`  ALERT  ${f.message}`);
+    }
+    paper.markToMarket(state.prices);
+  }
+
+  const missing = symbols.filter(s => !state.prices[s]);
+  console.log(`[${new Date().toLocaleTimeString()}] prices ${n}/${symbols.length} in ${Date.now() - t0}ms` +
+              (missing.length ? `  missing: ${missing.slice(0, 6).join(', ')}${missing.length > 6 ? '…' : ''}` : ''));
+  state.status = n > 0 ? 'live' : 'degraded';
+}
+
+/**
+ * The cross-engine alert pass.
+ *
+ * Runs on its own slow beat rather than on the price tick, and shares
+ * state.fired with the price alerts so both families reach the UI through one
+ * channel — a fired alert is a fired alert regardless of which engine noticed.
+ */
+function evaluateSignalAlerts() {
+  try {
+    const valued = pf.valuePortfolio(state.prices);
+    const { fired, skipped } = signals.evaluateSignals(state.prices, { research, valued });
+    if (fired.length) {
+      state.fired = [...fired, ...state.fired].slice(0, 50);
+      for (const f of fired) console.log(`  SIGNAL  ${f.message}`);
+    }
+    const failedEvals = skipped.filter(s => String(s.reason).startsWith('evaluation failed'));
+    if (failedEvals.length) {
+      console.log(`  signal alerts: ${failedEvals.length} failed to evaluate — ${failedEvals[0].reason}`);
+    }
+  } catch (e) {
+    console.log(`  signal alert pass failed: ${e.message}`);
+  }
+}
+
+async function refreshFearGreed() {
+  if (OFFLINE) return;
+  const fg = await fetchFearAndGreed();
+  if (fg) { state.fearGreed = fg; console.log(`  fear & greed ${fg.score} (${fg.rating})`); }
+}
+
+let newsRefreshInFlight = false;
+
+async function refreshNewsFeed() {
+  // With ~47 feeds fetched serially, a slow run can approach the 10-minute
+  // cadence itself — guard against the next scheduled tick starting a second
+  // pass on top of one still in progress.
+  if (newsRefreshInFlight || OFFLINE) return;
+  newsRefreshInFlight = true;
+  try {
+    const held = all('SELECT DISTINCT symbol, name FROM holdings').map(r => ({ symbol: r.symbol, name: r.name }));
+    const r = await refreshNews(held);
+    state.lastNews = Date.now();
+    state.lastNewsFailed = r.failed;
+    if (r.added) bumpVersion('news');
+    console.log(`  news +${r.added}` +
+                (r.duplicates ? `  (${r.duplicates} dupes)` : '') +
+                (r.failed.length ? `  failed ${r.failedCount}/${r.sources}: ${r.failed.join(', ')}` : ''));
+
+    // Score whatever arrived. Bounded per cycle and safe to fail — unscored
+    // stories fall back to heuristic ranking and get picked up next time.
+    if (hasGeminiKey()) {
+      const universe = trackedSymbols();
+      const s = await scoreNewStories(universe);
+      if (s.scored || s.skipped) {
+        console.log(`  news AI scored ${s.scored}` +
+                    (s.skipped ? `, skipped ${s.skipped}${s.reason ? ` (${s.reason})` : ''}` : ''));
+      }
+    }
+  } finally {
+    newsRefreshInFlight = false;
+  }
+}
+
+function snapshot() {
+  if (!Object.keys(state.prices).length) return;
+  try { pf.takeSnapshot(state.prices); } catch (e) { console.log('  snapshot failed:', e.message); }
+}
+
+// ─── Router ───────────────────────────────────────────────────
+
+const json = (res, code, body) => {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+};
+
+function readBody(req) {
+  return new Promise(resolve => {
+    const c = [];
+    req.on('data', d => c.push(d));
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(c).toString() || '{}')); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+/**
+ * The engines a periodic report is assembled from.
+ *
+ * Passed in rather than imported inside the reports module so that module has
+ * no opinion about which engines exist, and so the whole scheduler can be
+ * exercised in tests with stubs and no price data.
+ */
+const reportEngines = {
+  portfolio: prices => pf.valuePortfolio(prices),
+  performance: prices => {
+    const v = pf.valuePortfolio(prices);
+    return performance.performanceReport(v.total, getSnapshots(400));
+  },
+  attribution: (prices, opts) => attribution.attributionReport(prices, opts),
+  correlation: prices => correlation.correlationReport(pf.valuePortfolio(prices).positions),
+  xray: prices => xray.xray(pf.valuePortfolio(prices).positions),
+};
+
+/**
+ * Write any report that has fallen due.
+ *
+ * Runs on a timer, but is not driven by one: `generateDue` asks the table which
+ * completed periods have no report yet. The app is closed most of the time, and
+ * a schedule that only fired while the process happened to be running would
+ * skip every period the user did not open it during.
+ */
+function generateDueReports() {
+  try {
+    const res = reports.generateDue({ prices: state.prices, engines: reportEngines });
+    for (const w of res.written) {
+      console.log(`  report     ${w.period} ${w.periodKey}${w.complete ? '' : ' (incomplete — some engines failed)'}`);
+    }
+  } catch (e) {
+    console.log(`  report generation failed: ${e.message}`);
+  }
+}
+
+const routes = {
+
+  // ── status & data ──────────────────────────────────────────
+  'GET /': () => ({
+    status: 'Meridian v2 proxy running', port: PORT,
+    dataStatus: state.status, symbols: trackedSymbols().length,
+    lastFetch: state.lastFetch, db: healthCheck(),
+  }),
+
+  'GET /health': () => ({ ...healthCheck(), status: state.status, lastFetch: state.lastFetch, errors: state.errors.slice(-5) }),
+
+  // Everything about the data itself in one read: per-symbol bar coverage
+  // with staleness, feed freshness, memory recency, and when the overnight
+  // sync last ran. Built for the Settings page's Data Health section, so
+  // "is my data current?" is a glance rather than a set of curl calls.
+  'GET /system/health': () => {
+    const today = new Date();
+    const coverage = all(
+      'SELECT symbol, COUNT(*) bars, MIN(date) first, MAX(date) last FROM ohlcv GROUP BY symbol ORDER BY symbol'
+    ).map(r => {
+      const staleDays = r.last
+        ? Math.floor((today - new Date(r.last + 'T00:00:00Z')) / 86400_000) : null;
+      return {
+        ...r, staleDays,
+        // Calendar days, so a weekend read shows 1-2 days stale on everything
+        // — expected, and better than a trading-day guess that needs every
+        // exchange's holiday calendar to be right.
+        stale: staleDays != null && staleDays > 4,
+      };
+    });
+    const latestNews = one('SELECT MAX(published) t, COUNT(*) n FROM news');
+    const latestObs = one('SELECT MAX(date) d, COUNT(*) n FROM symbol_observations');
+    const tracked = trackedSymbols();
+    const stored = new Set(coverage.map(c => c.symbol));
+    return {
+      generatedAt: new Date().toISOString(),
+      symbols: {
+        tracked: tracked.length,
+        stored: coverage.length,
+        // Tracked but with no bars at all — invisible to every engine.
+        unstored: tracked.filter(s => !stored.has(s)),
+        stale: coverage.filter(c => c.stale).map(c => c.symbol),
+      },
+      coverage,
+      totalBars: coverage.reduce((a, c) => a + c.bars, 0),
+      news: { stories: latestNews?.n ?? 0, latestPublished: latestNews?.t ?? null },
+      memory: { observations: latestObs?.n ?? 0, latestDate: latestObs?.d ?? null },
+      lastOvernightSync: getSetting('lastOvernightSync'),
+      feed: { status: state.status, lastFetch: state.lastFetch },
+    };
+  },
+
+  // Recent commits, straight from git on the user's machine — the auto-update
+  // system already guarantees git and a real clone are present. Read-only and
+  // failure-tolerant: a zip-downloaded folder without .git just gets an
+  // explanatory message instead of a broken panel.
+  'GET /changelog': q => {
+    try {
+      const out = execSync(
+        `git log --pretty=format:%h%x09%ad%x09%s --date=short -${Math.min(Number(q.limit) || 25, 100)}`,
+        { cwd: path.join(__dirnameSafe, '..'), encoding: 'utf8', timeout: 5000 }
+      );
+      const commits = out.split('\n').filter(Boolean).map(line => {
+        const [hash, date, ...rest] = line.split('\t');
+        return { hash, date, subject: rest.join('\t') };
+      });
+      return { commits };
+    } catch (e) {
+      return { commits: [], error: 'Could not read git history — this folder may not be a git clone.' };
+    }
+  },
+
+  'GET /prices': () => ({
+    prices: state.prices, lastFetch: state.lastFetch,
+    count: Object.keys(state.prices).length, status: state.status,
+  }),
+
+  'GET /feargreed': () => state.fearGreed ?? {},
+
+  'GET /symbols': () => ({
+    tracked: trackedSymbols(),
+    core: CORE_SYMBOLS,
+    meta: SYMBOLS,
+    coverage: all('SELECT symbol, COUNT(*) bars, MIN(date) first, MAX(date) last FROM ohlcv GROUP BY symbol ORDER BY symbol'),
+  }),
+
+  'GET /history': q => {
+    const bars = getBars(q.symbol, q.from || null, q.to || null);
+    return { symbol: q.symbol, bars: bars.length, data: bars };
+  },
+
+  // Closing prices for many symbols at once, for sparklines. The Markets page
+  // draws ~35 of them; one request per symbol would mean 35 round trips on
+  // every page load. Only closes are returned — a sparkline needs nothing
+  // else, and full OHLCV rows would bloat the payload several times over.
+  'GET /history/batch': q => {
+    const symbols = String(q.symbols || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 80);
+    const days = Math.min(Math.max(Number(q.days) || 60, 5), 400);
+    // Calendar days back, not trading days — markets are shut ~2/7 of the
+    // time, so this deliberately over-reaches and lets the data decide.
+    const from = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+    // getBars only applies its date filter when BOTH bounds are given — pass
+    // `from` alone and it silently returns the symbol's entire history, which
+    // for a 12-year store is thousands of bars per symbol. `to` is set a day
+    // ahead so a bar stamped today is never cut off by a timezone boundary.
+    const to = new Date(Date.now() + 86400_000).toISOString().slice(0, 10);
+    const series = {};
+    for (const sym of symbols) {
+      const closes = getBars(sym, from, to)
+        .map(b => b.close)
+        .filter(c => typeof c === 'number' && Number.isFinite(c));
+      // A lone point can't be drawn as a line — treat it as no history.
+      if (closes.length > 1) series[sym] = closes;
+    }
+    return { days, from, to, series };
+  },
+
+  'POST /sync': async body => {
+    const symbols = body.symbols?.length ? body.symbols : trackedSymbols();
+    console.log(`  syncing history for ${symbols.length} symbols…`);
+    const r = await yahoo.syncAll(symbols, { years: body.years ?? 12, force: !!body.force });
+    // New bars mean the derived memory is stale. Rebuilding is idempotent and
+    // costs about a second, so it happens here rather than being something to
+    // remember to trigger.
+    const mem = memory.rebuild();
+    return { ...r, memory: { observations: mem.observations, regimeDays: mem.regime?.dates ?? 0 } };
+  },
+
+  // ── memory: what changed, not what is ──────────────────────
+  'GET /changes': q => memory.whatChanged({
+    limit: Math.min(Number(q.limit) || 12, 40),
+    zThreshold: Number(q.z) || 1.5,
+  }),
+
+  'GET /memory': () => memory.memoryStats(),
+  'GET /memory/latest': q => ({
+    observations: memory.latestFor(
+      String(q.symbols || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 200)),
+  }),
+  'GET /leadership': q => memory.leadership({ window: Number(q.window) || 21 }),
+
+  // ── calendar ───────────────────────────────────────────────
+  'GET /calendar': q => calendar.buildCalendar({ days: Math.min(Number(q.days) || 120, 400) }),
+  'POST /calendar/refresh': async body => {
+    const symbols = [...new Set([
+      ...all('SELECT DISTINCT symbol FROM holdings').map(r => r.symbol),
+      ...all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol),
+    ])];
+    const r = await calendar.refreshCorporateDates(symbols, { force: !!body?.force });
+    return { ...r, ...calendar.buildCalendar({ days: Math.min(Number(body?.days) || 120, 400) }) };
+  },
+  'GET /relationships': q => memory.correlationShifts({ window: Number(q.window) || 60 }),
+
+  // ── daily briefing ─────────────────────────────────────────
+  // The cross-engine read: portfolio, alerts, news, calendar, signals, regime
+  // and correlation, ranked against each other on one materiality scale.
+  // Strictly read-only — state.fired is passed in so alert messages survive
+  // (the poll loop keeps them in memory, not in the row), but nothing here
+  // evaluates or mutates an alert.
+  'GET /briefing': q => briefing.buildBriefing(state.prices, {
+    headlineLimit: Math.min(Number(q.limit) || 6, 30),
+    newsHours: Math.min(Number(q.newsHours) || 36, 168),
+    calendarDays: Math.min(Number(q.calendarDays) || 21, 120),
+    zThreshold: Number(q.z) || 1.5,
+    newsMinRelevance: q.newsMinRelevance != null ? Number(q.newsMinRelevance) : 45,
+    recentlyFired: state.fired,
+  }),
+  // Acknowledgement takes the fingerprints the client actually rendered rather
+  // than rebuilding here, so a finding that appears between render and click
+  // is not silently marked as already seen.
+  'POST /briefing/read': body => briefing.markRead(body?.fingerprints ?? [], body?.generatedAt ?? Date.now()),
+  'GET /memory/regime': q => ({ series: memory.regimeHistory({ days: Number(q.days) || 252 }) }),
+  'GET /memory/symbol': q => ({
+    symbol: q.symbol,
+    series: memory.symbolHistory(q.symbol, { days: Number(q.days) || 260 }),
+  }),
+  'POST /memory/rebuild': body => memory.rebuild({ symbols: body?.symbols ?? null }),
+
+  'GET /quote': async q => await yahoo.fetchSummary(q.symbol),
+  'GET /search': async q => ({ query: q.q, results: await yahoo.search(q.q) }),
+
+  'GET /integrity': () => auditStored(allStoredSymbols, getBars),
+
+  'POST /integrity/repair': async body => {
+    const audit = auditStored(allStoredSymbols, getBars);
+    if (!audit.totalFlagged) return { ok: true, message: 'No corruption found. Nothing to repair.', audit };
+
+    // Purge every flagged date, then re-fetch it. Systemic dates (affecting
+    // several symbols at once) are purged across all symbols, because that
+    // pattern means a write-side fault rather than isolated bad source data.
+    const dates = body?.dates?.length
+      ? body.dates
+      : [...new Set(audit.findings.flatMap(f => f.dates))];
+
+    let purged = 0;
+    for (const d of dates) purged += purgeBars(d);
+
+    const affected = [...new Set(audit.findings.map(f => f.symbol))];
+    const resync = await yahoo.syncAll(affected, { years: 12, force: false });
+
+    const after = auditStored(allStoredSymbols, getBars);
+    return {
+      ok: true,
+      purgedRows: purged,
+      datesRepaired: dates,
+      symbolsResynced: affected.length,
+      resyncFailed: resync.failed,
+      before: { flagged: audit.totalFlagged, symbols: audit.symbolsAffected },
+      after: { flagged: after.totalFlagged, symbols: after.symbolsAffected },
+      verdict: after.totalFlagged === 0
+        ? 'All corruption cleared.'
+        : `${after.totalFlagged} anomalies remain — likely genuine source-data glitches rather than unit errors.`,
+    };
+  },
+
+
+  // ── portfolio ──────────────────────────────────────────────
+  'GET /portfolio': () => pf.valuePortfolio(state.prices),
+
+  'GET /portfolio/history': q =>
+    pf.reconstructHistory(state.prices, Number(q.lookback) || 750),
+
+  'GET /portfolio/history/holdings': q =>
+    pf.reconstructHistoryByHolding(state.prices, Number(q.lookback) || 750),
+
+  'GET /portfolio/snapshots': () => ({ snapshots: getSnapshots() }),
+
+  // ── performance ────────────────────────────────────────────
+  // Money-weighted and time-weighted return, which answer different questions
+  // and routinely disagree. Both come from recorded facts — the cash-flow
+  // ledger and stored snapshots — never inferred from current holdings.
+  'GET /performance': q => {
+    const v = pf.valuePortfolio(state.prices);
+    return performance.performanceReport(v.total, getSnapshots(), {
+      benchmark: q.benchmark || undefined,
+    });
+  },
+  // Full look-through by listing venue, with per-holding basis and the
+  // coverage the headline figure on the Risk page is a share of.
+  'GET /lookthrough': q => {
+    const v = pf.valuePortfolio(state.prices);
+    const priced = v.positions.filter(p => (p.value ?? 0) > 0);
+    const compositions = exposure.listCompositions(priced.map(p => p.symbol));
+    return q.region
+      ? lookthrough.regionExposure(priced, compositions, String(q.region))
+      : lookthrough.lookThrough(priced, compositions);
+  },
+
+  'GET /performance/flows': () => ({ flows: performance.listFlows() }),
+  'POST /performance/flows': body => performance.addFlow({
+    date: body?.date, amount: body?.amount, currency: body?.currency ?? 'GBP',
+    account: body?.account ?? 'Main', kind: body?.kind ?? 'deposit', note: body?.note ?? null,
+  }),
+  'DELETE /performance/flows': q => performance.deleteFlow(Number(q.id)),
+
+  // ── portfolio analysis ─────────────────────────────────────
+  //
+  // Weights come from live prices on every call; the expensive per-instrument
+  // scoring behind them is cached for ten minutes, since it reads stored daily
+  // bars and published fees that do not change between polls.
+
+  'GET /portfolio/types': () => {
+    const v = pf.valuePortfolio(state.prices);
+    return {
+      rows: pfa.holdingsByType(v.positions, v.cash, v.total),
+      total: v.total,
+      invested: v.invested,
+      cash: v.cash,
+    };
+  },
+
+  'GET /portfolio/return': q => {
+    const lookback = Number(q.lookback) || 2500;
+    return pfa.reconstructedReturn(pf.reconstructHistory(state.prices, lookback));
+  },
+
+  'GET /portfolio/scorecard': () => {
+    const v = pf.valuePortfolio(state.prices);
+    const m = rebuild.mandate.loadMandate();
+    const regime = rebuild.regime.readRegime(state.prices, m);
+    return {
+      ...pfa.scorecard(v.positions, { mandate: m, regime }),
+      // Named so the page can say which mandate these axes are weighted for,
+      // rather than presenting one set of weights as universal.
+      regime: { label: regime?.label ?? null, timingTrust: regime?.timingTrust ?? null },
+    };
+  },
+
+  'GET /portfolio/correlations': q => {
+    const v = pf.valuePortfolio(state.prices);
+    return pfa.correlationPairs(v.positions, {
+      minObs: Number(q.minObs) || 60,
+      limit: Number(q.limit) || 5,
+    });
+  },
+
+  // ─── Correlation engine ─────────────────────────────────────
+  // The whole report in one call: the page renders several views of the same
+  // matrix, and computing it once per view would recompute the same date joins
+  // four times over.
+  'GET /correlation': q => {
+    const v = pf.valuePortfolio(state.prices);
+    return correlation.correlationReport(v.positions, {
+      window: q.window || '1y',
+      rollingWindow: Number(q.rolling) || 60,
+    });
+  },
+
+  // The matrix alone, for a caller that only wants the grid.
+  'GET /correlation/matrix': q => {
+    const v = pf.valuePortfolio(state.prices);
+    const symbols = q.symbols ? String(q.symbols).split(',').filter(Boolean)
+                              : v.positions.map(p => p.symbol);
+    return correlation.matrix(symbols, { window: q.window || '1y' });
+  },
+
+  // How many independent bets the book actually contains.
+  'GET /correlation/independence': q => {
+    const v = pf.valuePortfolio(state.prices);
+    const total = v.positions.reduce((s, p) => s + (p.value ?? 0), 0);
+    const weights = total > 0
+      ? Object.fromEntries(v.positions.map(p => [p.symbol, (p.value ?? 0) / total]))
+      : null;
+    return correlation.independence(v.positions.map(p => p.symbol), {
+      weights, window: q.window || '1y',
+    });
+  },
+
+  // Does diversification survive a selloff.
+  'GET /correlation/stress': q => {
+    const v = pf.valuePortfolio(state.prices);
+    const total = v.positions.reduce((s, p) => s + (p.value ?? 0), 0);
+    const weights = total > 0
+      ? Object.fromEntries(v.positions.map(p => [p.symbol, (p.value ?? 0) / total]))
+      : null;
+    return correlation.stressCorrelation(v.positions.map(p => p.symbol), {
+      window: q.window || '1y',
+      weights,
+      tail: Number(q.tail) || correlation.STRESS_TAIL,
+    });
+  },
+
+  // ─── Statement import ───────────────────────────────────────
+  // Two steps on purpose. Preview writes nothing; apply takes the preview's
+  // own rows back, so what is written is what was shown.
+  'POST /import/preview': body => importer.preview(body?.text ?? '', {
+    mode: body?.mode || 'holdings',
+    mapping: body?.mapping ?? null,
+    dateOrder: body?.dateOrder ?? null,
+    defaults: body?.defaults ?? {},
+  }),
+
+  'POST /import/apply': body => importer.apply(body?.rows ?? [], {
+    mode: body?.mode || 'holdings',
+    updateExisting: body?.updateExisting === true,
+    includeWarnings: body?.includeWarnings !== false,
+  }),
+
+  // ─── Periodic reports ───────────────────────────────────────
+  'GET /reports': q => ({ reports: reports.listReports({ limit: Number(q.limit) || 50 }) }),
+
+  'GET /reports/one': q => {
+    const r = reports.getReport(Number(q.id));
+    return r ?? { error: 'No such report' };
+  },
+
+  'DELETE /reports': q => reports.deleteReport(Number(q.id)),
+
+  // Build one now, for whichever period is asked for, rather than waiting for
+  // it to fall due.
+  'POST /reports/generate': body => {
+    const period = body?.period || 'monthly';
+    const payload = reports.assemble({
+      period,
+      at: body?.at ? new Date(body.at) : new Date(),
+      prices: state.prices,
+      engines: reportEngines,
+    });
+    const html = reports.render(payload);
+    const saved = reports.saveReport(payload, html);
+    return { id: saved?.id ?? null, periodKey: payload.periodKey, complete: payload.complete, failedSections: payload.failedSections };
+  },
+
+  // ─── Return attribution ─────────────────────────────────────
+  // Where the return came from, decomposed against the portfolio's own
+  // average. Not benchmark-relative — see the engine header for why.
+  'GET /attribution': q => attribution.attributionReport(state.prices, {
+    lookback: Number(q.lookback) || 750,
+    grouping: q.grouping || 'sector',
+    benchmark: q.benchmark || '^FTSE',
+  }),
+
+  // Commentary over the reconciled figures. Separate from the report because
+  // it costs an API call and the page should render its numbers without one.
+  'POST /attribution/explain': async body => {
+    const report = attribution.attributionReport(state.prices, {
+      lookback: Number(body?.lookback) || 750,
+      grouping: body?.grouping || 'sector',
+      benchmark: body?.benchmark || '^FTSE',
+    });
+    return attribution.explain(report);
+  },
+
+  // ─── Portfolio X-ray ────────────────────────────────────────
+  // What you actually own, as opposed to what you bought.
+  'GET /xray': q => {
+    const v = pf.valuePortfolio(state.prices);
+    return xray.xray(v.positions, { top: Number(q.top) || 10 });
+  },
+
+  // Companies reached through more than one holding.
+  'GET /xray/overlaps': () => {
+    const v = pf.valuePortfolio(state.prices);
+    return { pairs: xray.multiFundNames(xray.underlyingExposure(v.positions)) };
+  },
+
+  // Sector exposure blended through every fund that publishes one.
+  'GET /xray/sectors': () => {
+    const v = pf.valuePortfolio(state.prices);
+    return xray.sectorExposure(v.positions);
+  },
+
+  // Pairs that duplicate each other, ranked by how much of the book they cover.
+  'GET /correlation/redundancies': q => {
+    const v = pf.valuePortfolio(state.prices);
+    return correlation.redundancies(v.positions, {
+      window: q.window || '1y',
+      minCorr: q.minCorr ? Number(q.minCorr) : correlation.REDUNDANT_CORR,
+    });
+  },
+
+  'GET /portfolio/holding': q => {
+    const v = pf.valuePortfolio(state.prices);
+    const m = rebuild.mandate.loadMandate();
+    const regime = rebuild.regime.readRegime(state.prices, m);
+    return pfa.holdingDetail(q.symbol, v.positions, { mandate: m, regime });
+  },
+
+  'GET /holdings': () => {
+    const rows = all('SELECT * FROM holdings ORDER BY symbol');
+    return {
+      holdings: rows,
+      count: rows.length,
+      coverage: rows.map(h => {
+        const c = one('SELECT COUNT(*) n, MIN(date) first, MAX(date) last FROM ohlcv WHERE symbol = ?', h.symbol);
+        return {
+          symbol: h.symbol,
+          bars: c?.n ?? 0,
+          first: c?.first ?? null,
+          last: c?.last ?? null,
+          analysable: (c?.n ?? 0) >= 30,
+        };
+      }),
+    };
+  },
+
+  'POST /holdings': async body => {
+    if (!body.symbol) return { error: 'symbol is required.' };
+    const symbol = String(body.symbol).toUpperCase().trim();
+    if (body.isin) {
+      body.isin = String(body.isin).trim().toUpperCase();
+      if (!isValidISIN(body.isin)) {
+        return { error: `"${body.isin}" is not a valid ISIN — expected exactly 12 characters (e.g. GB00BN08ZR66). Don't include a Yahoo-style suffix like ".L".` };
+      }
+    }
+
+    // Duplicate protection. The original blind INSERT let the same holding be
+    // added repeatedly, which produced 15 rows for 5 positions and silently
+    // tripled portfolio weights. Same symbol in the same account and wrapper is
+    // now treated as an update, not a second position.
+    const existing = one(
+      'SELECT * FROM holdings WHERE symbol = ? AND account = ? AND wrapper = ?',
+      symbol, body.account ?? 'Main', body.wrapper ?? 'ISA'
+    );
+
+    if (existing && !body.allowDuplicate) {
+      run(`UPDATE holdings SET qty = ?, avg_price = ?, sector = ?, geography = ?,
+           asset_class = ?, target_pct = ?, thesis = ?, name = ?, link = ?, isin = ?, exchange = ? WHERE id = ?`,
+          body.qty ?? existing.qty, body.avgPrice ?? existing.avg_price,
+          body.sector ?? existing.sector, body.geography ?? existing.geography,
+          body.assetClass ?? existing.asset_class, body.targetPct ?? existing.target_pct,
+          body.thesis ?? existing.thesis, body.name ?? existing.name,
+          body.link ?? existing.link, body.isin ?? existing.isin,
+          body.exchange ?? existing.exchange, existing.id);
+      return {
+        ok: true, action: 'updated', id: existing.id,
+        message: `${symbol} already existed in ${existing.wrapper}/${existing.account} — updated rather than duplicated.`,
+        holdings: pf.listHoldings(),
+      };
+    }
+
+    const { lastInsertRowid } = run(`INSERT INTO holdings (symbol, name, qty, avg_price, currency, sector, geography,
+         asset_class, account, wrapper, acc_dist, link, target_pct, thesis, isin, exchange, added_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        symbol, body.name ?? null, body.qty ?? 0, body.avgPrice ?? 0,
+        body.currency ?? 'GBP', body.sector ?? null, body.geography ?? null,
+        body.assetClass ?? 'Equity', body.account ?? 'Main', body.wrapper ?? 'ISA',
+        body.accDist ?? null, body.link ?? null, body.targetPct ?? null,
+        body.thesis ?? null, body.isin ?? null, body.exchange ?? null, Date.now());
+
+    // A raw ticker like "0P0000WN7J.L" means nothing to a human — resolve its
+    // real name and listing venue from Yahoo unless the caller already
+    // supplied one, same "fill in what the user didn't have to type" spirit
+    // as the auto-sync below.
+    if (!body.name) {
+      const resolved = await yahoo.resolveNameAndExchange(symbol);
+      if (resolved.name || resolved.exchange) {
+        run('UPDATE holdings SET name = COALESCE(?, name), exchange = COALESCE(?, exchange) WHERE id = ?',
+            resolved.name ?? null, resolved.exchange ?? null, lastInsertRowid);
+      }
+    }
+
+    // Auto-sync history if we have none. Without this a new holding shows a
+    // live price but is invisible to Risk, Optimiser and Backtest until a
+    // manual sync is run — a gap that made "add a holding and it just works"
+    // untrue in practice.
+    const cov = one('SELECT COUNT(*) n FROM ohlcv WHERE symbol = ?', symbol);
+    let sync = null;
+    if ((cov?.n ?? 0) < 30) {
+      console.log(`  new symbol ${symbol}: fetching history…`);
+      sync = await yahoo.syncHistory(symbol, { years: 12 });
+      if (sync.error) {
+        console.log(`  ⚠ ${symbol}: history fetch failed — ${sync.error}`);
+      } else {
+        console.log(`  ${symbol}: ${sync.added} bars stored${sync.rejected ? `, ${sync.rejected} rejected` : ''}`);
+      }
+      await refreshPrices();
+    }
+
+    // A new holding's earnings and dividend dates are looked up now rather
+    // than waiting for someone to press the calendar's refresh button. Not
+    // awaited: a slow or failing lookup must never hold up the add itself.
+    calendar.refreshCorporateDates([symbol])
+      .then(r => { if (r.fetched) bumpVersion('calendar'); if (r.failed.length) console.log(`  calendar: ${symbol} dates not resolved (${r.unresolved[0]?.reason ?? 'unknown'})`); })
+      .catch(e => console.log(`  calendar refresh on add failed: ${e.message}`));
+
+    // Yahoo has no coverage for some HL "Class S" funds. If an ISIN was
+    // given, prime the FT fallback cache now so the holding has a price
+    // immediately rather than waiting on a later manual /fund-nav call.
+    let ftNav = null;
+    if (body.isin && sync?.error) {
+      console.log(`  ${symbol}: no Yahoo history — trying FT fallback for ${body.isin}…`);
+      ftNav = await fetchFTFundNav(body.isin, body.currency ?? 'GBP');
+      if (ftNav?.error) console.log(`  ⚠ FT fallback failed: ${ftNav.error}`);
+      else console.log(`  ${symbol}: FT fallback price £${ftNav.price}`);
+    }
+
+    return {
+      ok: true, action: 'created', symbol,
+      historySynced: sync ? { bars: sync.added ?? 0, rejected: sync.rejected ?? 0, error: sync.error ?? null } : 'already had history',
+      ftFallback: ftNav,
+      holdings: pf.listHoldings(),
+    };
+  },
+
+  'PUT /holdings': body => {
+    if (body.isin) {
+      body.isin = String(body.isin).trim().toUpperCase();
+      if (!isValidISIN(body.isin)) {
+        return { error: `"${body.isin}" is not a valid ISIN — expected exactly 12 characters (e.g. GB00BN08ZR66). Don't include a Yahoo-style suffix like ".L".` };
+      }
+    }
+    const fields = { qty: 'qty', avgPrice: 'avg_price', sector: 'sector', geography: 'geography',
+                     assetClass: 'asset_class', account: 'account', wrapper: 'wrapper',
+                     targetPct: 'target_pct', thesis: 'thesis', name: 'name', link: 'link', isin: 'isin',
+                     exchange: 'exchange' };
+    for (const [k, col] of Object.entries(fields)) {
+      if (body[k] !== undefined) run(`UPDATE holdings SET ${col} = ? WHERE id = ?`, body[k], body.id);
+    }
+    return { ok: true, holdings: pf.listHoldings() };
+  },
+
+  'DELETE /holdings': q => { run('DELETE FROM holdings WHERE id = ?', Number(q.id)); return { ok: true }; },
+
+  // Backfills name + exchange for existing holdings — the same lookup a new
+  // holding gets automatically on POST /holdings, run retroactively. Scope
+  // with body.symbols to target specific rows (e.g. after fixing bad data);
+  // omit it to sweep everything with a missing name; body.force also
+  // re-resolves rows that already have a name, e.g. after a corporate rename.
+  'POST /holdings/refresh-names': async body => {
+    const targets = body?.symbols?.length
+      ? all(`SELECT DISTINCT symbol FROM holdings WHERE symbol IN (${body.symbols.map(() => '?').join(',')})`, ...body.symbols.map(s => String(s).toUpperCase()))
+      : body?.force
+        ? all('SELECT DISTINCT symbol FROM holdings')
+        : all('SELECT DISTINCT symbol FROM holdings WHERE name IS NULL OR exchange IS NULL');
+    const symbols = targets.map(r => r.symbol);
+    if (!symbols.length) return { ok: true, resolved: 0, message: 'Nothing to resolve.' };
+
+    const resolved = await yahoo.resolveNamesAndExchanges(symbols);
+    let updated = 0;
+    const failed = [];
+    for (const symbol of symbols) {
+      const r = resolved[symbol];
+      if (!r || (!r.name && !r.exchange)) { failed.push(symbol); continue; }
+      run('UPDATE holdings SET name = COALESCE(?, name), exchange = COALESCE(?, exchange) WHERE symbol = ?',
+          r.name ?? null, r.exchange ?? null, symbol);
+      updated++;
+    }
+    return { ok: true, resolved: updated, failed, holdings: pf.listHoldings() };
+  },
+
+  'POST /cash': body => {
+    run(`INSERT INTO cash (account, wrapper, currency, amount, updated_at) VALUES (?,?,?,?,?)`,
+        body.account ?? 'Main', body.wrapper ?? 'ISA', body.currency ?? 'GBP', body.amount ?? 0, Date.now());
+    return { ok: true, cash: pf.listCash() };
+  },
+
+  'PUT /cash': body => {
+    const cols = { account: 'account', wrapper: 'wrapper', currency: 'currency', amount: 'amount' };
+    for (const [k, col] of Object.entries(cols)) {
+      if (body[k] !== undefined) run(`UPDATE cash SET ${col} = ? WHERE id = ?`, body[k], body.id);
+    }
+    run('UPDATE cash SET updated_at = ? WHERE id = ?', Date.now(), body.id);
+    return { ok: true, cash: pf.listCash() };
+  },
+
+  'DELETE /cash': q => { run('DELETE FROM cash WHERE id = ?', Number(q.id)); return { ok: true }; },
+
+  'POST /transactions': body => {
+    run(`INSERT INTO transactions (symbol, date, side, qty, price, fees, currency, account, wrapper, note)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        body.symbol, body.date, body.side, body.qty, body.price, body.fees ?? 0,
+        body.currency ?? 'GBP', body.account ?? 'Main', body.wrapper ?? 'ISA', body.note ?? null);
+    return { ok: true };
+  },
+
+  'GET /transactions': () => ({ transactions: all('SELECT * FROM transactions ORDER BY date DESC') }),
+
+  // ── risk & analytics ───────────────────────────────────────
+  // Defensive, not the primary path: POST /holdings already syncs a new
+  // holding's history on add, so in normal use every held symbol is already
+  // covered by the time this runs. This catches what that can't — a sync
+  // that failed at add-time, bars purged by an integrity repair, a holding
+  // added by some future path that skips the POST /holdings flow — so a
+  // holding is never permanently invisible to its own risk numbers. Polled
+  // every 60s from the Risk page; a no-op past the first fill, since
+  // ensureHistory only makes a network call for symbols still short.
+  'GET /risk': async q => {
+    const held = pf.valuePortfolio(state.prices).positions.map(p => p.symbol);
+    await yahoo.ensureHistory(held);
+    return analyst.riskProfile(state.prices, {
+      confidence: Number(q.confidence) || 0.95,
+      lookback: Number(q.lookback) || 750,
+    });
+  },
+
+  'GET /regime': () => analyst.computeRegime(state.prices),
+
+  'GET /correlations': async q => {
+    const held = pf.valuePortfolio(state.prices).positions.map(p => p.symbol);
+    await yahoo.ensureHistory(held);
+    return analyst.correlationWatch(state.prices, { window: Number(q.window) || 60 });
+  },
+
+  'GET /stress': () => {
+    const v = pf.valuePortfolio(state.prices);
+    const positions = v.positions.filter(p => p.value > 0).map(p => ({ symbol: p.symbol, value: p.value }));
+    if (!positions.length) return { error: 'No holdings to stress test.' };
+    return runAllScenarios(positions, getBars);
+  },
+
+  'POST /stress/shock': body => {
+    const v = pf.valuePortfolio(state.prices);
+    const positions = v.positions.filter(p => p.value > 0).map(p => ({ symbol: p.symbol, value: p.value }));
+    return { shocks: shockTest(positions, body.shocks ?? [-0.3, -0.2, -0.1, -0.05, 0.05, 0.1], getBars) };
+  },
+
+  'GET /scenarios': () => ({ scenarios: SCENARIOS }),
+
+  // ── optimisation & planning ────────────────────────────────
+  'POST /optimise': body => {
+    const symbols = body.symbols?.length
+      ? body.symbols
+      : pf.listHoldings().map(h => h.symbol);
+    const series = pf.holdingReturnSeries([...new Set(symbols)], body.lookback ?? 750);
+    return opt.optimise(series, {
+      method: body.method ?? 'maxSharpe',
+      maxWeight: body.maxWeight ?? 0.35,
+      minWeight: body.minWeight ?? 0,
+      rf: body.riskFree ?? 0.04,
+      shrinkage: body.shrinkage ?? 0.2,
+      expectedReturns: body.expectedReturns ?? null,
+    });
+  },
+
+  'POST /frontier': body => {
+    const symbols = body.symbols?.length ? body.symbols : pf.listHoldings().map(h => h.symbol);
+    const series = pf.holdingReturnSeries([...new Set(symbols)], body.lookback ?? 750);
+    return opt.efficientFrontier(series, {
+      points: body.points ?? 25, maxWeight: body.maxWeight ?? 0.35,
+      shrinkage: body.shrinkage ?? 0.2, rf: body.riskFree ?? 0.04,
+    });
+  },
+
+  'POST /rebalance': body => {
+    const v = pf.valuePortfolio(state.prices);
+    const holdings = v.positions.filter(p => p.hasPrice).map(p => ({
+      symbol: p.symbol, qty: p.qty, price: p.price, avgPrice: p.avgPrice,
+      wrapper: p.wrapper, account: p.account, currency: p.currency,
+    }));
+    const targets = body.targets ?? Object.fromEntries(
+      v.positions.filter(p => p.targetPct != null).map(p => [p.symbol, p.targetPct / 100]));
+    return rebalance(holdings, targets, {
+      contribution: body.contribution ?? 0,
+      cash: body.useCash === false ? 0 : v.cash,
+      tolerance: body.tolerance ?? 0.02,
+      minTradeValue: body.minTradeValue ?? 50,
+      cgtBand: body.cgtBand ?? 'higher',
+      cgtUsed: body.cgtUsed ?? 0,
+      allowSelling: body.allowSelling !== false,
+      dealingCharge: body.dealingCharge ?? 0,
+    });
+  },
+
+  'POST /contribute': body => {
+    const v = pf.valuePortfolio(state.prices);
+    const holdings = v.positions.filter(p => p.hasPrice).map(p => ({
+      symbol: p.symbol, qty: p.qty, price: p.price, avgPrice: p.avgPrice,
+      wrapper: p.wrapper, account: p.account,
+    }));
+    const targets = body.targets ?? Object.fromEntries(
+      v.positions.filter(p => p.targetPct != null).map(p => [p.symbol, p.targetPct / 100]));
+    return directContribution(holdings, targets, body.amount ?? 0, {});
+  },
+
+  // ── allocate: "I have cash, what do I do with it?" ─────────
+  // manual mode is a thin pass-through to directContribution, unchanged.
+  // auto mode scores every candidate (holdings, top Screener matches,
+  // watchlist) off the engines that already exist, and splits the cash
+  // proportional to conviction. See engines/allocate.js for the full design
+  // rationale — nothing here computes anything new.
+  // includeScreener defaults OFF here: scanning the full tracked universe
+  // (benchmarks, FX, commodities, sector ETFs — ~60 symbols) on every page
+  // load is slow and mostly irrelevant to "what do I buy", so the fast
+  // default is holdings + watchlist only. Pass ?includeScreener=1 to widen it.
+  'GET /allocate/candidates': async q => {
+    const v = pf.valuePortfolio(state.prices);
+    const holdingsSymbols = v.positions.map(p => p.symbol);
+    const wantScreener = q.includeScreener === '1';
+    const screenerUniverse = wantScreener ? trackedSymbols() : [];
+    const watchlistSymbols = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    await yahoo.ensureHistory([...new Set([...holdingsSymbols, ...watchlistSymbols, ...screenerUniverse])], { minBars: 120 });
+
+    const candidates = allocate.assembleCandidates({
+      holdingsSymbols,
+      includeScreener: wantScreener,
+      screenerStrategy: q.strategy ?? 'balanced',
+      screenerUniverse,
+      includeWatchlist: q.includeWatchlist !== '0',
+    });
+
+    const portfolioWeights = Object.fromEntries(v.positions.map(p => [p.symbol, p.weight / 100]));
+    const portfolioSeries = pf.holdingReturnSeries(holdingsSymbols, 750);
+    const scored = candidates.map(c => allocate.scoreCandidate(c.symbol, {
+      weight: portfolioWeights[c.symbol] ?? 0, portfolioWeights, portfolioSeries,
+    }));
+    return { candidates: candidates.map(c => c.source), scored, cash: v.cash, screenerIncluded: wantScreener };
+  },
+
+  'POST /allocate': async body => {
+    const amount = Number(body.amount) || 0;
+    if (amount <= 0) return { error: 'amount must be greater than 0.' };
+    const mode = body.mode === 'manual' ? 'manual' : 'auto';
+
+    const v = pf.valuePortfolio(state.prices);
+    const holdingsForContribution = v.positions.filter(p => p.hasPrice).map(p => ({
+      symbol: p.symbol, qty: p.qty, price: p.price, avgPrice: p.avgPrice,
+      wrapper: p.wrapper, account: p.account, currency: p.currency,
+    }));
+
+    if (mode === 'manual') {
+      const targets = body.targets ?? Object.fromEntries(
+        v.positions.filter(p => p.targetPct != null).map(p => [p.symbol, p.targetPct / 100]));
+      const result = allocate.generatePlan({ amount, mode, targets, holdings: holdingsForContribution });
+      return { mode, ...result };
+    }
+
+    const holdingsSymbols = v.positions.map(p => p.symbol);
+    const wantScreener = body.includeScreener === true;
+    const screenerUniverse = wantScreener ? (body.symbols?.length ? body.symbols : trackedSymbols()) : [];
+    const watchlistSymbols = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    await yahoo.ensureHistory([...new Set([...holdingsSymbols, ...watchlistSymbols, ...screenerUniverse])], { minBars: 120 });
+
+    const candidates = allocate.assembleCandidates({
+      holdingsSymbols,
+      includeScreener: wantScreener,
+      screenerStrategy: body.screenerStrategy ?? 'balanced',
+      screenerUniverse,
+      includeWatchlist: body.includeWatchlist !== false,
+      extra: body.extraSymbols ?? [],
+    });
+
+    const portfolioWeights = Object.fromEntries(v.positions.map(p => [p.symbol, p.weight / 100]));
+    const portfolioSeries = pf.holdingReturnSeries(holdingsSymbols, 750);
+    const scored = candidates.map(c => allocate.scoreCandidate(c.symbol, {
+      weight: portfolioWeights[c.symbol] ?? 0, portfolioWeights, portfolioSeries,
+    }));
+
+    const result = allocate.generatePlan({
+      amount, mode, scored,
+      maxShare: body.maxShare ?? 0.5,
+      minTilt: body.minTilt ?? 0.05,
+    });
+
+    const secondOpinionSymbols = [...new Set([...holdingsSymbols, ...result.allocations.map(a => a.symbol)])];
+    const secondOpinion = allocate.optimiserSecondOpinion(secondOpinionSymbols, {
+      method: body.optimiserMethod ?? 'maxSharpe',
+    });
+
+    return { mode, ...result, scored, secondOpinion };
+  },
+
+  'GET /allocate/history': q => ({ plans: allocate.listPlans(Math.min(Number(q.limit) || 20, 100)) }),
+
+  // ── rebuild: "what portfolio should exist?" ────────────────
+  // Distinct from both /rebalance (drift back to existing targets) and
+  // /allocate (deploy new cash). This assesses every holding and every
+  // investable tracked symbol against a stated mandate and proposes a
+  // portfolio from scratch, including full exits and new positions.
+  // Advisory only — it returns a trade list and never touches holdings.
+  // No tax modelling anywhere in this pipeline.
+  'GET /rebuild/mandate': () => rebuild.mandate.loadMandate(),
+
+  'POST /rebuild/mandate': body => {
+    if (body.reset === true) return rebuild.mandate.resetMandate();
+    return rebuild.mandate.saveMandate(body ?? {});
+  },
+
+  'GET /rebuild/mandate/options': () => ({
+    riskLevels: Object.entries(rebuild.mandate.RISK_LEVELS).map(([id, v]) => ({ id, ...v })),
+    horizons: Object.entries(rebuild.mandate.HORIZONS).map(([id, v]) => ({ id, ...v })),
+  }),
+
+  // Exposure teardown on its own. Cheap enough to load on page open, and it is
+  // the half of the report that is useful even when nothing else can run.
+  'GET /rebuild/exposure': () => {
+    const v = pf.valuePortfolio(state.prices);
+    return {
+      teardown: rebuild.exposure.teardown(v.positions.filter(p => (p.value ?? 0) > 0)),
+      total: v.total,
+      cash: v.cash,
+    };
+  },
+
+  // Refresh stored fund composition. Needs live Yahoo; when it cannot be
+  // reached the teardown keeps working off the stored copy and says how old
+  // it is, rather than failing.
+  'POST /rebuild/compositions/sync': async body => {
+    const v = pf.valuePortfolio(state.prices);
+    const held = v.positions.map(p => p.symbol);
+    const watched = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    const symbols = body.symbols?.length
+      ? body.symbols
+      : [...new Set([...held, ...watched, ...CORE_SYMBOLS])].filter(s => rebuild.universe.isInvestable(s));
+    return rebuild.exposure.syncCompositions(symbols, yahoo.fetchSummary, {
+      maxAgeDays: body.maxAgeDays ?? 30,
+      force: body.force === true,
+    });
+  },
+
+  'POST /rebuild': async body => {
+    const v = pf.valuePortfolio(state.prices);
+    const held = v.positions.map(p => p.symbol);
+    const watched = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    // Widen stored history before scanning, or a candidate is skipped for
+    // thin data that a single fetch would have fixed. Scoped to what the scan
+    // will actually consider.
+    const scope = body.includeTracked === false
+      ? [...held, ...watched]
+      : [...held, ...watched, ...CORE_SYMBOLS];
+    await yahoo.ensureHistory([...new Set(scope)], { minBars: 120 });
+
+    return rebuild.runRebuild(state.prices, {
+      strategy: body.strategy ?? 'balanced',
+      includeTracked: body.includeTracked !== false,
+      includeWatchlist: body.includeWatchlist !== false,
+      extraSymbols: body.extraSymbols ?? [],
+      minTradeValue: body.minTradeValue ?? 50,
+      save: body.save !== false,
+    });
+  },
+
+  'GET /rebuild/history': q => ({ runs: rebuild.listRuns(Math.min(Number(q.limit) || 20, 100)) }),
+
+  'GET /rebuild/run': q => rebuild.getRun(Number(q.id)) ?? { error: `No rebuild run with id ${q.id}.` },
+
+  'POST /montecarlo': body => {
+    let returns = null;
+    if (body.usePortfolioHistory !== false) {
+      const hist = pf.reconstructHistory(state.prices, 1500);
+      if (hist.series.length > 100) returns = A.toReturns(hist.series.map(s => s.value));
+    }
+    return simulate({
+      initial: body.initial ?? pf.valuePortfolio(state.prices).total,
+      monthly: body.monthly ?? 0,
+      years: body.years ?? 20,
+      returns, mode: body.mode ?? (returns ? 'blockBootstrap' : 'normal'),
+      expectedReturn: body.expectedReturn ?? null,
+      volatility: body.volatility ?? null,
+      paths: Math.min(body.paths ?? 5000, 20000),
+      inflation: body.inflation ?? 0.025,
+      fees: body.fees ?? 0,
+      seed: body.seed ?? 12345,
+    });
+  },
+
+  // POST /goal used to run a Gaussian model on inputs nobody entered (£100k,
+  // 7%, 15%). It is now defined in routes-overnight.js: the goal is saved by
+  // the user and simulated from the portfolio's own bootstrapped history.
+
+  // ── screener & backtest ────────────────────────────────────
+  'GET /screener/strategies': () => ({ screener: SCREEN_STRATEGIES, backtest: BT_STRATEGIES }),
+
+  // A screener universe you type in by hand (rather than the default tracked
+  // set, which is already synced) is exactly the "any ticker, on demand"
+  // case — ensureHistory is a cheap no-op for symbols already covered, so
+  // this costs nothing extra on the default path and only fetches for names
+  // genuinely new to this database.
+  'POST /screen': async body => {
+    const universe = body.symbols?.length ? body.symbols : trackedSymbols();
+    await yahoo.ensureHistory(universe, { minBars: 120 }); // scoreSymbol's own floor
+    return screen(universe, {
+      strategy: body.strategy ?? 'balanced',
+      minScore: body.minScore ?? 0,
+      limit: body.limit ?? 50,
+    });
+  },
+
+  'GET /score': async q => {
+    await yahoo.ensureHistory([q.symbol], { minBars: 120 });
+    return scoreSymbol(q.symbol, { strategy: q.strategy ?? 'balanced' })
+      ?? { error: `No usable history for ${q.symbol} even after a live fetch — check the symbol is correct.` };
+  },
+
+  'POST /backtest': async body => {
+    await yahoo.ensureHistory([body.symbol]);
+    return backtest(body.symbol, {
+      strategy: body.strategy ?? 'maCross', params: body.params ?? {},
+      initial: body.initial ?? 10000, commission: body.commission ?? 0,
+      slippageBps: body.slippageBps ?? 5, from: body.from ?? null, to: body.to ?? null,
+    });
+  },
+
+  'POST /walkforward': async body => {
+    await yahoo.ensureHistory([body.symbol]);
+    return walkForward(body.symbol, {
+      strategy: body.strategy ?? 'maCross', folds: body.folds ?? 5,
+      initial: body.initial ?? 10000,
+    });
+  },
+
+  // ── alerts ─────────────────────────────────────────────────
+  'GET /alerts': q => ({
+    alerts: alerts.listAlerts(q.status ?? null),
+    progress: alerts.alertProgress(state.prices),
+    recentlyFired: state.fired.slice(0, 20),
+    kinds: alerts.ALERT_KINDS,
+  }),
+  // Most alert kinds (maCross, rsi, drawdown, volRegime, high52/low52) need
+  // stored bars to ever fire; without this, an alert on a symbol nobody has
+  // synced would sit there silently inert forever, which is a worse failure
+  // than a slightly slower create. Runs once, at creation, not on every
+  // evaluate() tick.
+  'POST /alerts': async body => {
+    if (body?.symbol) await yahoo.ensureHistory([body.symbol]);
+    return alerts.createAlert(body);
+  },
+  'PUT /alerts': body => alerts.updateAlert(body.id, body.status),
+  'DELETE /alerts': q => {
+    // Remembered readings are per-alert; leaving them behind would let a new
+    // alert that happened to reuse the id inherit a stale baseline.
+    signals.clearSignalState(Number(q.id));
+    alerts.deleteAlert(Number(q.id));
+    return { ok: true };
+  },
+
+  // ── cross-engine alerts ────────────────────────────────────
+  // Everything the alerts page needs in one read: both families of alert with
+  // their descriptions, progress toward price thresholds, and the firing
+  // history that survives a repeating alert re-arming.
+  'GET /signals': () => {
+    const rows = alerts.listAlerts();
+    return {
+      alerts: rows.map(a => ({
+        ...a,
+        signal: signals.isSignalKind(a.kind) ? signals.describe(a) : null,
+        history: signals.alertHistory(a.id, 5),
+      })),
+      progress: alerts.alertProgress(state.prices),
+      events: signals.recentEvents(40),
+      priceKinds: alerts.ALERT_KINDS,
+      signalKinds: signals.SIGNAL_KINDS,
+      portfolioSymbol: signals.PORTFOLIO_SYMBOL,
+      // Said plainly rather than implied: an alert that fires while nothing is
+      // open is only waiting in the app, not delivered anywhere.
+      delivery: 'In-app only. Alerts are recorded when they fire and shown here and on the Briefing; '
+        + 'there is no email or desktop notification wired up.',
+    };
+  },
+  'POST /signals': body => signals.createSignalAlert({
+    kind: body?.kind, symbol: body?.symbol ?? null,
+    threshold: body?.threshold ?? null, note: body?.note ?? null,
+    repeat: body?.repeat ?? 'once',
+  }),
+  'POST /signals/snooze': body => signals.snooze(Number(body?.id), Number(body?.days) || 7),
+  'POST /signals/unsnooze': body => signals.unsnooze(Number(body?.id)),
+  'POST /signals/rearm': body => signals.rearm(Number(body?.id)),
+  // Evaluating on demand matters after arming something: the scheduled pass is
+  // fifteen minutes away and a new alert with no baseline yet looks broken
+  // until it has run once.
+  'POST /signals/evaluate': () => {
+    const valued = pf.valuePortfolio(state.prices);
+    const r = signals.evaluateSignals(state.prices, { research, valued });
+    if (r.fired.length) state.fired = [...r.fired, ...state.fired].slice(0, 50);
+    return r;
+  },
+
+  // ── watchlist ──────────────────────────────────────────────
+  'GET /watchlist': () => ({ watchlist: all('SELECT * FROM watchlist ORDER BY tier, symbol') }),
+  'POST /watchlist': body => {
+    run(`INSERT OR REPLACE INTO watchlist (symbol, tier, note, target, added_at) VALUES (?,?,?,?,?)`,
+        body.symbol, body.tier ?? 3, body.note ?? null, body.target ?? null, Date.now());
+    return { ok: true, watchlist: all('SELECT * FROM watchlist ORDER BY tier, symbol') };
+  },
+  'DELETE /watchlist': q => { run('DELETE FROM watchlist WHERE id = ?', Number(q.id)); return { ok: true }; },
+
+  // ── paper trading ──────────────────────────────────────────
+  'GET /paper': () => paper.performance(state.prices),
+  'POST /paper': body => paper.openTrade(body),
+  'PUT /paper': body => paper.closeTrade(body.id, body.exitPrice ?? state.prices[body.symbol]?.price),
+  'DELETE /paper': q => { paper.deleteTrade(Number(q.id)); return { ok: true }; },
+
+  // ── news ───────────────────────────────────────────────────
+  'GET /news': q => {
+    const held = all('SELECT DISTINCT symbol FROM holdings').map(r => r.symbol);
+    const watched = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    return {
+      news: getNews({
+        limit: Number(q.limit) || 60,
+        symbol: q.symbol || null,
+        source: q.source || null,
+        since: q.since ? Number(q.since) : null,
+        sort: q.sort === 'newest' ? 'newest' : 'smart',
+        minRelevance: Number(q.minRelevance) || 0,
+        category: q.category || null,
+        includeDupes: q.includeDupes === '1',
+        held, watched,
+      }),
+      lastRefresh: state.lastNews,
+      failedFeeds: state.lastNewsFailed,
+      categories: CATEGORIES,
+      ai: { enabled: hasGeminiKey(), ...scoringStats() },
+    };
+  },
+  'POST /news/refresh': async () => await refreshNewsFeed() ?? { ok: true },
+
+  // Research page: news for one arbitrary ticker. `symbol` filters the
+  // standing tagged feed (only hits if it's in SYMBOLS/holdings/watchlist);
+  // `query` (defaults to symbol) additionally runs a live per-ticker search so
+  // an untracked name still returns something. Cross-source duplicates are
+  // dropped with the same title-similarity check the ingest pipeline uses,
+  // just at a looser threshold since a wire headline and an aggregator's
+  // rendering of the same story are worded less identically than two RSS
+  // feeds carrying the same wire copy.
+  'GET /research/news': async q => {
+    const symbol = q.symbol ? String(q.symbol).toUpperCase().trim() : null;
+    const queryText = String(q.query ?? symbol ?? '').trim();
+    const limit = Math.min(Number(q.limit) || 30, 60);
+
+    const held = all('SELECT DISTINCT symbol FROM holdings').map(r => r.symbol);
+    const watched = all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol);
+    const feed = symbol ? getNews({ symbol, limit: 30, sort: 'smart', held, watched }) : [];
+
+    let live = [];
+    if (queryText) {
+      const raw = await searchLiveNews(queryText, { limit: 20 });
+      const feedSigs = feed.map(f => titleSignature(f.title));
+      live = raw.filter(l => {
+        const sig = titleSignature(l.title);
+        return !feedSigs.some(fs => jaccard(sig, fs) >= 0.5);
+      });
+    }
+
+    const combined = [...feed.map(f => ({ ...f, live: false })), ...live]
+      .sort((a, b) => (b.published ?? 0) - (a.published ?? 0))
+      .slice(0, limit);
+
+    return { symbol, query: queryText, feedCount: feed.length, liveCount: live.length, news: combined };
+  },
+
+  // ── bull / bear ────────────────────────────────────────────
+  // One read for the merged Overview tab: the Yahoo summary the page needs
+  // anyway, plus everything derived from stored bars and the local feed. The
+  // summary is fetched once here and passed down rather than being re-fetched
+  // by each engine — quoteSummary is the slowest part of this request by an
+  // order of magnitude, and the derived work is all local.
+  'GET /research/overview': async q => {
+    const symbol = String(q.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+
+    // Two independent Yahoo calls (the quote summary, and — only if this
+    // symbol has no or too little stored history — a live bar fetch) run
+    // together rather than one after the other, so researching a name
+    // never-before-looked-at costs roughly the slower of the two, not both
+    // added up. ensureHistory persists what it fetches, same as any other
+    // sync, so the chart/technicals/precedents below have real bars to read
+    // regardless of whether this symbol was tracked before this request.
+    const [summary] = await Promise.all([
+      yahoo.fetchSummary(symbol),
+      yahoo.ensureHistory([symbol]),
+    ]);
+    const ok = summary && !summary.error ? summary : null;
+    const price = state.prices[symbol]?.price ?? ok?.price ?? null;
+
+    // Same accrual as the Bull/Bear tab, for the same reason: consensus and
+    // multiple history builds for the instruments actually being researched.
+    // Reaching the Overview tab is the more common way in, so without this
+    // the snapshot series would only ever fill for symbols whose Bull/Bear
+    // tab happened to be opened.
+    if (ok) {
+      try { bullbear.recordSnapshots(symbol, ok); }
+      catch (e) { console.log(`  snapshot failed for ${symbol}: ${e.message}`); }
+    }
+
+    // Signal tally for the conviction ring in the instrument bar. Local and
+    // cheap — it reads stored observations, not the network — so it rides
+    // along here rather than costing the page a second request.
+    let signals = null;
+    try {
+      const built = bullbear.buildSignals(symbol, { summary: ok, price });
+      signals = { tally: built.tally, count: built.signals.length, unavailable: built.unavailable.length };
+    } catch (e) {
+      console.log(`  signal tally failed for ${symbol}: ${e.message}`);
+    }
+
+    return {
+      ...research.buildOverview(symbol, { summary: ok }),
+      quote: summary,
+      price,
+      signals,
+    };
+  },
+
+  // Where news tone and price are pulling in opposite directions, across the
+  // instruments the user actually follows (holdings + watchlist). Both sides
+  // of the comparison are local: the scored feed and stored bars. Symbols
+  // whose news coverage is too thin for a tone reading are listed as
+  // unassessable rather than silently dropped — an absence of signal and an
+  // absence of coverage are different facts.
+  'GET /news/divergence': () => {
+    const symbols = [...new Set([
+      ...all('SELECT DISTINCT symbol FROM holdings').map(r => r.symbol),
+      ...all('SELECT DISTINCT symbol FROM watchlist').map(r => r.symbol),
+    ])];
+    const rows = [], thin = [];
+    for (const sym of symbols) {
+      const sent = research.sentimentTrend(sym);
+      if (!sent.available) { thin.push({ symbol: sym, reason: sent.reason }); continue; }
+      const bars = getBars(sym);
+      const closes = bars.map(b => b.close).filter(c => typeof c === 'number' && isFinite(c));
+      const ret21 = closes.length > 21 ? closes[closes.length - 1] / closes[closes.length - 22] - 1 : null;
+      const diverging = ret21 != null && (
+        (sent.nowBand === 'positive' && ret21 < -0.02) ||
+        (sent.nowBand === 'negative' && ret21 > 0.02));
+      rows.push({
+        symbol: sym, tone: sent.nowBand, toneValue: sent.now,
+        stories: sent.stories, ret21, diverging,
+      });
+    }
+    rows.sort((a, b) => (b.diverging ? 1 : 0) - (a.diverging ? 1 : 0));
+    return { symbols: rows, unassessable: thin, generatedAt: new Date().toISOString() };
+  },
+
+  // Historical analogs to today's technical setup. Computation itself is
+  // stored-bars-only and fast; ensureHistory is what makes that true for a
+  // symbol reached here without the Overview tab (which already syncs it)
+  // having been opened first — e.g. this endpoint hit directly.
+  'GET /research/precedents': async q => {
+    const symbol = String(q.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+    await yahoo.ensureHistory([symbol]);
+    return { symbol, ...research.precedents(symbol, { count: Math.min(Number(q.count) || 10, 20) }) };
+  },
+
+  // Several symbols rebased onto one footing. Every symbol in the request
+  // gets the same on-demand treatment, not just the page's primary symbol —
+  // comparing against a name you've never researched before should work on
+  // the first try.
+  'GET /research/compare': async q => {
+    const symbols = String(q.symbols ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    await yahoo.ensureHistory(symbols);
+    return research.compareSeries(symbols, { days: Math.min(Math.max(Number(q.days) || 252, 30), 2600) });
+  },
+
+  // Dividend and split history — a live Yahoo read, so the Research page
+  // fetches it lazily per symbol rather than as part of the overview.
+  'GET /research/corporate': async q => {
+    const symbol = String(q.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+    return await yahoo.fetchCorporateActions(symbol);
+  },
+
+  // Instruments Yahoo considers similar, priced into a comparables table.
+  'GET /research/peers': async q => {
+    const symbol = String(q.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+    return await yahoo.fetchPeers(symbol);
+  },
+
+  // Chart annotations: the user's own dated notes on an instrument.
+  'GET /research/notes': q => ({ symbol: String(q.symbol ?? '').toUpperCase().trim(), notes: research.listNotes(q.symbol ?? '') }),
+  'POST /research/notes': body => research.addNote(body?.symbol, body?.date, body?.text),
+  'DELETE /research/notes': q => research.deleteNote(q.id),
+
+  // One read for the whole tab. The quoteSummary fetch is shared between the
+  // signals, the price scenario and the daily snapshot write, so the tab costs
+  // one upstream call rather than three.
+  'GET /research/bullbear': async q => {
+    const symbol = String(q.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+
+    const summary = await yahoo.fetchSummary(symbol);
+    const price = state.prices[symbol]?.price
+      ?? (summary && !summary.error ? summary.price : null);
+
+    // Snapshots accrue as a side effect of reading the tab. For a single-user
+    // app that beats a scheduled job: history builds for the instruments
+    // actually being looked at, and the unique constraint makes a second read
+    // on the same day free.
+    if (summary && !summary.error) {
+      try { bullbear.recordSnapshots(symbol, summary); }
+      catch (e) { console.log(`  bullbear snapshot failed for ${symbol}: ${e.message}`); }
+    }
+
+    return bullbear.readBullBear(symbol, {
+      summary: summary?.error ? null : summary,
+      price,
+      timeline: q.timeline !== '0',
+    });
+  },
+
+  'POST /research/bullbear/generate': async body => {
+    const symbol = String(body?.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { ok: false, error: 'bad-request', message: 'symbol is required.' };
+
+    const summary = await yahoo.fetchSummary(symbol);
+    const price = state.prices[symbol]?.price
+      ?? (summary && !summary.error ? summary.price : null);
+
+    return await bullbear.generateThesis(symbol, {
+      name: body?.name ?? (summary?.error ? symbol : summary?.name) ?? symbol,
+      summary: summary?.error ? null : summary,
+      price,
+    });
+  },
+
+  'PUT /research/bullbear/thesis': body => {
+    const symbol = String(body?.symbol ?? '').toUpperCase().trim();
+    if (!symbol) return { error: 'symbol is required.' };
+    return bullbear.editThesis(symbol, body?.side, {
+      target: body?.target,
+      keyAssumption: body?.keyAssumption,
+      argument: body?.argument,
+      disproof: body?.disproof,
+    });
+  },
+
+  'DELETE /research/bullbear': q => bullbear.clearThesis(String(q.symbol ?? '').toUpperCase().trim()),
+
+  // Score on demand — lets the user fill in a backlog without waiting for the
+  // next 10-minute cycle (e.g. right after first pasting their API key).
+  'POST /news/score': async body => {
+    if (!hasGeminiKey()) return { ok: false, error: 'No Gemini API key set. Add one in Settings.' };
+    const r = await scoreNewStories(trackedSymbols(), {
+      maxPerCycle: Math.min(Number(body?.limit) || 40, 120),
+    });
+    return { ok: true, ...r, ...scoringStats() };
+  },
+
+  // The Gemini key lives in the browser's localStorage, but scoring runs on
+  // the refresh loop with no browser attached — the frontend pushes it here
+  // so the backend can score unattended.
+  'GET /settings/ai': () => ({ enabled: hasGeminiKey(), ...scoringStats() }),
+  'POST /settings/ai': body => {
+    const key = String(body?.key ?? '').trim();
+    setSetting('gemini_key', key);
+    return { ok: true, enabled: key.length > 0 };
+  },
+
+  // ── SEC EDGAR ──────────────────────────────────────────────
+  'GET /insiders': async q => {
+    const cached = edgar.getInsiders(q.symbol);
+    if (cached.length && !q.refresh) return { symbol: q.symbol, filings: cached, cached: true };
+    const r = await edgar.syncInsiders(q.symbol);
+    return { ...r, filings: edgar.getInsiders(q.symbol) };
+  },
+  // type=all lists every recent form, not only Form 4 — 8-K, 10-K and 10-Q are
+  // the ones worth seeing and were previously unreachable through this route.
+  'GET /filings': async q => await edgar.fetchFilings(q.symbol, {
+    type: q.type === 'all' ? null : (q.type ?? '4'),
+    limit: Math.min(Number(q.limit) || 25, 100),
+  }),
+
+  'GET /insiders/summary': q => edgar.insiderSummary(q.symbol, { days: Number(q.days) || 180 }),
+
+  // Reported annual fundamentals straight from the filed XBRL, plus the trends
+  // that need several years to exist at all.
+  'GET /fundamentals': async q => {
+    const facts = await edgar.fetchCompanyFacts(q.symbol, { years: Number(q.years) || 10 });
+    if (facts.error) return facts;
+    return { ...facts, trends: edgar.deriveTrends(facts) };
+  },
+
+  // ── FT fund NAV fallback (for funds Yahoo has no data for) ──
+  'GET /fund-nav': async q => {
+    if (!q.isin) return { error: 'isin is required' };
+    const cleanIsin = q.isin.trim().toUpperCase();
+    if (!isValidISIN(cleanIsin)) {
+      return { error: `"${q.isin}" is not a valid ISIN — expected 12 characters (e.g. GB00BN08ZR66), not a Yahoo-style ticker.` };
+    }
+    const cached = getCachedFTNav(cleanIsin);
+    if (cached && !q.refresh) return cached;
+    return await fetchFTFundNav(cleanIsin, q.currency || 'GBP');
+  },
+
+  // ── AI analyst ─────────────────────────────────────────────
+  'GET /brief': q => ({
+    brief: analyst.buildBrief(state.prices, { includeScreen: q.screen !== 'false' }),
+    prompt: analyst.briefPrompt(q.kind ?? 'daily'),
+  }),
+
+  'GET /ai/notes': () => ({ notes: all('SELECT * FROM ai_notes ORDER BY ts DESC LIMIT 50') }),
+  'POST /ai/notes': body => {
+    run('INSERT INTO ai_notes (ts, kind, subject, body, context) VALUES (?,?,?,?,?)',
+        Date.now(), body.kind ?? 'note', body.subject ?? null, body.body,
+        body.context ? JSON.stringify(body.context) : null);
+    return { ok: true };
+  },
+
+  // ── settings ───────────────────────────────────────────────
+  'GET /settings': () => ({
+    settings: Object.fromEntries(all('SELECT key, value FROM settings').map(r => {
+      try { return [r.key, JSON.parse(r.value)]; } catch { return [r.key, r.value]; }
+    })),
+    wrappers: WRAPPERS,
+  }),
+  'POST /settings': body => {
+    for (const [k, v] of Object.entries(body)) setSetting(k, v);
+    return { ok: true };
+  },
+};
+
+Object.assign(routes, overnightRoutes({ state, versions, dataVersion, refreshPrices }));
+
+// ─── Server ───────────────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const key = `${req.method} ${url.pathname}`;
+  const handler = routes[key];
+
+  if (!handler) {
+    return json(res, 404, {
+      error: `No route ${key}`,
+      available: Object.keys(routes).sort(),
+    });
+  }
+
+  try {
+    const query = Object.fromEntries(url.searchParams);
+    const body = ['POST', 'PUT'].includes(req.method) ? await readBody(req) : null;
+    const result = await handler(body ?? query, query);
+    // A write bumps the part of the data version it touched, after it has
+    // succeeded, so the page refetches exactly the panels that depend on it.
+    const part = versionPartFor(req.method, url.pathname);
+    if (part && !(result && result.error)) bumpVersion(part);
+    res.setHeader('X-Meridian-Data-Version', dataVersion());
+    json(res, 200, result ?? {});
+  } catch (e) {
+    state.errors.push({ at: Date.now(), route: key, message: e.message });
+    console.log(`  ERROR ${key}: ${e.message}`);
+    json(res, 500, { error: e.message, route: key });
+  }
+});
+
+// ─── Boot ─────────────────────────────────────────────────────
+
+(async () => {
+  console.log('\n  MERIDIAN v2');
+  console.log('  ───────────────────────────────────────────');
+  const h = healthCheck();
+  console.log(`  database   ${h.bars} bars across ${h.symbols} symbols, ${h.holdings} holdings`);
+  console.log(`  symbols    ${trackedSymbols().length} tracked`);
+
+  // Derived memory is rebuilt from stored bars on every boot. It is idempotent
+  // and takes about a second, which buys the guarantee that "what changed"
+  // never reports against a stale or half-built history.
+  if (h.bars > 0) {
+    const t0 = Date.now();
+    try {
+      const mem = memory.rebuild();
+      console.log(`  memory     ${mem.observations} observations, ${mem.regime?.dates ?? 0} regime days in ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.log(`  memory     rebuild failed: ${e.message}`);
+    }
+  }
+
+  await refreshPrices();
+  await refreshFearGreed();
+  refreshNewsFeed().catch(() => {});
+
+  if (h.bars === 0) {
+    console.log('\n  No price history stored yet.');
+    console.log('  Run this once to backfill (takes a few minutes):');
+    console.log('    curl -X POST http://localhost:4001/sync\n');
+  }
+
+  setInterval(refreshPrices, CADENCE.prices);
+  setInterval(refreshFearGreed, CADENCE.feargreed);
+  setInterval(() => refreshNewsFeed().catch(() => {}), CADENCE.news);
+  setInterval(snapshot, CADENCE.snapshot);
+  setInterval(evaluateSignalAlerts, CADENCE.signals);
+  setInterval(generateDueReports, CADENCE.reports);
+  // Also check once at startup: if the app was closed across a period
+  // boundary, that report is due now and should not wait an hour.
+  setTimeout(generateDueReports, 20_000);
+  // Once at boot too: after an update or a restart the machine may have been
+  // off for hours, and the first pass is where a flip that happened overnight
+  // gets noticed.
+  evaluateSignalAlerts();
+
+  // Overnight history sync. The app already runs continuously on the user's
+  // machine (Task Scheduler starts it at login and restarts it on update), so
+  // the server itself is the right place for a daily job — no new scheduled
+  // task, no PowerShell, nothing else to install or go stale. Checked every
+  // half hour; fires once per calendar day in the 05:00-07:59 local window,
+  // when no market that matters here is open. If the machine was off all
+  // night nothing is missed permanently — the next manual sync or tomorrow's
+  // window catches up, since syncHistory is incremental from the last bar.
+  setInterval(async () => {
+    if (OFFLINE) return;
+    const hour = new Date().getHours();
+    const today = new Date().toISOString().slice(0, 10);
+    if (hour < 5 || hour > 7) return;
+    if (getSetting('lastOvernightSync') === today) return;
+    setSetting('lastOvernightSync', today);
+    console.log('  overnight sync: starting…');
+    try {
+      const r = await yahoo.syncAll(trackedSymbols(), { years: 12 });
+      const mem = memory.rebuild();
+      bumpVersion('bars');
+      console.log(`  overnight sync: ${r.synced} symbols updated, ${r.failed.length} failed, memory rebuilt (${mem.observations} observations).`);
+    } catch (e) {
+      console.log(`  overnight sync failed: ${e.message}`);
+    }
+    // Corporate dates go stale unless something refreshes them; the button on
+    // What Changed was the only caller. The cache's own daily TTL means this
+    // only re-fetches symbols whose dates are over a day old, and a failure is
+    // logged and carried in `unresolved`, never allowed to stop the window.
+    try {
+      const held = all('SELECT DISTINCT symbol FROM holdings').map(x => x.symbol);
+      const watched = all('SELECT DISTINCT symbol FROM watchlist').map(x => x.symbol);
+      const c = await calendar.refreshCorporateDates([...new Set([...held, ...watched])]);
+      if (c.fetched) bumpVersion('calendar');
+      console.log(`  overnight calendar: ${c.fetched} refreshed, ${c.cached} still fresh, ${c.failed.length} unresolved.`);
+    } catch (e) {
+      console.log(`  overnight calendar refresh failed: ${e.message}`);
+    }
+  }, 30 * 60_000);
+
+  server.listen(PORT, () => {
+    console.log(`  listening  http://localhost:${PORT}`);
+    console.log(`  routes     ${Object.keys(routes).length}\n`);
+  });
+})();
