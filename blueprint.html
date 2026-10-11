@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian Blueprint</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --mute:#666; --line:#ccc; --card:#fafafa;
+          --nd:#c0392b; --nc:#d68910; --wi:#2471a3; --dn:#1e8449; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --fg:#e6e6e6; --mute:#9aa0a6; --line:#3a3f46; --card:#1b1e23; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line); padding:12px 16px; }
+  h1 { margin:0 0 8px; font-size:18px; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .bar button { font:inherit; padding:4px 10px; border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:4px; cursor:pointer; }
+  .bar button.on { border-color:var(--fg); font-weight:700; }
+  .prog { height:8px; background:var(--line); border-radius:4px; overflow:hidden; display:flex; margin-top:8px; }
+  .prog span { display:block; height:100%; }
+  main { padding:16px; max-width:1200px; margin:0 auto; }
+  section { margin-bottom:28px; }
+  h2 { font-size:16px; margin:0 0 4px; border-bottom:2px solid var(--fg); padding-bottom:4px; }
+  .pnote { color:var(--mute); margin:0 0 10px; font-size:13px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:10px; }
+  .box { border:1px solid var(--line); background:var(--card); padding:10px; border-radius:4px; border-left-width:6px; }
+  .box h3 { margin:0 0 4px; font-size:14px; }
+  .box p { margin:0 0 6px; color:var(--mute); font-size:13px; }
+  .src { font:12px ui-monospace,Consolas,monospace; word-break:break-all; }
+  .badge { display:inline-block; font-size:11px; font-weight:700; padding:1px 6px; border-radius:3px; color:#fff; cursor:pointer; user-select:none; }
+  .nd { border-left-color:var(--nd); } .nd .badge { background:var(--nd); }
+  .nc { border-left-color:var(--nc); } .nc .badge { background:var(--nc); }
+  .wi { border-left-color:var(--wi); } .wi .badge { background:var(--wi); }
+  .dn { border-left-color:var(--dn); } .dn .badge { background:var(--dn); }
+  pre.data { margin:8px 0 0; padding:6px; background:var(--bg); border:1px dashed var(--line); max-height:120px; overflow:auto; font-size:11px; white-space:pre-wrap; }
+  .hint { color:var(--mute); font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meridian Blueprint</h1>
+  <div class="bar" id="filters"></div>
+  <div class="prog" id="prog"></div>
+  <div class="hint" id="sum"></div>
+</header>
+<main id="main"></main>
+
+<script>
+// ---- THE ONE PLACE TO EDIT ------------------------------------------------
+// status: nd = needs data (no route/source yet)  nc = needs code (partial)
+//         wi = wired (shows real data, unchecked)  dn = done (data verified + tested)
+// src: the API route the box reads. Only boxes with a GET route can fetch live.
+// Statuses are first guesses from reading the code. None are marked done: nothing has been tested.
+const STATUS = { nd:"Needs data", nc:"Needs code", wi:"Wired", dn:"Done" };
+const API = "http://localhost:4001";
+
+const PAGES = [
+ { name:"What Changed", note:"Front page. Must be able to say 'nothing happened'.", items:[
+  ["Session verdict","Quiet vs notable, from the memory layer","GET /changes","wi"],
+  ["Sigma-scored moves","Today's moves vs each instrument's own history","GET /changes","wi"],
+  ["Breadth / dispersion / correlation","Percentiles vs normal range","GET /memory/regime","wi"],
+  ["AI session read","Short Gemini summary of the numbers above","GET /brief","wi"],
+  ["Fear & Greed gauge","CNN index","GET /feargreed","wi"] ]},
+ { name:"Briefing", note:"Cross-engine ranked findings.", items:[
+  ["Ranked findings","Everything ranked by materiality, new first","GET /briefing","wi"],
+  ["Mark as read","Remembers what you have seen","POST /briefing/read","wi"],
+  ["Section coverage","Says why a section is empty","GET /briefing","wi"] ]},
+ { name:"Alerts", note:"", items:[
+  ["Alert list + arm form","16 alert kinds, once/daily/always","GET /signals","wi"],
+  ["Snooze / mute / re-arm","","POST /signals/snooze","wi"],
+  ["Firing history","","GET /signals","wi"],
+  ["Delivery outside the app","Email or desktop notification when app is closed","(none)","nc"] ]},
+ { name:"Portfolio: Overview", note:"Already modular in src/overview/.", items:[
+  ["Headline value","Total, P&L, day change","GET /portfolio","wi"],
+  ["Day contribution","What drove today","GET /portfolio","wi"],
+  ["Top holdings","","GET /portfolio","wi"],
+  ["Composition","Sector / geography / wrapper","GET /portfolio","wi"],
+  ["Performance chart","Value over time","GET /portfolio/history","wi"],
+  ["Leaders / laggards","","GET /portfolio","wi"],
+  ["Calendar","Earnings + dividend dates","GET /calendar","wi"],
+  ["News","Held-symbol news","GET /news","wi"],
+  ["Health axes","Quality, trend, technicals, precedent, cost","GET /portfolio/scorecard","wi"],
+  ["Briefing digest","","GET /briefing","wi"] ]},
+ { name:"Portfolio: Holdings", note:"src/holdings/", items:[
+  ["Holdings table","Live P&L per position","GET /holdings","wi"],
+  ["Add / edit / delete holding","","POST /holdings","wi"],
+  ["Holding side panel","One read for the whole panel","GET /portfolio/holding?symbol=","wi"],
+  ["Cash tiles","","GET /portfolio","wi"],
+  ["Concentration warnings","Largest, top-3, look-through US","GET /portfolio","wi"],
+  ["Holdings by type","","GET /portfolio/types","wi"],
+  ["Import broker statement","Preview first, writes nothing until applied","POST /import/preview","wi"],
+  ["Realised gains view","Transactions are logged but never shown","(none)","nd"],
+  ["What-if trade preview","See effect before committing a holding","(none)","nc"] ]},
+ { name:"Portfolio: Performance", note:"src/performance/", items:[
+  ["Money-weighted return (XIRR)","Needs the cash-flow ledger","GET /performance","wi"],
+  ["Time-weighted return","","GET /performance","wi"],
+  ["Timing gap","Did when you bought help or hurt","GET /performance","wi"],
+  ["Cash-flow ledger","Deposits and withdrawals","GET /performance/flows","wi"],
+  ["Attribution","Where the return came from","GET /attribution","wi"],
+  ["Forward dividend income","Portfolio-wide calendar","(none)","nc"] ]},
+ { name:"Portfolio: Analysis", note:"src/analysis/", items:[
+  ["Scorecard","Five axes with per-holding pull","GET /portfolio/scorecard","wi"],
+  ["Most / least correlated pairs","","GET /portfolio/correlations","wi"],
+  ["X-ray","What you actually own through funds","GET /xray","wi"] ]},
+ { name:"Risk", note:"Still inside App.jsx.", items:[
+  ["VaR / CVaR / beta / drawdown","","GET /risk","wi"],
+  ["Risk contribution per holding","","GET /risk","wi"],
+  ["Correlation heatmap","Joined on date, multiple windows","GET /correlation","wi"],
+  ["Calm vs stressed correlation","","GET /correlation/stress","wi"],
+  ["Independent bets","","GET /correlation/independence","wi"],
+  ["Stress scenarios","Six historical crises replayed","GET /stress","wi"],
+  ["Correlation over time","Rolling view; data exists in memory layer","(none)","nc"] ]},
+ { name:"Research", note:"Any symbol. Seven tabs.", items:[
+  ["Instrument header","Name, sparkline, price, signal ring","GET /research/overview?symbol=","wi"],
+  ["Price chart","Ranges, MAs, event markers, your notes","GET /research/overview?symbol=","wi"],
+  ["Where things stand","Composed narrative, no AI","GET /research/overview?symbol=","wi"],
+  ["Analyst consensus + targets","","GET /research/overview?symbol=","wi"],
+  ["Compare (up to 4)","Rebased to 100, date-joined","GET /research/compare?symbols=","wi"],
+  ["Precedents","Past days that looked like today","GET /research/precedents?symbol=","wi"],
+  ["News tab","","GET /research/news","wi"],
+  ["Bull / Bear","8 signals, no verdict score","GET /research/bullbear?symbol=","wi"],
+  ["Filings + insiders","","GET /filings","wi"],
+  ["AI note","","GET /brief","wi"],
+  ["Chart notes","","GET /research/notes","wi"],
+  ["Dividends + splits","","GET /research/corporate?symbol=","wi"],
+  ["Chart / data export","PNG or CSV","(none)","nc"] ]},
+ { name:"Markets", note:"", items:[
+  ["FX / commodities / indices","","GET /prices","wi"],
+  ["Sector heatmap","","GET /prices","wi"],
+  ["Yield curve","","GET /prices","wi"],
+  ["Macro calendar","CPI, payrolls, rate decisions: no free feed","(none)","nd"] ]},
+ { name:"News", note:"", items:[
+  ["Scored feed","Relevance, category, sentiment filters","GET /news","wi"],
+  ["Tone vs price divergence","Shows nothing on a normal day","GET /news/divergence","wi"] ]},
+ { name:"Screener / Watchlist", note:"", items:[
+  ["Screener","Six strategies on stored history","POST /screen","wi"],
+  ["Backtest + walk-forward","Always shows buy-and-hold alongside","POST /backtest","wi"],
+  ["Watchlist","Tiered symbols","GET /watchlist","wi"],
+  ["Paper trades","","GET /paper","wi"] ]},
+ { name:"Planning", note:"", items:[
+  ["Allocate new cash","Never proposes a sale","POST /allocate","wi"],
+  ["Rebalance","Tax-wrapper aware","POST /rebalance","wi"],
+  ["Rebuild","What should I own at all? Advisory only","POST /rebuild","wi"],
+  ["Optimiser + frontier","","POST /optimise","wi"],
+  ["Monte Carlo / goal","","POST /montecarlo","wi"] ]},
+ { name:"Reports", note:"", items:[
+  ["Report archive","Self-contained HTML per closed period","GET /reports","wi"],
+  ["Generate report","","POST /reports/generate","wi"],
+  ["Email delivery","Deliberately not built","(none)","nc"] ]},
+ { name:"Settings", note:"", items:[
+  ["Gemini API key","","POST /settings/ai","wi"],
+  ["Data health","Per-symbol staleness, one-click resync","GET /system/health","wi"],
+  ["Backup export","Manual only. No automatic backup of meridian.db","GET /holdings","nc"],
+  ["Changelog","Recent git commits","GET /changelog","wi"] ]},
+];
+// ---------------------------------------------------------------------------
+
+const LS = (() => { try { return localStorage; } catch { return null; } })();
+const saved = (() => { try { return JSON.parse(LS.getItem("blueprint-status") || "{}"); } catch { return {}; } })();
+let filter = "all", live = false;
+const key = (p, n) => p + " / " + n;
+const getStatus = (p, it) => saved[key(p, it[0])] || it[3];
+
+function render() {
+  const all = PAGES.flatMap(p => p.items.map(it => getStatus(p.name, it)));
+  const count = s => all.filter(x => x === s).length;
+  const f = document.getElementById("filters");
+  f.innerHTML = "";
+  [["all","All " + all.length], ...Object.keys(STATUS).map(s => [s, STATUS[s] + " " + count(s)])].forEach(([k, label]) => {
+    const b = document.createElement("button");
+    b.textContent = label; if (filter === k) b.className = "on";
+    b.onclick = () => { filter = k; render(); };
+    f.appendChild(b);
+  });
+  const lb = document.createElement("button");
+  lb.textContent = live ? "Live data: ON" : "Live data: OFF";
+  lb.className = live ? "on" : "";
+  lb.onclick = () => { live = !live; render(); };
+  f.appendChild(lb);
+
+  const colors = { nd:"var(--nd)", nc:"var(--nc)", wi:"var(--wi)", dn:"var(--dn)" };
+  document.getElementById("prog").innerHTML = Object.keys(STATUS)
+    .map(s => `<span style="width:${count(s)/all.length*100}%;background:${colors[s]}"></span>`).join("");
+  document.getElementById("sum").textContent =
+    `${count("dn")} done, ${count("wi")} wired, ${count("nc")} need code, ${count("nd")} need data. Click a badge to change its status. Live data needs the API running on ${API}.`;
+
+  const main = document.getElementById("main");
+  main.innerHTML = "";
+  PAGES.forEach(p => {
+    const items = p.items.filter(it => filter === "all" || getStatus(p.name, it) === filter);
+    if (!items.length) return;
+    const sec = document.createElement("section");
+    sec.innerHTML = `<h2>${p.name}</h2><p class="pnote">${p.note}</p>`;
+    const g = document.createElement("div"); g.className = "grid";
+    items.forEach(it => {
+      const st = getStatus(p.name, it);
+      const d = document.createElement("div"); d.className = "box " + st;
+      d.innerHTML = `<h3>${it[0]}</h3><p>${it[1]}</p><div class="src">${it[2]}</div>`;
+      const b = document.createElement("span"); b.className = "badge"; b.textContent = STATUS[st];
+      b.onclick = () => {
+        const order = Object.keys(STATUS);
+        saved[key(p.name, it[0])] = order[(order.indexOf(st) + 1) % order.length];
+        try { LS.setItem("blueprint-status", JSON.stringify(saved)); } catch {}
+        render();
+      };
+      d.insertBefore(b, d.firstChild);
+      if (live && it[2].startsWith("GET ")) {
+        const pre = document.createElement("pre"); pre.className = "data"; pre.textContent = "loading...";
+        d.appendChild(pre);
+        const path = it[2].slice(4).replace(/[?].*$/, "");
+        fetch(API + path).then(r => r.json()).then(j => { pre.textContent = JSON.stringify(j, null, 1).slice(0, 1500); })
+          .catch(e => { pre.textContent = "No response: " + e.message + (it[2].includes("?") ? " (route needs a parameter)" : ""); });
+      }
+      g.appendChild(d);
+    });
+    sec.appendChild(g); main.appendChild(sec);
+  });
+}
+render();
+</script>
+</body>
+</html>
